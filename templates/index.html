@@ -110,12 +110,12 @@
       <!-- Status Badges -->
       <div class="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
         <!-- USB Internet -->
-        <span class="flex items-center gap-1.5" title="General internet connectivity">
+        <span class="flex items-center gap-1.5" title="Internet connectivity and its source">
           <span id="status-usb-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
-          <span id="status-usb-label" class="hidden sm:inline text-slate-300">USB</span>
+          <span id="status-usb-label" class="hidden sm:inline text-slate-300">Internet</span>
         </span>
         <!-- Hotspot IP -->
-        <span class="flex items-center gap-1.5" title="Hotspot">
+        <span id="status-camera-net" class="flex items-center gap-1.5" title="Address camera phones connect to">
           📡 <span id="status-hotspot-ip" class="text-slate-300">{{ media_host }}</span>
         </span>
         <!-- RTMP Server -->
@@ -182,7 +182,8 @@
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 grid grid-cols-2 gap-3">
           {% for team in ['home', 'away'] %}
           <div class="text-center min-w-0">
-            <div data-bind="{{ team }}_name" class="text-sm font-semibold text-slate-300 uppercase truncate">{{ team|upper }}</div>
+            <button data-bind="{{ team }}_name" onclick="renameTeam('{{ team }}')" title="Tap to rename"
+                    class="w-full text-sm font-semibold text-slate-300 truncate underline decoration-dotted underline-offset-4">{{ team|upper }}</button>
             <div data-bind="{{ team }}_score" class="text-5xl font-extrabold tabular-nums text-white my-1">0</div>
             <div class="grid grid-cols-2 gap-2">
               <button onclick="adjustScore('{{ team }}', -1)" aria-label="{{ team }} minus one"
@@ -218,11 +219,16 @@
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🌐 Network Controls
       </h2>
+      <!-- Where camera phones connect: the app's hotspot, or the Wi-Fi/LAN the laptop is on -->
+      <div id="camera-network" class="mb-4 rounded-lg p-3 border border-slate-700 bg-slate-900">
+        <p id="camera-network-title" class="text-sm font-semibold text-white">Detecting camera network…</p>
+        <p id="camera-network-hint" class="text-xs text-slate-400 mt-1"></p>
+      </div>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <!-- USB Connect -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm text-slate-400">USB Tethering</span>
+            <span class="text-sm text-slate-400">USB Tethering <span class="text-slate-500">(optional)</span></span>
             <span id="net-usb-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Disconnected</span>
           </div>
           <button onclick="apiPost('/api/network/usb-connect')"
@@ -233,9 +239,10 @@
         <!-- Hotspot Controls -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm text-slate-400">Wi-Fi Hotspot</span>
+            <span class="text-sm text-slate-400">Wi-Fi Hotspot <span class="text-slate-500">(optional)</span></span>
             <span id="net-hotspot-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Inactive</span>
           </div>
+          <p id="hotspot-note" class="hidden text-xs text-brand-amber mb-2"></p>
           <div class="space-y-2 mb-3">
             <input id="hotspot-ssid" type="text" value="MatchdayLive" placeholder="SSID"
                    class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
@@ -273,6 +280,7 @@
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🎥 Camera RTMP Links
         <span class="text-xs text-slate-400 font-normal">(Tap to copy on camera phones)</span>
+        <span id="camera-links-network" class="text-xs text-brand-cyan font-normal"></span>
       </h2>
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
         <!-- Cam 1 -->
@@ -433,7 +441,7 @@
         <div>
           <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
           <div class="flex flex-col sm:flex-row gap-2">
-            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="720p">720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
+            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
             <div class="relative flex-1">
               <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
                      class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
@@ -926,7 +934,17 @@
 
     const dirtyNames = new Set();
     for (const id of ['home-name', 'away-name']) {
-      document.getElementById(id).addEventListener('input', () => dirtyNames.add(id));
+      // Mark as edited and refresh the overlay preview while typing; saved on Enter / leaving the field.
+      document.getElementById(id).addEventListener('input', () => { dirtyNames.add(id); interpolateClock(); });
+    }
+
+    async function renameTeam(team) {
+      const input = document.getElementById(team + '-name');
+      const name = prompt(team === 'home' ? 'Home team name' : 'Away team name', input.value);
+      if (name === null) return;
+      input.value = name.trim().slice(0, 40);
+      dirtyNames.add(input.id);
+      await updateScoreboard();
     }
     async function updateScoreboard() {
       const submitted = {};
@@ -1013,11 +1031,9 @@
 
     // ──────────────────────── Sideline Checklist ────────────────────────
     const checklistItems = [
-      { id: 'chk-usb-plug',     label: 'Phone plugged in via USB' },
-      { id: 'chk-usb-tether',   label: 'USB tethering enabled on phone' },
-      { id: 'chk-usb-connect',  label: 'USB connected in dashboard' },
-      { id: 'chk-hotspot',      label: 'Wi-Fi hotspot started' },
-      { id: 'chk-cam-connect',  label: 'Camera phones connected to hotspot' },
+      { id: 'chk-internet',     label: 'Internet: laptop on Wi-Fi, or phone USB-tethered and connected in dashboard' },
+      { id: 'chk-camera-net',   label: 'Camera network: same Wi-Fi as the laptop, or hotspot started' },
+      { id: 'chk-cam-connect',  label: 'Camera phones joined the camera network' },
       { id: 'chk-cam1-stream',  label: 'Camera 1 streaming' },
       { id: 'chk-stream-key',   label: 'Stream key entered' },
       { id: 'chk-scoreboard',   label: 'Scoreboard set up' },
@@ -1068,6 +1084,42 @@
       banner.className = bannerStyles[level];
     }
 
+    // ──────────────────────── Camera network ────────────────────────
+    function renderCameraNetwork(network) {
+      const box = document.getElementById('camera-network');
+      const title = document.getElementById('camera-network-title');
+      const hint = document.getElementById('camera-network-hint');
+      const linksNote = document.getElementById('camera-links-network');
+      const hotspotNote = document.getElementById('hotspot-note');
+      let tone = 'border-green-800 bg-green-950/40';
+      hotspotNote.classList.add('hidden');
+      if (network.camera_mode === 'hotspot') {
+        const name = network.hotspot_ssid || 'hotspot';
+        title.textContent = `📡 Cameras join the hotspot “${name}” — server ${network.camera_ip}`;
+        hint.textContent = network.usb_iface ? 'Internet comes from the USB-tethered phone.'
+          : 'No USB tether detected: internet depends on another connection of this laptop.';
+        linksNote.textContent = `Phones must join Wi-Fi “${name}”`;
+      } else if (network.camera_mode === 'lan') {
+        const name = network.lan_name || network.lan_iface;
+        if (network.lan_type === 'wifi') {
+          title.textContent = `📶 Cameras join the same Wi-Fi “${name}” — server ${network.camera_ip}`;
+          hint.textContent = 'No hotspot or tethering needed. Guest networks often block devices from reaching each other; if cameras cannot connect, use the hotspot instead.';
+          hotspotNote.textContent = `Not needed on Wi-Fi “${name}”. Starting the hotspot can replace this Wi-Fi connection on a laptop with one Wi-Fi adapter.`;
+          hotspotNote.classList.remove('hidden');
+        } else {
+          title.textContent = `🔌 Laptop is on wired network “${name}” — server ${network.camera_ip}`;
+          hint.textContent = 'Camera phones must join a Wi-Fi of this same network, or start the hotspot.';
+        }
+        linksNote.textContent = `Phones must join Wi-Fi “${name}”`;
+      } else {
+        tone = 'border-red-800 bg-red-950/40';
+        title.textContent = '⚠ No camera network';
+        hint.textContent = 'Connect the laptop to a Wi-Fi network the phones can join, or start the hotspot.';
+        linksNote.textContent = '';
+      }
+      box.className = 'mb-4 rounded-lg p-3 border ' + tone;
+    }
+
     // ──────────────────────── Poll /api/status ────────────────────────
     async function pollStatus() {
       const data = await apiGet('/api/status');
@@ -1086,10 +1138,9 @@
       else if (stream.fallback && stream.active) setBanner('Live — fallback video / silence', 'warning');
       else setBanner('Connected', 'ok');
 
-      if (network.hotspot_active && network.wifi_ip && network.wifi_ip !== 'N/A') {
-        cameraHost = network.wifi_ip;
-      }
+      if (network.camera_ip) cameraHost = network.camera_ip;
       for (const cam of ['cam1', 'cam2', 'cam3']) document.getElementById('url-' + cam).textContent = cameraUrl(cam);
+      renderCameraNetwork(network);
 
       // --- USB Internet ---
       const usbDot = document.getElementById('status-usb-dot');
@@ -1100,7 +1151,7 @@
       } else {
         usbDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
       }
-      usbLabel.textContent = network.usb_status || 'USB';
+      usbLabel.textContent = network.internet_ok ? (network.uplink || 'Internet') : 'No internet';
       netUsbStatus.textContent = network.usb_status || 'Disconnected';
       if (network.usb_iface) {
         netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
@@ -1111,7 +1162,7 @@
       // --- Hotspot ---
       const hotspotIp = document.getElementById('status-hotspot-ip');
       const netHotspot = document.getElementById('net-hotspot-status');
-      hotspotIp.textContent = network.wifi_ip || '{{ media_host }}';
+      hotspotIp.textContent = network.camera_ip || '{{ media_host }}';
       if (network.hotspot_active) {
         netHotspot.textContent = 'Active';
         netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';

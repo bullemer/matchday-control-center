@@ -64,6 +64,7 @@ app = Flask(__name__)
 
 app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
 app.config["OPERATOR_PASSWORD"] = os.environ.get("MCC_OPERATOR_PASSWORD")
+app.config["OPERATOR_USER"] = os.environ.get("MCC_OPERATOR_USER", "operator")
 
 @app.before_request
 def protect_controls():
@@ -71,7 +72,8 @@ def protect_controls():
     auth = request.authorization
     if not password:
         return jsonify(ok=False, error="Operator password has not been configured"), 503
-    if not auth or auth.username != "operator" or not secrets.compare_digest((auth.password or "").encode(), password.encode()):
+    user_ok = secrets.compare_digest((auth.username or "").encode(), app.config["OPERATOR_USER"].encode()) if auth else False
+    if not auth or not user_ok or not secrets.compare_digest((auth.password or "").encode(), password.encode()):
         return jsonify(ok=False, error="Operator login required"), 401, {
             "WWW-Authenticate": 'Basic realm="Matchday operator"', "Cache-Control": "no-store"}
     if request.method == "POST":
@@ -365,7 +367,8 @@ def api_scoreboard_update():
     updates = {}
     for field in ("home_name", "away_name"):
         if field in data:
-            updates[field] = text_field(data, field, 40).upper() or field.split("_")[0].upper()
+            # Team names are shown exactly as typed; empty falls back to HOME / AWAY.
+            updates[field] = text_field(data, field, 40) or field.split("_")[0].upper()
     for field in ("home_score", "away_score"):
         if field in data:
             value = data[field]
@@ -539,13 +542,16 @@ def _background_init():
 def initialize():
     RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     password_file = RUNTIME_DIR / "operator-password"
+    user_file = RUNTIME_DIR / "operator-user"
+    if "MCC_OPERATOR_USER" not in os.environ and user_file.exists():
+        app.config["OPERATOR_USER"] = user_file.read_text().strip() or "operator"
     if not app.config["OPERATOR_PASSWORD"]:
         if not password_file.exists():
             fd = os.open(password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd, "w") as output:
                 output.write(secrets.token_urlsafe(24))
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
-        log.info("Login as operator; password is in %s", password_file)
+        log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     _restore_match()
     _write_scoreboard_file()
     for target in (_overlay_worker, _diagnostics_worker, _background_init):

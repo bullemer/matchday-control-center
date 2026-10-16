@@ -127,6 +127,32 @@ class NetworkTests(unittest.TestCase):
         with patch.object(n.shutil,'which',return_value='/bin/nmcli'),patch.object(n.subprocess,'run',side_effect=subprocess.TimeoutExpired(['nmcli','password','secret'],1)):
             self.assertNotIn('secret',n.run_cmd(['nmcli','password','secret'])[1])
 
+    def fake_nmcli(self, devices, route='8.8.8.8 via 192.168.1.1 dev wlan0 src 192.168.1.50'):
+        def run(cmd, timeout=10):
+            if cmd[:3] == ['nmcli','-t','-f']:
+                return True, devices
+            if cmd[:3] == ['nmcli','-g','IP4.ADDRESS']:
+                return True, {'wlan0':'192.168.1.50/24','eth0':'10.0.0.5/24'}.get(cmd[-1], '')
+            if cmd[:2] == ['ip','-4']:
+                return True, route
+            return True, ''
+        return run
+
+    def test_wifi_client_is_camera_network_without_hotspot(self):
+        devices='docker0:bridge:connected (externally):docker0\nwlan0:wifi:connected:Club\\:WiFi\neth0:ethernet:unavailable:'
+        with patch.object(n,'run_cmd',side_effect=self.fake_nmcli(devices)),patch.object(n,'_owned_uuid',return_value=None),patch.object(n,'_is_usb_device',return_value=False):
+            status=n.get_network_status()
+        self.assertEqual((status['camera_mode'],status['camera_ip']),('lan','192.168.1.50'))
+        self.assertEqual((status['lan_name'],status['lan_type'],status['uplink']),('Club:WiFi','wifi','Club:WiFi'))
+        self.assertFalse(status['hotspot_active'])
+
+    def test_usb_tether_is_never_camera_network(self):
+        devices='usb0:ethernet:connected:Tether\neth0:ethernet:connected:Wired'
+        with patch.object(n,'run_cmd',side_effect=self.fake_nmcli(devices,'8.8.8.8 dev usb0 src 192.168.42.10')),patch.object(n,'_owned_uuid',return_value=None),patch.object(n,'_is_usb_device',side_effect=lambda d: d=='usb0'):
+            status=n.get_network_status()
+        self.assertEqual(status['usb_iface'],'usb0')
+        self.assertEqual((status['camera_mode'],status['lan_iface'],status['uplink']),('lan','eth0','USB tether'))
+
     def test_pulse_mapping_by_properties(self):
         with patch.object(n,'_parse_arecord_devices',return_value=[dict(card_num=2,device_num=0,card_name='USB Mic',alsa_device='hw:2,0',is_usb=True)]),patch.object(n,'_parse_pulse_sources',return_value=[{'name':'alsa_input.USB-Microphone','properties':{'alsa.card':'2','alsa.device':'0'}}]):
             self.assertEqual(n.get_usb_audio_devices()[0]['id'],'alsa_input.USB-Microphone')
@@ -202,6 +228,24 @@ class MediaTests(unittest.TestCase):
             start.assert_called_once()
             m._supervise_once()  # backoff: not again immediately
             start.assert_called_once()
+
+    def test_1080p_profile_end_to_end_resolution(self):
+        with patch.object(m,'_profile','1080p'),patch.object(m,'_probe',return_value={'video','audio'}):
+            cmd,_,_=m._relay_command('cam2','active')
+            self.assertIn('scale=1920:1080',' '.join(cmd))
+            self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
+            with patch.object(m,'Process') as proc,patch.object(m,'_youtube_stream_key','key'):
+                m._launch_encoder()
+            enc=proc.call_args.args[0]
+            vf=enc[enc.index('-vf')+1]
+            self.assertIn('scale=1920:1080',vf); self.assertIn('fontsize=42',vf)
+            self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
+
+    def test_profile_change_rebuilds_relay_before_live(self):
+        with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
+            self.assertTrue(m.start_youtube_stream('key','1080p')[0])
+            cut.assert_called_once_with('cam1')
+            m.stop_youtube_stream()
 
     def test_log_redaction(self):
         proc=object.__new__(m.Process)

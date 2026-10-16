@@ -12,7 +12,7 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await page.waitForTimeout(2200);
   await expect(page.locator('#home-name')).toHaveValue('Test FC');
   await page.locator('#away-name').click();
-  await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.home_name)).toBe('TEST FC');
+  await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.home_name)).toBe('Test FC');
   await page.evaluate(() => adjustScore('home',1));
   await expect(page.locator('#home-score-display')).toHaveText('1');
   await page.evaluate(() => clockAction('second_half'));
@@ -90,4 +90,36 @@ test('match mode puts sideline controls on one phone screen', async ({page}) => 
   await expect(page.locator('#match-preview')).toBeHidden();
   await page.screenshot({path:'/tmp/mcc-match-mode.png'});
   expect(errors).toEqual([]);
+});
+
+test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address', async ({page}) => {
+  await page.route('**/api/status', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.network = {internet_ok: true, hotspot_active: false, wifi_ip: 'N/A', usb_iface: null,
+      usb_status: 'Disconnected', camera_mode: 'lan', camera_ip: '192.168.1.50', lan_type: 'wifi',
+      lan_iface: 'wlan0', lan_name: 'Club WiFi', lan_ip: '192.168.1.50', uplink: 'Club WiFi'};
+    await route.fulfill({response, json: body});
+  });
+  await page.goto('/');
+  await expect(page.locator('#url-cam1')).toHaveText('rtmp://192.168.1.50:1935/cam1');
+  await expect(page.locator('#camera-network-title')).toContainText('same Wi-Fi “Club WiFi”');
+  await expect(page.locator('#status-hotspot-ip')).toHaveText('192.168.1.50');
+  await expect(page.locator('#status-usb-label')).toHaveText('Club WiFi');
+  await expect(page.locator('#hotspot-note')).toBeVisible();
+});
+
+test('team names keep their own wording on the overlay and can be renamed in match mode', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('#home-name').fill('Fortuna Düsseldorf U19');
+  await expect(page.locator('#scoreboard-preview')).toContainText('Fortuna Düsseldorf U19');
+  await page.locator('#home-name').press('Enter');
+  await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.home_name)).toBe('Fortuna Düsseldorf U19');
+  await page.locator('#mode-toggle').click();
+  page.once('dialog', dialog => dialog.accept('SV Gäste'));
+  await page.locator('#match-panel [data-bind="away_name"]').click();
+  await expect(page.locator('#match-panel [data-bind="away_name"]')).toHaveText('SV Gäste');
+  await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.away_name)).toBe('SV Gäste');
+  await page.locator('#mode-toggle').click();
 });

@@ -94,6 +94,14 @@ def run():
             m._youtube_proc.proc.wait(timeout=5)
             wait(lambda: m._youtube_proc.proc.pid != encoder_pid and m.get_stream_status()['state'] == 'live',seconds=35)
             print('PASS: failed encoder automatically restarts and resumes progress', flush=True)
+            assert m.stop_youtube_stream()[0]
+            assert m.start_youtube_stream('cam3', '1080p')[0], m.get_stream_status()
+            wait(lambda: m.get_stream_status()['state'] == 'live')
+            probe = subprocess.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',
+                                    '-show_entries', 'stream=width,height', '-of', 'csv=p=0', f'{m.RTSP_BASE}/program'],
+                                   capture_output=True, text=True, timeout=10)
+            assert probe.stdout.strip() == '1920,1080', probe.stdout
+            print('PASS: 1080p profile streams a 1080p program', flush=True)
             results = []
             cut = threading.Thread(target=lambda: results.append(m.switch_camera('cam1')))
             cut.start()

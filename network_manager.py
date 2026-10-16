@@ -49,35 +49,80 @@ def _owned_uuid():
     return uuid
 
 
+def _nmcli_fields(line):
+    """Split one `nmcli -t` line; values escape ':' and '\\' with a backslash."""
+    return [part.replace("\\:", ":").replace("\\\\", "\\")
+            for part in re.split(r"(?<!\\):", line)]
+
+
+def _is_usb_device(dev):
+    return "/usb" in os.path.realpath(f"/sys/class/net/{dev}/device")
+
+
+def _device_ip(dev):
+    ok, ip = run_cmd(["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev])
+    return ip.splitlines()[0].split("/")[0] if ok and ip else None
+
+
 def get_network_status():
+    """Report the internet uplink and the network camera phones should join.
+
+    Cameras use the app's hotspot when it is active; otherwise they join the same
+    Wi-Fi/LAN the laptop is connected to (a USB tether is never a camera network)."""
     info = dict(wifi_ip="N/A", usb_iface=None, usb_status="Disconnected",
-                hotspot_active=False, internet_ok=False)
-    ok, raw = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE", "device"])
-    candidates = []
+                hotspot_active=False, hotspot_ssid=None, internet_ok=False,
+                lan_iface=None, lan_type=None, lan_name=None, lan_ip=None,
+                camera_mode="none", camera_ip=None, uplink=None)
+    ok, raw = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
+    candidates, lans = [], []
     if ok:
         for line in raw.splitlines():
-            parts = line.split(":")
-            if len(parts) != 3:
+            parts = _nmcli_fields(line)
+            if len(parts) != 4:
                 continue
-            dev, kind, state = parts
+            dev, kind, state, connection = parts
             # Identify USB-backed ethernet by sysfs, not by an enx name guess.
-            device_path = os.path.realpath(f"/sys/class/net/{dev}/device")
-            if kind == "ethernet" and "/usb" in device_path:
+            usb = kind == "ethernet" and _is_usb_device(dev)
+            if usb:
                 candidates.append((state == "connected", dev, state))
+            elif kind in ("wifi", "ethernet") and state == "connected":
+                lans.append((kind != "wifi", dev, kind, connection))  # prefer Wi-Fi
         if candidates:
             _, dev, state = sorted(candidates, reverse=True)[0]
             info.update(usb_iface=dev, usb_status=f"{dev} ({state})")
     uuid = _owned_uuid()
+    hotspot_dev = None
     if uuid:
         ok, active = run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"])
         if ok:
             for line in active.splitlines():
                 key, _, dev = line.partition(":")
                 if key == uuid:
+                    hotspot_dev = dev
                     info["hotspot_active"] = True
-                    ok_ip, ip = run_cmd(["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev])
-                    if ok_ip and ip:
-                        info["wifi_ip"] = ip.splitlines()[0].split("/")[0]
+                    info["hotspot_ssid"] = _field(uuid, "802-11-wireless.ssid") or None
+                    info["wifi_ip"] = _device_ip(dev) or "N/A"
+    for _, dev, kind, connection in sorted(lans):
+        if dev == hotspot_dev:
+            continue
+        ip = _device_ip(dev)
+        if ip:
+            info.update(lan_iface=dev, lan_type=kind, lan_name=connection, lan_ip=ip)
+            break
+    if info["hotspot_active"] and info["wifi_ip"] != "N/A":
+        info.update(camera_mode="hotspot", camera_ip=info["wifi_ip"])
+    elif info["lan_ip"]:
+        info.update(camera_mode="lan", camera_ip=info["lan_ip"])
+    ok, route = run_cmd(["ip", "-4", "-o", "route", "get", "8.8.8.8"], timeout=2)
+    if ok:
+        match = re.search(r"\bdev (\S+)", route)
+        dev = match.group(1) if match else None
+        if dev and dev == info["usb_iface"]:
+            info["uplink"] = "USB tether"
+        elif dev and dev == info["lan_iface"]:
+            info["uplink"] = info["lan_name"] or dev
+        else:
+            info["uplink"] = dev
     # A route-independent ping is only general connectivity, not proof of a tether uplink.
     ok, _ = run_cmd(["ping", "-c", "1", "-W", "1", "8.8.8.8"], timeout=2)
     info["internet_ok"] = ok
@@ -87,7 +132,7 @@ def get_network_status():
 def connect_usb(iface):
     if not isinstance(iface, str) or not re.fullmatch(r"[a-zA-Z0-9_.-]+", iface):
         return False, "Invalid interface"
-    if "/usb" not in os.path.realpath(f"/sys/class/net/{iface}/device"):
+    if not _is_usb_device(iface):
         return False, "Interface is not a USB network device"
     with _network_lock:
         ok, out = run_cmd(["nmcli", "--wait", "25", "device", "connect", iface], timeout=30)

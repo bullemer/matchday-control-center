@@ -22,6 +22,8 @@ sudo apt install python3-venv ffmpeg network-manager iproute2 iputils-ping alsa-
 Open `http://localhost:5000`. Log in as **operator**. On first launch, a random
 password is saved in `data/operator-password` with owner-only permissions. Read it
 locally, or supply your own password through `MCC_OPERATOR_PASSWORD` before launch.
+To change the login, edit `data/operator-user` and `data/operator-password` (one line
+each) and restart, or set `MCC_OPERATOR_USER` / `MCC_OPERATOR_PASSWORD`.
 Keep the password private; camera operators only need their camera publishing URL.
 The application never stores a YouTube stream key on disk or intentionally logs it.
 
@@ -50,7 +52,8 @@ workers: the hardware process manager and live match state are process-local.
    source (Cam 1 or the USB mic) is missing or drops out, the picture stays on the
    selected camera with that camera's own audio (or silence) and the dashboard shows an
    audio warning; the chosen source is restored automatically when it returns.
-5. Enter the YouTube stream key, choose 720p or 480p, and click GO LIVE. The app
+5. Enter the YouTube stream key, choose 1080p, 720p or 480p, and click GO LIVE.
+   1080p needs about 7 Mbps of reliable upload; use 720p on a weak mobile connection. The app
    validates a camera relay before launching the output encoder. “Starting” is not
    “Live”: frame progress is required for live status.
 6. Tap **Match mode** in the header for a one-screen sideline view: program preview
@@ -65,7 +68,7 @@ workers: the hardware process manager and live match state are process-local.
 ## Media pipeline and recovery
 
 Camera phones publish RTMP to `cam1`, `cam2`, or `cam3`. A relay normalizes the
-selected camera to 720p H.264 and stereo 48 kHz AAC on `program`. MediaMTX 1.21.2's
+selected camera to H.264 at the stream resolution and stereo 48 kHz AAC on `program`. MediaMTX 1.21.2's
 always-available program path supplies fallback video and silence when that publisher
 is absent. A separate encoder reads the continuous program over loopback RTSP,
 adds the scoreboard, and publishes RTMPS to YouTube.
@@ -111,7 +114,7 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/network/usb-connect` | Connect detected USB ethernet |
 | POST | `/api/network/hotspot-start` | Start/update owned hotspot with `ssid`, `password` |
 | POST | `/api/network/hotspot-stop` | Stop owned hotspot only |
-| POST | `/api/stream/start` | `stream_key`, optional `profile`: `720p` or `480p` |
+| POST | `/api/stream/start` | `stream_key`, optional `profile`: `1080p`, `720p` or `480p` |
 | POST | `/api/stream/stop` | Stop streaming |
 | POST | `/api/switch/<cam_id>` | Select cam1/cam2/cam3 |
 | POST | `/api/audio-source` | `mode`: `cam1`, `active`, or `usb:<device id>` |

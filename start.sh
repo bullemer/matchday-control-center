@@ -48,7 +48,7 @@ fi
 echo ""
 echo "[START] Launching on http://0.0.0.0:5000"
 echo "        Local access: http://localhost:5000"
-echo "        Login username: operator (password path is printed on startup)"
+echo "        Login details are printed on startup"
 echo ""
 
 exec python3 app.py

@@ -57,7 +57,12 @@ _retry_at = 0.0
 _retries = 0
 _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
 _profile = "720p"
-PROFILES = {"720p": (1280, 720, "4500k"), "480p": (854, 480, "1800k")}
+_relay_profile = None    # profile the running relay was built for
+# width, height, YouTube bitrate, camera-relay bitrate (relay output is re-encoded, so it
+# gets headroom). The relay runs at the stream resolution so 1080p is never upscaled.
+PROFILES = {"1080p": (1920, 1080, "6000k", "8000k"),
+            "720p": (1280, 720, "4500k", "4500k"),
+            "480p": (854, 480, "1800k", "2500k")}
 
 
 # Media processes run in their own process group (so a cut can kill ffmpeg cleanly) and
@@ -199,7 +204,7 @@ def generate_mediamtx_config():
         "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
         "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
         "rtmp": True, "rtmpAddress": ":1935", "hls": True, "hlsAddress": ":8888",
-        "webrtc": True, "webrtcAddress": ":8889", "srt": False,
+        "webrtc": True, "webrtcAddress": ":8889", "srt": False, "moq": False,
         "authInternalUsers": [
             {"user": "any", "ips": [], "permissions": [
                 {"action": "publish", "path": "~^cam[123]$"}, {"action": "read"}]},
@@ -367,10 +372,11 @@ def _relay_command(cam, mode):
 
 
 def _relay_output(cmd, audio):
+    width, height, _, bitrate = PROFILES[_profile]
     return cmd + ["-map", "0:v:0", "-map", audio,
-        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p", "-g", "30", "-b:v", "4500k",
+        "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-af", "aresample=async=1",
         "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"]
 
@@ -414,10 +420,11 @@ def switch_camera(cam_id, automatic=False):
 
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_audio, _audio_warning, _relay_failures
+    global _relay_profile
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
-    mode = _audio_source_mode
+    mode, profile = _audio_source_mode, _profile
     try:
         # Probe and validate before disturbing the current publisher.
         cmd, audio, warning = _relay_command(cam_id, mode)
@@ -439,7 +446,7 @@ def _replace_relay(cam_id, generation):
     with _lock:
         installed = ok and current()
         if installed:
-            _relay_proc, _active_camera = candidate, cam_id
+            _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
             _relay_audio, _audio_warning = audio, warning
             _error, _relay_failures = "", 0
     if installed:
@@ -479,15 +486,17 @@ def set_audio_source(mode):
 
 def _launch_encoder():
     global _youtube_proc
-    width, height, bitrate = PROFILES[_profile]
+    width, height, bitrate, _ = PROFILES[_profile]
+    font = round(height / 26)  # same on-screen size at every resolution
     # Disable drawtext expansion: team names are literal text, including percent signs.
     escaped = SCOREBOARD_PATH.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
     vf = (f"scale={width}:{height},drawtext=textfile='{escaped}':reload=1:expansion=none:"
-          "fontcolor=white:fontsize=28:box=1:boxcolor=black@0.6:boxborderw=8:x=20:y=h-th-20")
+          f"fontcolor=white:fontsize={font}:box=1:boxcolor=black@0.6:boxborderw={font // 3}:"
+          f"x={font * 2 // 3}:y=h-th-{font * 2 // 3}")
     cmd = _ffmpeg() + _input("program") + [
         "-map", "0:v:0", "-map", "0:a:0", "-vf", vf,
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
-        "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "9000k", "-g", "60",
+        "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
         "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
         "-ar", "48000", "-ac", "2", "-rw_timeout", "10000000", "-f", "flv",
         f"{YOUTUBE_RTMP_BASE}/{_youtube_stream_key}"]
@@ -508,6 +517,12 @@ def start_youtube_stream(stream_key, profile="720p"):
         return False, "MediaMTX is not ready"
     if not Path(SCOREBOARD_PATH).is_file():
         return False, "Scoreboard is not initialized"
+    _profile = profile
+    if get_active_camera() and _relay_profile != profile:
+        # Rebuild the program relay at the stream resolution before going live.
+        ok, message = switch_camera(_active_camera)
+        if not ok:
+            return False, message
     if not get_active_camera():
         # Selecting a camera can take seconds; do it without holding _lock.
         try:
@@ -524,7 +539,7 @@ def start_youtube_stream(stream_key, profile="720p"):
     with _lock:
         if _want_stream:
             return False, "Stream is already starting or running; stop before changing settings"
-        _youtube_stream_key, _profile = stream_key, profile
+        _youtube_stream_key = stream_key
         try:
             _launch_encoder()
         except OSError:
