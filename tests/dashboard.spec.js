@@ -129,3 +129,22 @@ test('team names keep their own wording on the overlay and can be renamed in mat
   await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.away_name)).toBe('SV Gäste');
   await page.locator('#mode-toggle').click();
 });
+
+test('hotspot form keeps the saved password and buttons follow the hotspot state', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#net-hotspot-status')).toHaveText('Active');
+  await expect(page.locator('#hotspot-password')).toHaveValue('saved-secret');
+  await expect(page.locator('#hotspot-ssid')).toHaveValue('MatchdayLive');
+  // Running with unchanged settings: nothing to start, only Stop.
+  await expect(page.locator('#hotspot-start-btn')).toBeDisabled();
+  await expect(page.locator('#hotspot-start-btn')).toHaveText('↻ Apply changes');
+  await expect(page.locator('#hotspot-stop-btn')).toBeEnabled();
+  await page.locator('#hotspot-password').fill('new-password-1');
+  await expect(page.locator('#hotspot-start-btn')).toBeEnabled();
+  await page.waitForTimeout(2500);  // a status poll must not wipe the edit
+  await expect(page.locator('#hotspot-password')).toHaveValue('new-password-1');
+  let asked = '';
+  page.once('dialog', dialog => { asked = dialog.message(); dialog.dismiss(); });
+  await page.locator('#hotspot-stop-btn').click();
+  expect(asked).toContain('Stop the hotspot?');
+});

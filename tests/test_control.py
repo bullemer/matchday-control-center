@@ -57,6 +57,12 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code,409)
         self.assertTrue(r.json['superseded'])
 
+    def test_hotspot_start_accepts_empty_password(self):
+        with patch.object(a,'start_hotspot',return_value=(True,'ok')) as start,patch.object(a,'_refresh_network'):
+            self.assertEqual(self.post('/api/network/hotspot-start',{'ssid':'Net','password':''}).status_code,200)
+            start.assert_called_once_with('Net','')
+        self.assertEqual(self.post('/api/network/hotspot-start',{'ssid':'Net','password':'short'}).status_code,400)
+
     def test_audio_case_preserved(self):
         with patch.object(a,'set_audio_source',return_value=(True,'ok')) as fn:
             self.post('/api/audio-source',{'mode':'usb:alsa_input.USB-Device'})
@@ -165,6 +171,23 @@ class NetworkTests(unittest.TestCase):
                 return True, route
             return True, ''
         return run
+
+    def test_hotspot_running_unchanged_is_not_restarted(self):
+        with patch.object(n,'_owned_uuid',return_value='owned'),patch.object(n,'get_hotspot_config',return_value={'ssid':'Net','password':'secret123','saved':True}),patch.object(n,'_hotspot_active',return_value=True),patch.object(n,'run_cmd') as run:
+            self.assertEqual(n.start_hotspot('Net',''),(True,'Hotspot is already running'))
+            run.assert_not_called()
+
+    def test_empty_password_reuses_saved(self):
+        with patch.object(n,'_owned_uuid',return_value='owned'),patch.object(n,'get_hotspot_config',return_value={'ssid':'Net','password':'secret123','saved':True}),patch.object(n,'_hotspot_active',return_value=False),patch.object(n,'run_cmd',return_value=(True,'')) as run:
+            self.assertTrue(n.start_hotspot('Net','')[0])
+            modify=run.call_args_list[0].args[0]
+            self.assertEqual(modify[modify.index('wifi-sec.psk')+1],'secret123')
+            self.assertIn('rsn',modify)
+
+    def test_new_hotspot_requires_password(self):
+        with patch.object(n,'_owned_uuid',return_value=None),patch.object(n,'run_cmd') as run:
+            self.assertFalse(n.start_hotspot('Net','')[0])
+            run.assert_not_called()
 
     def test_wifi_client_is_camera_network_without_hotspot(self):
         devices='docker0:bridge:connected (externally):docker0\nwlan0:wifi:connected:Club\\:WiFi\neth0:ethernet:unavailable:'

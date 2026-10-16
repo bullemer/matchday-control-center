@@ -30,7 +30,7 @@ import signal
 from pathlib import Path
 from urllib.parse import urlsplit
 from werkzeug.exceptions import HTTPException
-from network_manager import (get_network_status, connect_usb, start_hotspot,
+from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
                              stop_hotspot, get_usb_audio_devices, get_firewall_status)
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
@@ -261,13 +261,32 @@ def api_hotspot_start():
 
     if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32:
         raise ValueError("SSID must be 1–32 bytes")
-    if not isinstance(password, str) or not 8 <= len(password) <= 63:
+    # Empty password: reuse the one saved with the hotspot profile.
+    if not isinstance(password, str) or (password and not 8 <= len(password) <= 63):
         return jsonify({"ok": False, "error": "Password must be 8–63 characters"}), 400
 
     log.info("Hotspot start requested: ssid=%s", ssid)
     success, msg = start_hotspot(ssid, password)
+    _refresh_network()
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
+
+
+@app.route("/api/network/hotspot-config", methods=["GET"])
+@api_endpoint
+def api_hotspot_config():
+    """Saved hotspot SSID and password, to prefill the dashboard form."""
+    return jsonify({"ok": True, **get_hotspot_config()})
+
+
+def _refresh_network():
+    """Update cached network diagnostics now, so the dashboard shows the result of a
+    hotspot change on its next poll instead of after the next 5 s probe."""
+    try:
+        network = get_network_status()
+        _diagnostics.update(network=network, firewall=get_firewall_status(network))
+    except Exception:
+        log.exception("Network refresh failed")
 
 
 @app.route("/api/network/hotspot-stop", methods=["POST"])
@@ -276,6 +295,7 @@ def api_hotspot_stop():
     """Stop the Wi-Fi hotspot."""
     log.info("Hotspot stop requested")
     success, msg = stop_hotspot()
+    _refresh_network()
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
 

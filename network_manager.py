@@ -145,19 +145,46 @@ def connect_usb(iface):
         return ok, f"Connected {iface}" if ok else out
 
 
-def start_hotspot(ssid, password):
+def _hotspot_active(uuid):
+    ok, active = run_cmd(["nmcli", "-t", "-f", "UUID", "connection", "show", "--active"])
+    return ok and uuid in active.splitlines()
+
+
+def get_hotspot_config():
+    """SSID and password of the app's hotspot. NetworkManager already stores them, so the
+    dashboard can prefill the form without the app keeping its own copy of the secret."""
+    uuid = _owned_uuid()
+    if not uuid:
+        return {"ssid": "MatchdayLive", "password": "", "saved": False}
+    ok, psk = run_cmd(["nmcli", "-s", "-g", "802-11-wireless-security.psk", "connection", "show", "uuid", uuid])
+    return {"ssid": _field(uuid, "802-11-wireless.ssid") or "MatchdayLive",
+            "password": psk if ok else "", "saved": True}
+
+
+def start_hotspot(ssid, password=""):
+    """Start the hotspot. An empty password keeps the saved one. If it is already running
+    with these settings nothing is restarted, so connected phones are not dropped."""
     if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32:
         return False, "SSID must be 1–32 bytes"
-    if not isinstance(password, str) or not 8 <= len(password) <= 63:
+    if not isinstance(password, str) or (password and not 8 <= len(password) <= 63):
         return False, "Passphrase must be 8–63 characters"
     with _network_lock:
         uuid = _owned_uuid()
         if uuid:
+            saved = get_hotspot_config()
+            password = password or saved["password"]
+            if not password:
+                return False, "Enter a hotspot password (8–63 characters)"
+            unchanged = saved["ssid"] == ssid and saved["password"] == password
+            if unchanged and _hotspot_active(uuid):
+                return True, "Hotspot is already running"
             ok, out = run_cmd(["nmcli", "connection", "modify", "uuid", uuid,
                                "802-11-wireless.ssid", ssid, "wifi-sec.psk", password, *HOTSPOT_RADIO])
             if ok:
                 ok, out = run_cmd(["nmcli", "connection", "up", "uuid", uuid], timeout=30)
             return ok, "Hotspot started" if ok else "Could not activate hotspot; check NetworkManager permissions"
+        if not password:
+            return False, "Enter a hotspot password (8–63 characters)"
         ok, devices = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"])
         if not ok:
             return False, devices

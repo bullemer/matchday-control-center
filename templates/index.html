@@ -244,18 +244,18 @@
           </div>
           <p id="hotspot-note" class="hidden text-xs text-brand-amber mb-2"></p>
           <div class="space-y-2 mb-3">
-            <input id="hotspot-ssid" type="text" value="MatchdayLive" placeholder="SSID"
-                   class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
-            <input id="hotspot-password" type="text" value="" placeholder="Password (8–63 characters)"
-                   class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
+            <input id="hotspot-ssid" type="text" value="MatchdayLive" placeholder="SSID" oninput="renderHotspotControls()"
+                   aria-label="Hotspot name" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
+            <input id="hotspot-password" type="text" value="" placeholder="Password (8–63 characters)" oninput="renderHotspotControls()"
+                   aria-label="Hotspot password" autocomplete="off" class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
           </div>
           <div class="flex gap-2">
-            <button onclick="hotspotStart()"
-                    class="flex-1 bg-brand-green hover:bg-green-600 text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
+            <button id="hotspot-start-btn" onclick="hotspotStart()"
+                    class="flex-1 bg-brand-green hover:bg-green-600 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
               ▶ Start
             </button>
-            <button onclick="apiPost('/api/network/hotspot-stop')"
-                    class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
+            <button id="hotspot-stop-btn" onclick="hotspotStop()"
+                    class="flex-1 bg-slate-600 hover:bg-slate-500 disabled:bg-slate-700 disabled:text-slate-500 disabled:cursor-not-allowed text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
               ⏹ Stop
             </button>
           </div>
@@ -685,14 +685,75 @@
     }
 
     // ──────────────────────── Network ────────────────────────
-    function hotspotStart() {
-      const ssid = document.getElementById('hotspot-ssid').value.trim();
-      const password = document.getElementById('hotspot-password').value;
-      if (!ssid || !password) {
-        showToast('Enter SSID and password', 'warning');
+    // The form is prefilled from the saved hotspot; buttons follow the real hotspot state.
+    const hotspot = {saved: null, pending: null, active: false, network: {}};
+
+    async function loadHotspotConfig() {
+      const config = await apiGet('/api/network/hotspot-config');
+      if (!config || !config.ok) return;
+      hotspot.saved = {ssid: config.ssid, password: config.password};
+      const ssid = document.getElementById('hotspot-ssid');
+      const password = document.getElementById('hotspot-password');
+      if (document.activeElement !== ssid) ssid.value = config.ssid;
+      if (document.activeElement !== password) password.value = config.password;
+      renderHotspotControls();
+    }
+
+    function hotspotFormChanged() {
+      if (!hotspot.saved) return true;
+      return document.getElementById('hotspot-ssid').value.trim() !== hotspot.saved.ssid
+        || document.getElementById('hotspot-password').value !== hotspot.saved.password;
+    }
+
+    function renderHotspotControls() {
+      const start = document.getElementById('hotspot-start-btn');
+      const stop = document.getElementById('hotspot-stop-btn');
+      const badge = document.getElementById('net-hotspot-status');
+      if (hotspot.pending) {
+        badge.textContent = hotspot.pending === 'start' ? 'Starting…' : 'Stopping…';
+        badge.className = 'text-xs px-2 py-0.5 rounded bg-brand-amber/20 text-brand-amber font-medium pulse-live';
+        start.disabled = stop.disabled = true;
         return;
       }
-      apiPost('/api/network/hotspot-start', { ssid, password });
+      badge.textContent = hotspot.active ? 'Active' : 'Off';
+      badge.className = hotspot.active
+        ? 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium'
+        : 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
+      const changed = hotspotFormChanged();
+      // Running with the same settings: nothing to start. Changed settings: apply (restarts it).
+      start.textContent = hotspot.active ? '↻ Apply changes' : '▶ Start';
+      start.disabled = hotspot.active && !changed;
+      stop.disabled = !hotspot.active;
+    }
+
+    async function hotspotStart() {
+      const ssid = document.getElementById('hotspot-ssid').value.trim();
+      const password = document.getElementById('hotspot-password').value;
+      if (!ssid) return showToast('Enter a hotspot name', 'warning');
+      if (password && (password.length < 8 || password.length > 63)) return showToast('Password must be 8–63 characters', 'warning');
+      if (!password && !(hotspot.saved && hotspot.saved.password)) return showToast('Enter a hotspot password (8–63 characters)', 'warning');
+      const net = hotspot.network;
+      if (hotspot.active && !confirm('Apply the new hotspot name/password? Connected phones disconnect and must rejoin with the new details.')) return;
+      if (!hotspot.active && net.camera_mode === 'lan' && net.lan_type === 'wifi'
+          && !confirm(`Start the hotspot? The laptop will leave Wi-Fi “${net.lan_name}”; phones then use the hotspot and the dashboard at http://10.42.0.1:5000.`)) return;
+      hotspot.pending = 'start';
+      renderHotspotControls();
+      const result = await apiPost('/api/network/hotspot-start', {ssid, password});
+      hotspot.pending = null;
+      if (result) hotspot.active = true;
+      await loadHotspotConfig();
+      pollStatus();
+    }
+
+    async function hotspotStop() {
+      if (!confirm('Stop the hotspot? Camera phones connected to it will disconnect.')) return;
+      hotspot.pending = 'stop';
+      renderHotspotControls();
+      const result = await apiPost('/api/network/hotspot-stop');
+      hotspot.pending = null;
+      if (result) hotspot.active = false;
+      renderHotspotControls();
+      pollStatus();
     }
 
     // ──────────────────────── Match mode ────────────────────────
@@ -1166,15 +1227,10 @@
 
       // --- Hotspot ---
       const hotspotIp = document.getElementById('status-hotspot-ip');
-      const netHotspot = document.getElementById('net-hotspot-status');
       hotspotIp.textContent = network.camera_ip || '{{ media_host }}';
-      if (network.hotspot_active) {
-        netHotspot.textContent = 'Active';
-        netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
-      } else {
-        netHotspot.textContent = 'Inactive';
-        netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
-      }
+      hotspot.network = network;
+      if (!hotspot.pending) hotspot.active = !!network.hotspot_active;
+      renderHotspotControls();
 
       // --- RTMP Server ---
       const rtmpDot = document.getElementById('status-rtmp-dot');
@@ -1325,6 +1381,7 @@
     applyMode();
     updateTallyButtons();
     updateAudioToggle();
+    loadHotspotConfig();
     pollLoop();
   </script>
 </body>
