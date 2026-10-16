@@ -26,7 +26,7 @@ from flask import Flask, jsonify, render_template, request
 # Graceful imports for companion modules (may not exist yet during early dev)
 # ---------------------------------------------------------------------------
 try:
-    from network_manager import get_network_status, connect_usb_tether, start_hotspot, stop_hotspot
+    from network_manager import get_network_status, connect_usb, start_hotspot, stop_hotspot
 except ImportError:
     logging.warning("network_manager module not found — network endpoints will return stub data")
 
@@ -39,7 +39,7 @@ except ImportError:
             "internet_ok": False,
         }
 
-    def connect_usb_tether():
+    def connect_usb(iface=None):
         return False, "network_manager module not loaded"
 
     def start_hotspot(ssid, password):
@@ -50,15 +50,33 @@ except ImportError:
 
 try:
     from media_engine import (
-        init_mediamtx,
+        ensure_mediamtx,
+        start_mediamtx,
         get_camera_status,
-        get_mediamtx_status,
+        get_mediamtx_running,
+        get_youtube_running,
+        get_active_camera,
+        get_audio_source as get_audio_source_mode,
         start_youtube_stream,
         stop_youtube_stream,
         switch_camera,
         set_audio_source,
-        get_stream_status,
     )
+
+    def init_mediamtx():
+        ensure_mediamtx()
+        start_mediamtx()
+
+    def get_mediamtx_status():
+        return {"running": get_mediamtx_running()}
+
+    def get_stream_status():
+        return {
+            "active": get_youtube_running(),
+            "active_camera": get_active_camera(),
+            "audio_source": get_audio_source_mode(),
+        }
+
 except ImportError:
     logging.warning("media_engine module not found — media endpoints will return stub data")
 
@@ -245,7 +263,12 @@ def api_status():
 def api_usb_connect():
     """Connect the USB tethering interface."""
     log.info("USB connect requested")
-    success, msg = connect_usb_tether()
+    # Auto-detect USB interface from network status
+    net = get_network_status()
+    iface = net.get("usb_iface")
+    if not iface:
+        return jsonify({"ok": False, "message": "No USB tethering interface detected"}), 404
+    success, msg = connect_usb(iface)
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
 

@@ -26,7 +26,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-MEDIAMTX_VERSION = "1.12.2"
+MEDIAMTX_VERSION = "1.21.2"
 MEDIAMTX_DOWNLOAD_URL = (
     f"https://github.com/bluenviron/mediamtx/releases/download/"
     f"v{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_linux_amd64.tar.gz"
