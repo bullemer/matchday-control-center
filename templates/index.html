@@ -1,0 +1,945 @@
+<!DOCTYPE html>
+<html lang="en" class="scroll-smooth">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>⚽ Matchday Live Control Center</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            slate: {
+              950: '#0f172a',
+              900: '#0f1729',
+              850: '#131c35',
+              800: '#1e293b',
+              700: '#334155',
+              600: '#475569',
+            },
+            brand: {
+              red: '#ef4444',
+              green: '#22c55e',
+              blue: '#3b82f6',
+              amber: '#f59e0b',
+              cyan: '#06b6d4',
+            }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    /* Base dark-mode styles */
+    body {
+      background-color: #0f172a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    }
+    /* Scrollbar styling */
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #1e293b; }
+    ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+
+    /* Toast animations */
+    @keyframes slideIn {
+      from { transform: translateX(100%); opacity: 0; }
+      to   { transform: translateX(0);    opacity: 1; }
+    }
+    @keyframes slideOut {
+      from { transform: translateX(0);    opacity: 1; }
+      to   { transform: translateX(100%); opacity: 0; }
+    }
+    .toast-enter { animation: slideIn 0.3s ease forwards; }
+    .toast-exit  { animation: slideOut 0.3s ease forwards; }
+
+    /* Pulsing live dot */
+    @keyframes pulse-live {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+    .pulse-live { animation: pulse-live 1.2s ease-in-out infinite; }
+
+    /* WebRTC iframe container */
+    .webrtc-frame {
+      position: relative;
+      padding-bottom: 56.25%; /* 16:9 */
+      height: 0;
+      overflow: hidden;
+      border-radius: 0.5rem;
+      background: #1e293b;
+    }
+    .webrtc-frame iframe {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%; height: 100%;
+      border: none;
+      border-radius: 0.5rem;
+    }
+
+    /* Password toggle */
+    .password-toggle {
+      cursor: pointer;
+      user-select: none;
+    }
+
+    /* Touch-friendly buttons */
+    .btn-tally {
+      min-height: 56px;
+      font-size: 1rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      transition: all 0.15s ease;
+    }
+    .btn-tally:active {
+      transform: scale(0.96);
+    }
+
+    /* Score button */
+    .btn-score {
+      min-width: 48px;
+      min-height: 48px;
+      font-size: 1.5rem;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body class="min-h-screen pb-8">
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       TOAST CONTAINER
+       ═══════════════════════════════════════════════════════════════════ -->
+  <div id="toast-container" class="fixed top-4 right-4 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       1. TOP STATUS BAR
+       ═══════════════════════════════════════════════════════════════════ -->
+  <header class="sticky top-0 z-40 bg-slate-900/95 backdrop-blur border-b border-slate-700 px-4 py-2">
+    <div class="max-w-6xl mx-auto flex flex-wrap items-center justify-between gap-2">
+      <!-- Title -->
+      <h1 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+        ⚽ <span class="hidden sm:inline">Matchday Live</span> Control Center
+      </h1>
+      <!-- Status Badges -->
+      <div class="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
+        <!-- USB Internet -->
+        <span class="flex items-center gap-1.5" title="USB Internet">
+          <span id="status-usb-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+          <span id="status-usb-label" class="text-slate-300">USB</span>
+        </span>
+        <!-- Hotspot IP -->
+        <span class="flex items-center gap-1.5" title="Hotspot">
+          📡 <span id="status-hotspot-ip" class="text-slate-300">10.42.0.1</span>
+        </span>
+        <!-- RTMP Server -->
+        <span class="flex items-center gap-1.5" title="RTMP Server">
+          <span id="status-rtmp-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
+          <span class="text-slate-300">RTMP</span>
+        </span>
+        <!-- YouTube Stream -->
+        <span id="status-yt-badge"
+              class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400">
+          OFFLINE
+        </span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       MAIN CONTENT
+       ═══════════════════════════════════════════════════════════════════ -->
+  <main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         2. NETWORK CONTROLS PANEL
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        🌐 Network Controls
+      </h2>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
+        <!-- USB Connect -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm text-slate-400">USB Tethering</span>
+            <span id="net-usb-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Disconnected</span>
+          </div>
+          <button onclick="apiPost('/api/network/usb-connect')"
+                  class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2.5 rounded-lg transition-colors">
+            🔌 USB Connect
+          </button>
+        </div>
+        <!-- Hotspot Controls -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm text-slate-400">Wi-Fi Hotspot</span>
+            <span id="net-hotspot-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Inactive</span>
+          </div>
+          <div class="space-y-2 mb-3">
+            <input id="hotspot-ssid" type="text" value="MatchdayLive" placeholder="SSID"
+                   class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
+            <input id="hotspot-password" type="text" value="GoalGoal!" placeholder="Password"
+                   class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
+          </div>
+          <div class="flex gap-2">
+            <button onclick="hotspotStart()"
+                    class="flex-1 bg-brand-green hover:bg-green-600 text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
+              ▶ Start
+            </button>
+            <button onclick="apiPost('/api/network/hotspot-stop')"
+                    class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-semibold py-2.5 rounded-lg transition-colors text-sm">
+              ⏹ Stop
+            </button>
+          </div>
+        </div>
+        <!-- Firewall Status -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm text-slate-400">Firewall</span>
+            <span id="net-firewall-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Unknown</span>
+          </div>
+          <div id="net-firewall-details" class="text-xs text-slate-400 space-y-1">
+            <p>Ports required: 5000, 1935, 8888, 8889, 8189/UDP</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         3. CAMERA OPERATOR QUICK-COPY CARDS
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        🎥 Camera RTMP Links
+        <span class="text-xs text-slate-400 font-normal">(Tap to copy on camera phones)</span>
+      </h2>
+      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <!-- Cam 1 -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-white">📹 Cam 1</span>
+            <span id="cam-badge-cam1" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
+          </div>
+          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam1</code>
+          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam1')"
+                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
+            📋 Copy RTMP URL
+          </button>
+        </div>
+        <!-- Cam 2 -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-white">📹 Cam 2</span>
+            <span id="cam-badge-cam2" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
+          </div>
+          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam2</code>
+          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam2')"
+                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
+            📋 Copy RTMP URL
+          </button>
+        </div>
+        <!-- Cam 3 -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <div class="flex items-center justify-between mb-2">
+            <span class="font-semibold text-white">📹 Cam 3</span>
+            <span id="cam-badge-cam3" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
+          </div>
+          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam3</code>
+          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam3')"
+                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
+            📋 Copy RTMP URL
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         4. MULTIVIEW GRID + CAMERA SWITCHING
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        📺 Multiview &amp; Camera Switching
+      </h2>
+
+      <!-- 2x2 WebRTC Grid -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
+        <!-- Cam 1 Preview -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 1</span>
+            <span id="mv-badge-cam1" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
+          </div>
+          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam1">
+            <iframe src="http://10.42.0.1:8889/cam1" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
+        <!-- Cam 2 Preview -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 2</span>
+            <span id="mv-badge-cam2" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
+          </div>
+          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam2">
+            <iframe src="http://10.42.0.1:8889/cam2" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
+        <!-- Cam 3 Preview -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 3</span>
+            <span id="mv-badge-cam3" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
+          </div>
+          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam3">
+            <iframe src="http://10.42.0.1:8889/cam3" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
+        <!-- Program Output -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program Output</span>
+            <span id="mv-badge-program" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
+          </div>
+          <div class="webrtc-frame border-2 border-red-900" id="frame-program">
+            <iframe src="http://10.42.0.1:8889/program" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tally / Cut Buttons -->
+      <div class="grid grid-cols-3 gap-3 mb-4">
+        <button id="btn-cut-cam1" onclick="switchCam('cam1')"
+                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
+          🎥 CUT TO CAM 1
+        </button>
+        <button id="btn-cut-cam2" onclick="switchCam('cam2')"
+                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
+          🎥 CUT TO CAM 2
+        </button>
+        <button id="btn-cut-cam3" onclick="switchCam('cam3')"
+                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
+          🎥 CUT TO CAM 3
+        </button>
+      </div>
+
+      <!-- Audio Source Toggle -->
+      <div class="flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-slate-700">
+        <span class="text-sm text-slate-400">🔊 Audio Source:</span>
+        <div class="flex rounded-lg overflow-hidden border border-slate-600">
+          <button id="audio-cam1" onclick="setAudioSource('cam1')"
+                  class="px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors">
+            🎙 Main Mic (Cam 1)
+          </button>
+          <button id="audio-follow" onclick="setAudioSource('follow')"
+                  class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
+            🔄 Follow Active Camera
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         5. YOUTUBE STREAM CONTROLS
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        ▶️ YouTube Stream
+      </h2>
+      <div class="space-y-4">
+        <!-- Stream Key Input -->
+        <div>
+          <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
+          <div class="flex gap-2">
+            <div class="relative flex-1">
+              <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
+                     class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
+              <button onclick="toggleStreamKeyVisibility()"
+                      class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm px-2 py-1">
+                👁
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- Go Live / Stop -->
+        <div class="flex gap-3">
+          <button onclick="goLive()"
+                  class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
+            🔴 GO LIVE
+          </button>
+          <button onclick="stopStream()"
+                  class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
+            ⏹ STOP STREAM
+          </button>
+        </div>
+        <!-- Duration Timer -->
+        <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
+          <span class="pulse-live text-red-500 text-lg">🔴</span>
+          <span class="text-sm text-slate-300">ON AIR</span>
+          <span id="yt-duration" class="font-mono text-xl text-white font-bold ml-auto">00:00:00</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         6. LIVE FOOTBALL SCOREBOARD CONTROLS
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        ⚽ Scoreboard &amp; Match Clock
+      </h2>
+
+      <!-- Score Controls -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
+        <!-- Home Team -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Home Team</label>
+          <input id="home-name" type="text" value="HOME" placeholder="Home team name"
+                 onchange="updateScoreboard()"
+                 class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
+          <div class="flex items-center justify-center gap-3">
+            <button onclick="adjustScore('home', -1)"
+                    class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg transition-colors">−</button>
+            <span id="home-score-display" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
+            <button onclick="adjustScore('home', 1)"
+                    class="btn-score bg-slate-700 hover:bg-slate-600 text-brand-green rounded-lg transition-colors">+</button>
+          </div>
+        </div>
+        <!-- Away Team -->
+        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+          <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Away Team</label>
+          <input id="away-name" type="text" value="AWAY" placeholder="Away team name"
+                 onchange="updateScoreboard()"
+                 class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
+          <div class="flex items-center justify-center gap-3">
+            <button onclick="adjustScore('away', -1)"
+                    class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg transition-colors">−</button>
+            <span id="away-score-display" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
+            <button onclick="adjustScore('away', 1)"
+                    class="btn-score bg-slate-700 hover:bg-slate-600 text-brand-green rounded-lg transition-colors">+</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Live Scoreboard Preview -->
+      <div class="bg-black rounded-lg p-4 mb-4 border border-slate-600">
+        <label class="block text-xs text-slate-500 uppercase tracking-wider mb-2">Live Overlay Preview</label>
+        <div id="scoreboard-preview"
+             class="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 rounded-lg px-6 py-3 text-center border border-slate-600">
+          <span class="text-lg sm:text-2xl font-bold text-white tracking-wide font-mono">
+            HOME &nbsp; 0 - 0 &nbsp; AWAY &nbsp; | &nbsp; 00:00
+          </span>
+        </div>
+      </div>
+
+      <!-- Match Clock -->
+      <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
+        <label class="block text-xs text-slate-400 uppercase tracking-wider mb-3">⏱ Match Clock</label>
+        <div class="text-center mb-4">
+          <span id="match-clock-display" class="text-5xl sm:text-6xl font-bold font-mono text-white tabular-nums">00:00</span>
+        </div>
+        <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+          <button onclick="clockAction('start')"
+                  class="bg-brand-green hover:bg-green-600 text-white font-semibold py-3 rounded-lg transition-colors">
+            ▶ Start
+          </button>
+          <button onclick="clockAction('pause')"
+                  class="bg-brand-amber hover:bg-amber-600 text-white font-semibold py-3 rounded-lg transition-colors">
+            ⏸ Pause
+          </button>
+          <button onclick="clockAction('reset')"
+                  class="bg-slate-600 hover:bg-slate-500 text-white font-semibold py-3 rounded-lg transition-colors">
+            ↺ Reset
+          </button>
+          <button onclick="clockAction('second_half')"
+                  class="bg-brand-blue hover:bg-blue-600 text-white font-semibold py-3 rounded-lg transition-colors">
+            ⏩ 2nd Half (45:00)
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         7. INTERACTIVE SIDELINE CHECKLIST
+         ───────────────────────────────────────────────────────────────── -->
+    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        ✅ Sideline Checklist
+      </h2>
+      <div id="checklist" class="space-y-2">
+        <!-- Items rendered by JS -->
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       FOOTER
+       ═══════════════════════════════════════════════════════════════════ -->
+  <footer class="max-w-6xl mx-auto px-4 py-4 text-center text-xs text-slate-600">
+    Matchday Live Control Center • Sideline Broadcast System
+  </footer>
+
+  <!-- ═══════════════════════════════════════════════════════════════════
+       JAVASCRIPT
+       ═══════════════════════════════════════════════════════════════════ -->
+  <script>
+    // ──────────────────────── State ────────────────────────
+    let state = {
+      homeScore: 0,
+      awayScore: 0,
+      activeCam: 'cam1',
+      audioSource: 'cam1',         // 'cam1' or 'follow'
+      ytLive: false,
+      ytStartTime: null,
+      clockRunning: false,
+      clockElapsed: 0,             // seconds from server
+      clockLastServerUpdate: null,  // Date.now() of last server sync
+      streamKeyVisible: false,
+    };
+
+    // ──────────────────────── Clipboard (HTTP-safe) ────────────────────────
+    function copyToClipboard(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        navigator.clipboard.writeText(text);
+      } else {
+        const textArea = document.createElement('textarea');
+        textArea.value = text;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-9999px';
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+    }
+
+    function copyRtmp(url) {
+      copyToClipboard(url);
+      showToast('📋 Copied: ' + url, 'info');
+    }
+
+    // ──────────────────────── Toast Notifications ────────────────────────
+    function showToast(message, type = 'info') {
+      const container = document.getElementById('toast-container');
+      const toast = document.createElement('div');
+      const colors = {
+        info:    'bg-brand-blue',
+        success: 'bg-brand-green',
+        error:   'bg-brand-red',
+        warning: 'bg-brand-amber',
+      };
+      toast.className = `pointer-events-auto ${colors[type] || colors.info} text-white text-sm font-medium px-4 py-3 rounded-lg shadow-lg toast-enter max-w-xs`;
+      toast.textContent = message;
+      container.appendChild(toast);
+      setTimeout(() => {
+        toast.classList.remove('toast-enter');
+        toast.classList.add('toast-exit');
+        setTimeout(() => toast.remove(), 300);
+      }, 3000);
+    }
+
+    // ──────────────────────── API Helpers ────────────────────────
+    async function apiPost(url, body = {}) {
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        const data = await res.json();
+        if (data.ok || data.status === 'ok' || res.ok) {
+          showToast(data.message || 'Done', 'success');
+        } else {
+          showToast(data.message || data.error || 'Error', 'error');
+        }
+        return data;
+      } catch (err) {
+        showToast('Request failed: ' + err.message, 'error');
+        return null;
+      }
+    }
+
+    async function apiGet(url) {
+      try {
+        const res = await fetch(url);
+        return await res.json();
+      } catch {
+        return null;
+      }
+    }
+
+    // ──────────────────────── Network ────────────────────────
+    function hotspotStart() {
+      const ssid = document.getElementById('hotspot-ssid').value.trim();
+      const password = document.getElementById('hotspot-password').value.trim();
+      if (!ssid || !password) {
+        showToast('Enter SSID and password', 'warning');
+        return;
+      }
+      apiPost('/api/network/hotspot-start', { ssid, password });
+    }
+
+    // ──────────────────────── Camera Switching ────────────────────────
+    async function switchCam(camId) {
+      await apiPost('/api/switch/' + camId);
+      state.activeCam = camId;
+      updateTallyButtons();
+    }
+
+    function updateTallyButtons() {
+      ['cam1', 'cam2', 'cam3'].forEach(c => {
+        const btn = document.getElementById('btn-cut-' + c);
+        if (c === state.activeCam) {
+          btn.className = 'btn-tally bg-brand-red hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2 ring-2 ring-red-400';
+        } else {
+          btn.className = 'btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2';
+        }
+      });
+      // Update multiview frame borders
+      ['cam1', 'cam2', 'cam3'].forEach(c => {
+        const frame = document.getElementById('frame-' + c);
+        if (!frame) return;
+        if (c === state.activeCam) {
+          frame.classList.remove('border-slate-700');
+          frame.classList.add('border-red-500');
+        } else {
+          frame.classList.remove('border-red-500');
+          frame.classList.add('border-slate-700');
+        }
+      });
+    }
+
+    // ──────────────────────── Audio Source ────────────────────────
+    async function setAudioSource(source) {
+      state.audioSource = source;
+      await apiPost('/api/audio-source', { source });
+      updateAudioToggle();
+    }
+
+    function updateAudioToggle() {
+      const btnCam1 = document.getElementById('audio-cam1');
+      const btnFollow = document.getElementById('audio-follow');
+      if (state.audioSource === 'cam1') {
+        btnCam1.className  = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
+        btnFollow.className = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
+      } else {
+        btnCam1.className  = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
+        btnFollow.className = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
+      }
+    }
+
+    // ──────────────────────── YouTube Stream ────────────────────────
+    function toggleStreamKeyVisibility() {
+      const input = document.getElementById('stream-key');
+      state.streamKeyVisible = !state.streamKeyVisible;
+      input.type = state.streamKeyVisible ? 'text' : 'password';
+    }
+
+    async function goLive() {
+      const key = document.getElementById('stream-key').value.trim();
+      if (!key) {
+        showToast('Enter a YouTube stream key first', 'warning');
+        return;
+      }
+      await apiPost('/api/stream/start', { stream_key: key });
+    }
+
+    async function stopStream() {
+      await apiPost('/api/stream/stop');
+    }
+
+    let ytTimerInterval = null;
+
+    function startYtTimer(startedAt) {
+      state.ytLive = true;
+      state.ytStartTime = startedAt ? new Date(startedAt).getTime() : Date.now();
+      document.getElementById('yt-timer-row').classList.remove('hidden');
+      document.getElementById('yt-timer-row').classList.add('flex');
+      if (ytTimerInterval) clearInterval(ytTimerInterval);
+      ytTimerInterval = setInterval(updateYtDuration, 1000);
+      updateYtDuration();
+    }
+
+    function stopYtTimer() {
+      state.ytLive = false;
+      state.ytStartTime = null;
+      document.getElementById('yt-timer-row').classList.add('hidden');
+      document.getElementById('yt-timer-row').classList.remove('flex');
+      if (ytTimerInterval) { clearInterval(ytTimerInterval); ytTimerInterval = null; }
+      document.getElementById('yt-duration').textContent = '00:00:00';
+    }
+
+    function updateYtDuration() {
+      if (!state.ytStartTime) return;
+      const elapsed = Math.floor((Date.now() - state.ytStartTime) / 1000);
+      const h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
+      const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
+      const s = String(elapsed % 60).padStart(2, '0');
+      document.getElementById('yt-duration').textContent = `${h}:${m}:${s}`;
+    }
+
+    // ──────────────────────── Scoreboard ────────────────────────
+    function adjustScore(team, delta) {
+      if (team === 'home') {
+        state.homeScore = Math.max(0, state.homeScore + delta);
+        document.getElementById('home-score-display').textContent = state.homeScore;
+      } else {
+        state.awayScore = Math.max(0, state.awayScore + delta);
+        document.getElementById('away-score-display').textContent = state.awayScore;
+      }
+      updateScoreboard();
+    }
+
+    function updateScoreboard() {
+      const homeName = document.getElementById('home-name').value.trim() || 'HOME';
+      const awayName = document.getElementById('away-name').value.trim() || 'AWAY';
+      const clockStr = document.getElementById('match-clock-display').textContent;
+      // Update preview
+      renderScoreboardPreview(homeName, state.homeScore, awayName, state.awayScore, clockStr);
+      // Send to server
+      apiPost('/api/scoreboard', {
+        home_name: homeName,
+        home_score: state.homeScore,
+        away_name: awayName,
+        away_score: state.awayScore,
+      });
+    }
+
+    function renderScoreboardPreview(home, hs, away, as, clock) {
+      document.getElementById('scoreboard-preview').innerHTML =
+        `<span class="text-lg sm:text-2xl font-bold text-white tracking-wide font-mono">
+          ${escHtml(home)} &nbsp; ${hs} - ${as} &nbsp; ${escHtml(away)} &nbsp; | &nbsp; ${clock}
+        </span>`;
+    }
+
+    function escHtml(str) {
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
+    // ──────────────────────── Match Clock ────────────────────────
+    function clockAction(action) {
+      apiPost('/api/clock/' + action);
+    }
+
+    function formatClock(totalSeconds) {
+      const m = String(Math.floor(totalSeconds / 60)).padStart(2, '0');
+      const s = String(Math.floor(totalSeconds) % 60).padStart(2, '0');
+      return `${m}:${s}`;
+    }
+
+    // Client-side clock interpolation (runs every second)
+    function interpolateClock() {
+      let displaySeconds = state.clockElapsed;
+      if (state.clockRunning && state.clockLastServerUpdate) {
+        const drift = (Date.now() - state.clockLastServerUpdate) / 1000;
+        displaySeconds = state.clockElapsed + drift;
+      }
+      const clockStr = formatClock(displaySeconds);
+      document.getElementById('match-clock-display').textContent = clockStr;
+
+      // Also update the scoreboard preview in real time
+      const homeName = document.getElementById('home-name').value.trim() || 'HOME';
+      const awayName = document.getElementById('away-name').value.trim() || 'AWAY';
+      renderScoreboardPreview(homeName, state.homeScore, awayName, state.awayScore, clockStr);
+    }
+
+    setInterval(interpolateClock, 1000);
+
+    // ──────────────────────── Sideline Checklist ────────────────────────
+    const checklistItems = [
+      { id: 'chk-usb-plug',     label: 'Phone plugged in via USB' },
+      { id: 'chk-usb-tether',   label: 'USB tethering enabled on phone' },
+      { id: 'chk-usb-connect',  label: 'USB connected in dashboard' },
+      { id: 'chk-hotspot',      label: 'Wi-Fi hotspot started' },
+      { id: 'chk-cam-connect',  label: 'Camera phones connected to hotspot' },
+      { id: 'chk-cam1-stream',  label: 'Camera 1 streaming' },
+      { id: 'chk-stream-key',   label: 'Stream key entered' },
+      { id: 'chk-scoreboard',   label: 'Scoreboard set up' },
+      { id: 'chk-yt-live',      label: 'YouTube stream started' },
+      { id: 'chk-test-cut',     label: 'Test cut between cameras' },
+    ];
+
+    function renderChecklist() {
+      const container = document.getElementById('checklist');
+      container.innerHTML = '';
+      checklistItems.forEach(item => {
+        const checked = localStorage.getItem(item.id) === 'true';
+        const div = document.createElement('div');
+        div.className = 'flex items-center gap-3 bg-slate-900 rounded-lg px-4 py-3 border border-slate-700 cursor-pointer select-none';
+        div.innerHTML = `
+          <input type="checkbox" id="${item.id}" ${checked ? 'checked' : ''}
+                 class="w-5 h-5 rounded border-slate-500 text-brand-green bg-slate-800 focus:ring-brand-green focus:ring-offset-0 cursor-pointer accent-green-500">
+          <label for="${item.id}" class="text-sm text-slate-200 cursor-pointer flex-1 ${checked ? 'line-through text-slate-500' : ''}">${item.label}</label>
+        `;
+        const checkbox = div.querySelector('input');
+        checkbox.addEventListener('change', () => {
+          localStorage.setItem(item.id, checkbox.checked);
+          renderChecklist();
+        });
+        // Clicking the whole row toggles the checkbox
+        div.addEventListener('click', (e) => {
+          if (e.target.tagName !== 'INPUT') {
+            checkbox.checked = !checkbox.checked;
+            localStorage.setItem(item.id, checkbox.checked);
+            renderChecklist();
+          }
+        });
+        container.appendChild(div);
+      });
+    }
+
+    renderChecklist();
+
+    // ──────────────────────── Poll /api/status ────────────────────────
+    async function pollStatus() {
+      const data = await apiGet('/api/status');
+      if (!data) return;
+
+      // --- USB Internet ---
+      const usbDot = document.getElementById('status-usb-dot');
+      const usbLabel = document.getElementById('status-usb-label');
+      const netUsbStatus = document.getElementById('net-usb-status');
+      if (data.internet_ok) {
+        usbDot.className = 'w-2.5 h-2.5 rounded-full bg-brand-green';
+      } else {
+        usbDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
+      }
+      usbLabel.textContent = data.usb_status || 'USB';
+      netUsbStatus.textContent = data.usb_status || 'Disconnected';
+      if (data.usb_iface) {
+        netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
+      } else {
+        netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
+      }
+
+      // --- Hotspot ---
+      const hotspotIp = document.getElementById('status-hotspot-ip');
+      const netHotspot = document.getElementById('net-hotspot-status');
+      hotspotIp.textContent = data.wifi_ip || '10.42.0.1';
+      if (data.hotspot_active) {
+        netHotspot.textContent = 'Active';
+        netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
+      } else {
+        netHotspot.textContent = 'Inactive';
+        netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
+      }
+
+      // --- RTMP Server ---
+      const rtmpDot = document.getElementById('status-rtmp-dot');
+      if (data.mediamtx_running) {
+        rtmpDot.className = 'w-2.5 h-2.5 rounded-full bg-brand-green';
+      } else {
+        rtmpDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
+      }
+
+      // --- Camera Live Badges ---
+      ['cam1', 'cam2', 'cam3'].forEach(c => {
+        const badge = document.getElementById('cam-badge-' + c);
+        const mvBadge = document.getElementById('mv-badge-' + c);
+        const isLive = data.cameras && data.cameras[c];
+        if (isLive) {
+          badge.textContent = 'LIVE';
+          badge.className = 'text-xs px-2 py-0.5 rounded font-bold bg-red-900/60 text-red-400 pulse-live';
+          if (mvBadge) {
+            mvBadge.textContent = 'LIVE';
+            mvBadge.className = 'text-xs px-1.5 py-0.5 rounded bg-red-900/60 text-red-400 font-bold pulse-live';
+          }
+        } else {
+          badge.textContent = 'OFFLINE';
+          badge.className = 'text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400';
+          if (mvBadge) {
+            mvBadge.textContent = 'OFF';
+            mvBadge.className = 'text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500';
+          }
+        }
+      });
+
+      // Program badge
+      const mvProgram = document.getElementById('mv-badge-program');
+      if (data.cameras && data.cameras.program) {
+        mvProgram.textContent = 'LIVE';
+        mvProgram.className = 'text-xs px-1.5 py-0.5 rounded bg-red-900/60 text-red-400 font-bold pulse-live';
+      } else {
+        mvProgram.textContent = 'OFF';
+        mvProgram.className = 'text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500';
+      }
+
+      // --- YouTube Stream Status ---
+      const ytBadge = document.getElementById('status-yt-badge');
+      if (data.youtube_live) {
+        ytBadge.textContent = '🔴 ON AIR';
+        ytBadge.className = 'px-2 py-0.5 rounded text-xs font-bold bg-red-600 text-white pulse-live';
+        if (!state.ytLive) {
+          startYtTimer(data.youtube_started_at);
+        }
+      } else {
+        ytBadge.textContent = 'OFFLINE';
+        ytBadge.className = 'px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400';
+        if (state.ytLive) {
+          stopYtTimer();
+        }
+      }
+
+      // --- Active Camera ---
+      if (data.active_cam) {
+        state.activeCam = data.active_cam;
+        updateTallyButtons();
+      }
+
+      // --- Audio Source ---
+      if (data.audio_source) {
+        state.audioSource = data.audio_source;
+        updateAudioToggle();
+      }
+
+      // --- Scoreboard ---
+      if (data.scoreboard) {
+        state.homeScore = data.scoreboard.home_score ?? state.homeScore;
+        state.awayScore = data.scoreboard.away_score ?? state.awayScore;
+        document.getElementById('home-score-display').textContent = state.homeScore;
+        document.getElementById('away-score-display').textContent = state.awayScore;
+        if (data.scoreboard.home_name) {
+          document.getElementById('home-name').value = data.scoreboard.home_name;
+        }
+        if (data.scoreboard.away_name) {
+          document.getElementById('away-name').value = data.scoreboard.away_name;
+        }
+      }
+
+      // --- Match Clock ---
+      if (data.clock !== undefined) {
+        state.clockElapsed = data.clock.elapsed ?? state.clockElapsed;
+        state.clockRunning = data.clock.running ?? state.clockRunning;
+        state.clockLastServerUpdate = Date.now();
+      }
+
+      // --- Firewall ---
+      const fwStatus = document.getElementById('net-firewall-status');
+      const fwDetails = document.getElementById('net-firewall-details');
+      if (data.firewall) {
+        fwStatus.textContent = data.firewall.status || 'Unknown';
+        if (data.firewall.status === 'inactive' || data.firewall.status === 'disabled') {
+          fwStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
+        } else {
+          fwStatus.className = 'text-xs px-2 py-0.5 rounded bg-brand-amber/20 text-brand-amber font-medium';
+        }
+        if (data.firewall.details) {
+          fwDetails.innerHTML = `<p class="text-xs text-slate-400">${escHtml(data.firewall.details)}</p>`;
+        }
+      }
+    }
+
+    // Initial poll + interval
+    pollStatus();
+    setInterval(pollStatus, 2000);
+
+    // Initial tally state
+    updateTallyButtons();
+  </script>
+</body>
+</html>
