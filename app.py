@@ -26,7 +26,13 @@ from flask import Flask, jsonify, render_template, request
 # Graceful imports for companion modules (may not exist yet during early dev)
 # ---------------------------------------------------------------------------
 try:
-    from network_manager import get_network_status, connect_usb, start_hotspot, stop_hotspot
+    from network_manager import (
+        get_network_status,
+        connect_usb,
+        start_hotspot,
+        stop_hotspot,
+        get_usb_audio_devices,
+    )
 except ImportError:
     logging.warning("network_manager module not found — network endpoints will return stub data")
 
@@ -47,6 +53,9 @@ except ImportError:
 
     def stop_hotspot():
         return False, "network_manager module not loaded"
+
+    def get_usb_audio_devices():
+        return []
 
 try:
     from media_engine import (
@@ -245,6 +254,7 @@ def api_status():
     mediamtx = get_mediamtx_status()
     stream = get_stream_status()
     scoreboard = _get_scoreboard_state()
+    audio_devices = get_usb_audio_devices()
 
     return jsonify({
         "ok": True,
@@ -253,6 +263,7 @@ def api_status():
         "mediamtx": mediamtx,
         "stream": stream,
         "scoreboard": scoreboard,
+        "audio_devices": audio_devices,
     })
 
 
@@ -349,17 +360,28 @@ def api_switch_camera(cam_id):
 @app.route("/api/audio-source", methods=["POST"])
 @api_endpoint
 def api_audio_source():
-    """Set the audio mode — 'cam1' (lock to main mic) or 'active' (follow active camera)."""
+    """Set the audio mode — 'cam1', 'active', or 'usb:<device_id>'."""
     data = request.get_json(force=True, silent=True) or {}
     mode = data.get("mode", "").strip().lower()
 
-    if mode not in ("cam1", "active"):
-        return jsonify({"ok": False, "error": "mode must be 'cam1' or 'active'"}), 400
+    if mode not in ("cam1", "active") and not (mode.startswith("usb:") and len(mode) > 4):
+        return jsonify({
+            "ok": False,
+            "error": "mode must be 'cam1', 'active', or 'usb:<device_id>'",
+        }), 400
 
     log.info("Audio source change requested: %s", mode)
     success, msg = set_audio_source(mode)
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg, "audio_source": mode}), status_code
+
+
+@app.route("/api/audio/devices", methods=["GET"])
+@api_endpoint
+def api_audio_devices():
+    """Return a list of detected USB audio devices."""
+    devices = get_usb_audio_devices()
+    return jsonify({"ok": True, "devices": devices})
 
 
 # --- Scoreboard --------------------------------------------------------

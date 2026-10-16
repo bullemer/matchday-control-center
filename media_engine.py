@@ -55,7 +55,7 @@ _camera_poll_thread: threading.Thread | None = None
 _camera_poll_stop = threading.Event()
 
 _active_camera: str | None = None
-_audio_source_mode: str = "cam1"   # "cam1" (locked) or "active" (follows video)
+_audio_source_mode: str = "cam1"   # "cam1" (locked), "active" (follows video), or "usb:<device>" (USB audio)
 _youtube_stream_key: str | None = None
 
 
@@ -430,6 +430,21 @@ def get_youtube_stream_key() -> str | None:
     return _youtube_stream_key
 
 
+def _parse_usb_audio_device(mode: str) -> str | None:
+    """
+    Extract the audio device string from a 'usb:<device>' mode value.
+
+    Returns the device portion (e.g. 'hw:1,0' from 'usb:hw:1,0') or None
+    if the mode string is malformed.
+    """
+    if not mode.startswith("usb:"):
+        return None
+    device = mode[4:]  # Strip leading 'usb:'
+    if not device:
+        return None
+    return device
+
+
 # ── Stage B — Camera Relay (seamless switch) ────────────────────────────
 
 def switch_camera(cam_id: str) -> bool:
@@ -443,6 +458,7 @@ def switch_camera(cam_id: str) -> bool:
     Audio behaviour:
       • mode='cam1'  → always take audio from cam1 (main commentary mic)
       • mode='active' → take audio from whichever camera is switched on-air
+      • mode='usb:<device>' → take audio from a USB device via PulseAudio/ALSA
     """
     global _relay_proc, _active_camera
 
@@ -465,7 +481,37 @@ def switch_camera(cam_id: str) -> bool:
         video_source = f"{RTMP_BASE}/{cam_id}"
         destination = f"{RTMP_BASE}/program"
 
-        if _audio_source_mode == "cam1" and cam_id != "cam1":
+        usb_device = _parse_usb_audio_device(_audio_source_mode)
+
+        if usb_device is not None:
+            # Take video from selected cam, audio from USB device
+            # Try PulseAudio first (PipeWire with PulseAudio compat),
+            # fall back to ALSA device strings (hw:X,Y)
+            if usb_device.startswith("hw:") or usb_device.startswith("plughw:"):
+                audio_input_fmt = "alsa"
+            else:
+                audio_input_fmt = "pulse"
+
+            cmd = [
+                "ffmpeg",
+                "-re",
+                # Input 0 — video source (selected camera)
+                "-i", video_source,
+                # Input 1 — audio source (USB device)
+                "-f", audio_input_fmt,
+                "-i", usb_device,
+                # Map video from input 0, audio from input 1
+                "-map", "0:v:0",
+                "-map", "1:a:0",
+                # Video: copy (no re-encode), Audio: encode raw PCM → AAC
+                "-c:v", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-ar", "44100",
+                "-f", "flv",
+                destination,
+            ]
+        elif _audio_source_mode == "cam1" and cam_id != "cam1":
             # Take video from selected cam, audio from cam1
             audio_source = f"{RTMP_BASE}/cam1"
             cmd = [
@@ -526,17 +572,34 @@ def set_audio_source(mode: str) -> bool:
     Set audio source mode.
 
     Args:
-        mode: 'cam1' — always use cam1 audio (main commentary mic)
+        mode: 'cam1'   — always use cam1 audio (main commentary mic)
               'active' — use audio from whichever camera is currently on-air
+              'usb:<device>' — use a USB audio device, e.g. 'usb:hw:1,0'
+                               or 'usb:alsa_input.usb-...' (PulseAudio name)
 
     If a camera relay is running and the mode changes, the relay is
     restarted automatically to apply the new audio mapping.
     """
     global _audio_source_mode
 
-    mode = mode.lower().strip()
-    if mode not in ("cam1", "active"):
-        logger.error("Invalid audio mode '%s' — must be 'cam1' or 'active'", mode)
+    mode = mode.strip()
+
+    # Validate the mode
+    if mode.lower() in ("cam1", "active"):
+        mode = mode.lower()
+    elif mode.startswith("usb:"):
+        device = _parse_usb_audio_device(mode)
+        if device is None:
+            logger.error(
+                "Invalid USB audio mode '%s' — expected 'usb:<device>', "
+                "e.g. 'usb:hw:1,0' or 'usb:alsa_input.usb-...'", mode,
+            )
+            return False
+    else:
+        logger.error(
+            "Invalid audio mode '%s' — must be 'cam1', 'active', or 'usb:<device>'",
+            mode,
+        )
         return False
 
     previous = _audio_source_mode
@@ -553,7 +616,7 @@ def set_audio_source(mode: str) -> bool:
 
 
 def get_audio_source() -> str:
-    """Return current audio source mode ('cam1' or 'active')."""
+    """Return current audio source mode ('cam1', 'active', or 'usb:<device>')."""
     return _audio_source_mode
 
 

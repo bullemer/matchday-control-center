@@ -10,6 +10,7 @@ if a binary or interface is missing.
 """
 
 import logging
+import os
 import re
 import shutil
 import subprocess
@@ -406,4 +407,210 @@ def get_firewall_status() -> dict:
 
     result["all_open"] = all_open
     logger.info("Firewall port check complete: all_open=%s", all_open)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# USB Audio Device Detection
+# ---------------------------------------------------------------------------
+
+def _is_usb_audio_card(card_num: int, card_name: str) -> bool:
+    """
+    Determine whether ALSA card *card_num* is a USB audio device.
+
+    Checks for the presence of ``/proc/asound/card<N>/usbbus`` first
+    (authoritative), then falls back to looking for 'USB' in the card name.
+    """
+    usbbus_path = f"/proc/asound/card{card_num}/usbbus"
+    if os.path.exists(usbbus_path):
+        logger.debug("Card %d identified as USB via %s.", card_num, usbbus_path)
+        return True
+
+    if "usb" in card_name.lower():
+        logger.debug("Card %d identified as USB via name: %s", card_num, card_name)
+        return True
+
+    return False
+
+
+def _parse_arecord_devices() -> list[dict]:
+    """
+    Parse ``arecord -l`` output and return a list of capture device dicts::
+
+        {
+            "card_num":   int,
+            "device_num": int,
+            "card_name":  str,
+            "device_name": str,
+            "alsa_device": str,   # e.g. "hw:1,0"
+            "is_usb":     bool,
+        }
+
+    Returns an empty list if ``arecord`` is unavailable or produces no output.
+    """
+    ok, output = run_cmd(["arecord", "-l"], timeout=5)
+    if not ok:
+        logger.warning("arecord unavailable or failed — ALSA device list skipped.")
+        return []
+
+    devices: list[dict] = []
+    # Example line:
+    #   card 1: Device [USB Condenser Mic], device 0: USB Audio [USB Audio]
+    pattern = re.compile(
+        r"^card\s+(\d+):\s+(\S+)\s+\[(.+?)\],\s+device\s+(\d+):\s+(.+?)\s+\[(.+?)\]",
+    )
+    for line in output.splitlines():
+        m = pattern.match(line)
+        if not m:
+            continue
+        card_num = int(m.group(1))
+        card_name = m.group(3)
+        device_num = int(m.group(4))
+        device_name = m.group(6)
+        alsa_hw = f"hw:{card_num},{device_num}"
+        is_usb = _is_usb_audio_card(card_num, card_name)
+
+        devices.append({
+            "card_num": card_num,
+            "device_num": device_num,
+            "card_name": card_name,
+            "device_name": device_name,
+            "alsa_device": alsa_hw,
+            "is_usb": is_usb,
+        })
+        logger.debug(
+            "ALSA capture device: %s — %s (USB=%s)", alsa_hw, card_name, is_usb,
+        )
+
+    return devices
+
+
+def _parse_pulse_sources() -> list[dict]:
+    """
+    Parse ``pactl list sources short`` and return a list of source dicts::
+
+        {
+            "index":       str,
+            "name":        str,   # PulseAudio / PipeWire source name
+            "module":      str,
+            "sample_spec": str,
+            "state":       str,
+        }
+
+    Returns an empty list if ``pactl`` is unavailable.
+    """
+    ok, output = run_cmd(["pactl", "list", "sources", "short"], timeout=5)
+    if not ok:
+        logger.warning("pactl unavailable or failed — PulseAudio source list skipped.")
+        return []
+
+    sources: list[dict] = []
+    for line in output.splitlines():
+        # Tab-separated columns: index  name  module  sample_spec  state
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        sources.append({
+            "index": parts[0].strip(),
+            "name": parts[1].strip(),
+            "module": parts[2].strip() if len(parts) > 2 else "",
+            "sample_spec": parts[3].strip() if len(parts) > 3 else "",
+            "state": parts[4].strip() if len(parts) > 4 else "",
+        })
+
+    logger.debug("PulseAudio/PipeWire sources found: %d", len(sources))
+    return sources
+
+
+def get_usb_audio_devices() -> list[dict]:
+    """
+    Detect USB audio capture devices and return a list of dicts::
+
+        [
+            {
+                "id":           str,   # unique id (ALSA hw string or pulse name)
+                "name":         str,   # human-readable label
+                "type":         str,   # "usb" or "builtin"
+                "alsa_device":  str,   # e.g. "hw:1,0"
+                "pulse_source": str | None,
+            },
+            ...
+        ]
+
+    USB devices are listed first, followed by a single built-in mic fallback
+    (if one exists).  The function degrades gracefully when ``arecord`` or
+    ``pactl`` are not installed.
+    """
+    alsa_devices = _parse_arecord_devices()
+    pulse_sources = _parse_pulse_sources()
+
+    # Build a quick lookup: ALSA card+device → PulseAudio source name.
+    # PipeWire / PulseAudio source names often contain the ALSA card number
+    # (e.g. "alsa_input.usb-…" or "alsa_input.pci-…").  We match by
+    # checking whether "card<N>" or "hw_<card>_<dev>" appears in the name.
+    def _find_pulse_source(card_num: int, device_num: int) -> str | None:
+        patterns = [
+            f"hw_{card_num}_{device_num}",
+            f"card{card_num}",
+            f"hw:{card_num},{device_num}",
+        ]
+        for src in pulse_sources:
+            src_name_lower = src["name"].lower()
+            for pat in patterns:
+                if pat in src_name_lower:
+                    return src["name"]
+        return None
+
+    usb_devices: list[dict] = []
+    builtin_devices: list[dict] = []
+
+    for dev in alsa_devices:
+        pulse_name = _find_pulse_source(dev["card_num"], dev["device_num"])
+        entry = {
+            "id": pulse_name if pulse_name else dev["alsa_device"],
+            "name": dev["card_name"],
+            "type": "usb" if dev["is_usb"] else "builtin",
+            "alsa_device": dev["alsa_device"],
+            "pulse_source": pulse_name,
+        }
+        if dev["is_usb"]:
+            usb_devices.append(entry)
+        else:
+            builtin_devices.append(entry)
+
+    # If no ALSA devices were found at all, try to offer a PulseAudio-only
+    # fallback for any source whose name hints at a USB device.
+    if not alsa_devices and pulse_sources:
+        logger.info("No ALSA devices parsed — falling back to PulseAudio sources.")
+        for src in pulse_sources:
+            name_lower = src["name"].lower()
+            # Skip monitors (speaker loopbacks)
+            if ".monitor" in name_lower:
+                continue
+            is_usb = "usb" in name_lower
+            entry = {
+                "id": src["name"],
+                "name": src["name"],
+                "type": "usb" if is_usb else "builtin",
+                "alsa_device": "",
+                "pulse_source": src["name"],
+            }
+            if is_usb:
+                usb_devices.append(entry)
+            else:
+                builtin_devices.append(entry)
+
+    # Return USB devices first; append at most one built-in fallback.
+    result = list(usb_devices)
+    if builtin_devices:
+        result.append(builtin_devices[0])
+        logger.debug(
+            "Including built-in mic fallback: %s", builtin_devices[0]["name"],
+        )
+
+    logger.info(
+        "USB audio detection complete: %d USB device(s), %d built-in fallback(s).",
+        len(usb_devices),
+        min(len(builtin_devices), 1),
+    )
     return result

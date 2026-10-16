@@ -325,17 +325,37 @@
       </div>
 
       <!-- Audio Source Toggle -->
-      <div class="flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-slate-700">
-        <span class="text-sm text-slate-400">🔊 Audio Source:</span>
-        <div class="flex rounded-lg overflow-hidden border border-slate-600">
-          <button id="audio-cam1" onclick="setAudioSource('cam1')"
-                  class="px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors">
-            🎙 Main Mic (Cam 1)
-          </button>
-          <button id="audio-follow" onclick="setAudioSource('follow')"
-                  class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
-            🔄 Follow Active Camera
-          </button>
+      <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-3">
+        <div class="flex items-center gap-3 flex-wrap">
+          <span class="text-sm text-slate-400">🔊 Audio Source:</span>
+          <div class="flex rounded-lg overflow-hidden border border-slate-600">
+            <button id="audio-cam1" onclick="setAudioSource('cam1')"
+                    class="px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors">
+              🎙 Main Mic (Cam 1)
+            </button>
+            <button id="audio-follow" onclick="setAudioSource('follow')"
+                    class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
+              🔄 Follow Active Camera
+            </button>
+            <button id="audio-usb" onclick="setAudioSource('usb')"
+                    class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
+              🎤 USB Microphone
+            </button>
+          </div>
+        </div>
+        <!-- USB Audio Device Selector (shown when USB mode active) -->
+        <div id="usb-audio-selector" class="hidden">
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-400">🎤 USB Device:</span>
+            <select id="usb-audio-device"
+                    onchange="selectUsbAudioDevice(this.value)"
+                    class="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-cyan focus:outline-none appearance-none cursor-pointer">
+              <option value="" disabled selected>No USB audio devices detected</option>
+            </select>
+          </div>
+          <p id="usb-audio-active-label" class="text-xs text-slate-500 mt-1 hidden">
+            Active: <span id="usb-audio-active-name" class="text-brand-cyan font-medium"></span>
+          </p>
         </div>
       </div>
     </section>
@@ -490,7 +510,9 @@
       homeScore: 0,
       awayScore: 0,
       activeCam: 'cam1',
-      audioSource: 'cam1',         // 'cam1' or 'follow'
+      audioSource: 'cam1',         // 'cam1', 'follow', or 'usb:<device_id>'
+      audioDevices: [],              // detected USB audio devices from server
+      selectedUsbDevice: null,       // currently selected USB device id
       ytLive: false,
       ytStartTime: null,
       clockRunning: false,
@@ -614,20 +636,92 @@
 
     // ──────────────────────── Audio Source ────────────────────────
     async function setAudioSource(source) {
-      state.audioSource = source;
-      await apiPost('/api/audio-source', { source });
+      if (source === 'usb') {
+        // When clicking the USB button, show the dropdown but don't send API call yet
+        // unless a device is already selected
+        if (state.selectedUsbDevice) {
+          state.audioSource = 'usb:' + state.selectedUsbDevice;
+          await apiPost('/api/audio-source', { mode: 'usb:' + state.selectedUsbDevice });
+        } else {
+          state.audioSource = 'usb';
+        }
+      } else {
+        state.audioSource = source;
+        state.selectedUsbDevice = null;
+        await apiPost('/api/audio-source', { mode: source });
+      }
       updateAudioToggle();
+    }
+
+    async function selectUsbAudioDevice(deviceId) {
+      if (!deviceId) return;
+      state.selectedUsbDevice = deviceId;
+      state.audioSource = 'usb:' + deviceId;
+      await apiPost('/api/audio-source', { mode: 'usb:' + deviceId });
+      updateAudioToggle();
+    }
+
+    function populateUsbDevices(devices) {
+      state.audioDevices = devices || [];
+      const select = document.getElementById('usb-audio-device');
+      const currentVal = select.value;
+      select.innerHTML = '';
+      if (state.audioDevices.length === 0) {
+        const opt = document.createElement('option');
+        opt.value = '';
+        opt.disabled = true;
+        opt.selected = true;
+        opt.textContent = 'No USB audio devices detected';
+        select.appendChild(opt);
+      } else {
+        state.audioDevices.forEach(dev => {
+          const opt = document.createElement('option');
+          opt.value = dev.id || dev.device_id || dev.name;
+          opt.textContent = '🎤 ' + (dev.name || dev.label || dev.id);
+          select.appendChild(opt);
+        });
+        // Restore selection if still valid
+        const validIds = state.audioDevices.map(d => d.id || d.device_id || d.name);
+        if (state.selectedUsbDevice && validIds.includes(state.selectedUsbDevice)) {
+          select.value = state.selectedUsbDevice;
+        } else if (currentVal && validIds.includes(currentVal)) {
+          select.value = currentVal;
+        }
+      }
     }
 
     function updateAudioToggle() {
       const btnCam1 = document.getElementById('audio-cam1');
       const btnFollow = document.getElementById('audio-follow');
-      if (state.audioSource === 'cam1') {
-        btnCam1.className  = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
-        btnFollow.className = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
+      const btnUsb = document.getElementById('audio-usb');
+      const usbSelector = document.getElementById('usb-audio-selector');
+      const usbActiveLabel = document.getElementById('usb-audio-active-label');
+      const usbActiveName = document.getElementById('usb-audio-active-name');
+
+      const activeClass  = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
+      const defaultClass = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
+
+      const isUsb = state.audioSource === 'usb' || state.audioSource.startsWith('usb:');
+
+      btnCam1.className  = (state.audioSource === 'cam1') ? activeClass : defaultClass;
+      btnFollow.className = (state.audioSource === 'follow') ? activeClass : defaultClass;
+      btnUsb.className   = isUsb ? activeClass : defaultClass;
+
+      // Show/hide USB device selector
+      if (isUsb) {
+        usbSelector.classList.remove('hidden');
+        // Show active device label if a device is selected
+        if (state.selectedUsbDevice) {
+          const dev = state.audioDevices.find(d => (d.id || d.device_id || d.name) === state.selectedUsbDevice);
+          const devName = dev ? (dev.name || dev.label || dev.id) : state.selectedUsbDevice;
+          usbActiveName.textContent = devName;
+          usbActiveLabel.classList.remove('hidden');
+        } else {
+          usbActiveLabel.classList.add('hidden');
+        }
       } else {
-        btnCam1.className  = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
-        btnFollow.className = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
+        usbSelector.classList.add('hidden');
+        usbActiveLabel.classList.add('hidden');
       }
     }
 
@@ -894,7 +988,16 @@
       // --- Audio Source ---
       if (data.audio_source) {
         state.audioSource = data.audio_source;
+        // If the server reports usb:<id>, extract the device id
+        if (data.audio_source.startsWith('usb:')) {
+          state.selectedUsbDevice = data.audio_source.substring(4);
+        }
         updateAudioToggle();
+      }
+
+      // --- USB Audio Devices ---
+      if (data.audio_devices !== undefined) {
+        populateUsbDevices(data.audio_devices);
       }
 
       // --- Scoreboard ---
