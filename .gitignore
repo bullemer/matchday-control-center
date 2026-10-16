@@ -19,3 +19,10 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Private runtime state and credentials
+data/
+# Compiled frontend dependencies
+node_modules/
+playwright-report/
+test-results/

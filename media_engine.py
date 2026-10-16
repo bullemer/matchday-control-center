@@ -1,669 +1,638 @@
-"""
-media_engine.py — Media Engine for Matchday Live Control Center
+"""Supervised local media pipeline. All control mutations share one lock."""
+from __future__ import annotations
 
-Manages:
-  • MediaMTX (auto-download, config generation, process lifecycle, camera status polling)
-  • Two-stage seamless camera switcher (Stage A: YouTube encoder, Stage B: camera relay)
-  • Atomic scoreboard overlay file for FFmpeg drawtext reload=1
-"""
-
+import hashlib
+import json
 import logging
 import os
+from pathlib import Path
+import platform
+import re
 import shutil
 import signal
 import subprocess
+import sys
+import tarfile
 import tempfile
 import threading
 import time
-import tarfile
+from datetime import datetime, timezone
+
 import requests
 
-# ---------------------------------------------------------------------------
-# Logging
-# ---------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
+BASE = Path(__file__).resolve().parent
 MEDIAMTX_VERSION = "1.21.2"
-MEDIAMTX_DOWNLOAD_URL = (
-    f"https://github.com/bluenviron/mediamtx/releases/download/"
-    f"v{MEDIAMTX_VERSION}/mediamtx_{MEDIAMTX_VERSION}_linux_amd64.tar.gz"
-)
-MEDIAMTX_BIN = "./mediamtx"
-MEDIAMTX_CONFIG = "./mediamtx.yml"
+MEDIAMTX_BIN = str(BASE / "mediamtx")
+MEDIAMTX_CONFIG = str(BASE / "data/mediamtx.yml")
 MEDIAMTX_API = "http://127.0.0.1:9997"
-
 RTMP_BASE = "rtmp://127.0.0.1:1935"
-YOUTUBE_RTMP_BASE = "rtmp://a.rtmp.youtube.com/live2"
-
-SCOREBOARD_PATH = os.path.join("static", "scoreboard.txt")
-
+RTSP_BASE = "rtsp://127.0.0.1:8554"
+YOUTUBE_RTMP_BASE = "rtmps://a.rtmps.youtube.com:443/live2"
+SCOREBOARD_PATH = str(BASE / "static/scoreboard.txt")
 CAMERA_IDS = ["cam1", "cam2", "cam3"]
+_lock = threading.RLock()
+# Serializes relay replacement. Slow work (probe, waiting for frames) happens under this
+# lock only, never under _lock, so status, STOP and the supervisor stay responsive.
+_switch_lock = threading.Lock()
+_generation = 0          # bumped by each operator cut and by STOP; stale cut attempts discard their result
+_pending_camera = None
+_stop = threading.Event()
+_thread = None
+_mediamtx_proc = _youtube_proc = _relay_proc = None
+_active_camera = None
+_audio_source_mode = "cam1"
+_relay_audio = None      # audio actually on program: "cam1", "usb:<id>", "camera" or "silence"
+_audio_warning = ""
+_relay_failures = 0
+_relay_retry_at = 0.0
+_restore_check_at = 0.0
+_mediamtx_retry_at = 0.0
+_youtube_stream_key = None
+_want_stream = False
+_state = "stopped"
+_error = ""
+_started_at = None
+_retry_at = 0.0
+_retries = 0
+_camera_status = {c: False for c in CAMERA_IDS + ["program"]}
+_profile = "720p"
+PROFILES = {"720p": (1280, 720, "4500k"), "480p": (854, 480, "1800k")}
 
-# ---------------------------------------------------------------------------
-# Module-level state
-# ---------------------------------------------------------------------------
-_mediamtx_proc: subprocess.Popen | None = None
-_youtube_proc: subprocess.Popen | None = None    # Stage A — persistent YouTube encoder
-_relay_proc: subprocess.Popen | None = None       # Stage B — camera → /program relay
-_relay_lock = threading.Lock()
 
-_camera_status: dict[str, bool] = {c: False for c in CAMERA_IDS}
-_camera_poll_thread: threading.Thread | None = None
-_camera_poll_stop = threading.Event()
-
-_active_camera: str | None = None
-_audio_source_mode: str = "cam1"   # "cam1" (locked), "active" (follows video), or "usb:<device>" (USB audio)
-_youtube_stream_key: str | None = None
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 1.  MediaMTX Management
-# ═══════════════════════════════════════════════════════════════════════════
-
-def ensure_mediamtx() -> bool:
-    """Download and extract the MediaMTX Linux amd64 binary if it is missing."""
-    if os.path.isfile(MEDIAMTX_BIN) and os.access(MEDIAMTX_BIN, os.X_OK):
-        logger.info("MediaMTX binary already present at %s", MEDIAMTX_BIN)
-        return True
-
-    tarball = f"mediamtx_{MEDIAMTX_VERSION}_linux_amd64.tar.gz"
-    logger.info("MediaMTX binary not found — downloading v%s …", MEDIAMTX_VERSION)
-
+# Media processes run in their own process group (so a cut can kill ffmpeg cleanly) and
+# would therefore outlive a crashed control app, still streaming to YouTube. This wrapper
+# leads the group: it terminates the child when its stdin pipe from the app closes (the app
+# exited, however it died), and the child gets SIGKILL if the wrapper itself dies.
+_WATCHDOG = r"""
+import ctypes, signal, subprocess, sys, threading
+def setup():
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    ctypes.CDLL(None).prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a group SIGTERM stops the child; then exit with it
+child = subprocess.Popen(sys.argv[1:], stdin=subprocess.DEVNULL, preexec_fn=setup)
+def orphaned():
+    sys.stdin.buffer.read()
+    child.terminate()
     try:
-        resp = requests.get(MEDIAMTX_DOWNLOAD_URL, stream=True, timeout=120)
-        resp.raise_for_status()
-
-        with open(tarball, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=1 << 16):
-                f.write(chunk)
-
-        logger.info("Extracting %s …", tarball)
-        with tarfile.open(tarball, "r:gz") as tar:
-            tar.extractall(path=".")
-
-        os.chmod(MEDIAMTX_BIN, 0o755)
-        logger.info("MediaMTX binary ready at %s", MEDIAMTX_BIN)
-        return True
-
-    except Exception:
-        logger.exception("Failed to download/extract MediaMTX")
-        return False
-    finally:
-        # Clean up tarball
-        if os.path.isfile(tarball):
-            try:
-                os.remove(tarball)
-            except OSError:
-                pass
-
-
-def generate_mediamtx_config() -> str:
-    """Generate mediamtx.yml and return the path."""
-    config = """\
-###############################################
-# Matchday Live Control Center — MediaMTX Config
-# Auto-generated — do not edit manually
-###############################################
-
-# ── Global ──────────────────────────────────
-logLevel: info
-
-# ── API ─────────────────────────────────────
-api: yes
-apiAddress: 127.0.0.1:9997
-
-# ── RTMP ────────────────────────────────────
-rtmp: yes
-rtmpAddress: :1935
-
-# ── HLS ─────────────────────────────────────
-hls: yes
-hlsAddress: :8888
-
-# ── WebRTC ──────────────────────────────────
-webrtc: yes
-webrtcAddress: :8889
-
-# ── Paths ───────────────────────────────────
-paths:
-  cam1:
-  cam2:
-  cam3:
-  program:
+        child.wait(3)
+    except subprocess.TimeoutExpired:
+        child.kill()
+threading.Thread(target=orphaned, daemon=True).start()
+sys.exit(child.wait())
 """
-    with open(MEDIAMTX_CONFIG, "w") as f:
-        f.write(config)
 
-    logger.info("Generated MediaMTX config at %s", MEDIAMTX_CONFIG)
+
+class Process:
+    """Drain both pipes continuously; retain only a bounded, redacted error tail."""
+    def __init__(self, cmd, secret=None, cwd=None):
+        if not shutil.which(cmd[0]):
+            raise FileNotFoundError(cmd[0])
+        self.proc = subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG, *cmd],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE, text=True,
+                                     start_new_session=True, bufsize=1, cwd=cwd)
+        self.last_progress = 0.0
+        self.frame = 0
+        self.error = ""
+        self.launched = time.monotonic()
+        self.secret = secret
+        for pipe, progress in [(self.proc.stdout, True), (self.proc.stderr, False)]:
+            threading.Thread(target=self._read, args=(pipe, progress), daemon=True).start()
+
+    def _read(self, pipe, progress):
+        try:
+            for line in pipe:
+                line = line.strip()
+                if progress and line.startswith("frame="):
+                    try:
+                        frame = int(line.split("=", 1)[1])
+                        if frame > self.frame:
+                            self.last_progress = time.monotonic()
+                        self.frame = frame
+                    except ValueError:
+                        pass
+                elif not progress and line:
+                    if self.secret:
+                        line = line.replace(self.secret, "[REDACTED]")
+                    line = re.sub(r"rtmps?://\S+", "[RTMP URL]", line)
+                    self.error = line[-500:]
+                    logger.debug("Media process: %s", self.error)
+        finally:
+            pipe.close()
+
+    def poll(self):
+        return self.proc.poll()
+
+    def healthy(self):
+        return self.poll() is None and self.last_progress > 0 and time.monotonic() - self.last_progress < 15
+
+
+def _kill_process(proc, label="process"):
+    if not proc:
+        return
+    try:
+        if proc.poll() is not None:
+            return
+        os.killpg(proc.proc.pid, signal.SIGTERM)
+        try:
+            proc.proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.proc.pid, signal.SIGKILL)
+            proc.proc.wait(timeout=3)
+    except ProcessLookupError:
+        pass
+    finally:
+        if proc.proc.stdin:
+            proc.proc.stdin.close()
+
+
+def ensure_mediamtx():
+    """Install only the binary, with the release checksum; never extract arbitrary paths."""
+    if os.path.isfile(MEDIAMTX_BIN) and os.access(MEDIAMTX_BIN, os.X_OK):
+        try:
+            result = subprocess.run([MEDIAMTX_BIN, "--version"], capture_output=True, text=True, timeout=5)
+            if result.returncode == 0 and result.stdout.strip() == "v" + MEDIAMTX_VERSION:
+                return True
+            logger.error("Existing MediaMTX version differs from v%s; move it aside to provision the supported release", MEDIAMTX_VERSION)
+        except (OSError, subprocess.TimeoutExpired):
+            logger.error("Cannot execute the installed MediaMTX binary")
+        return False
+    arch = {"x86_64": "amd64", "aarch64": "arm64"}.get(platform.machine())
+    if platform.system() != "Linux" or not arch:
+        logger.error("Unsupported MediaMTX platform")
+        return False
+    name = f"mediamtx_v{MEDIAMTX_VERSION}_linux_{arch}.tar.gz"
+    base = f"https://github.com/bluenviron/mediamtx/releases/download/v{MEDIAMTX_VERSION}"
+    try:
+        with tempfile.TemporaryDirectory(dir=BASE) as tmp:
+            archive = Path(tmp) / name
+            with requests.get(f"{base}/{name}", stream=True, timeout=60) as response:
+                response.raise_for_status()
+                with archive.open("wb") as output:
+                    for chunk in response.iter_content(65536):
+                        output.write(chunk)
+            checks = requests.get(f"{base}/checksums.sha256", timeout=20)
+            checks.raise_for_status()
+            expected = next(line.split()[0] for line in checks.text.splitlines()
+                            if line.split()[-1].lstrip("*") == name)
+            if hashlib.sha256(archive.read_bytes()).hexdigest() != expected:
+                raise ValueError("MediaMTX checksum mismatch")
+            with tarfile.open(archive) as tar:
+                member = tar.getmember("mediamtx")
+                if not member.isfile():
+                    raise ValueError("MediaMTX binary is not a regular file")
+                with tar.extractfile(member) as source, open(Path(tmp) / "binary", "wb") as target:
+                    shutil.copyfileobj(source, target)
+            os.chmod(Path(tmp) / "binary", 0o755)
+            os.replace(Path(tmp) / "binary", MEDIAMTX_BIN)
+        return True
+    except Exception as exc:
+        logger.error("MediaMTX installation failed: %s", exc)
+        return False
+
+
+def generate_mediamtx_config():
+    # A continuous program path supplies video + silence during cuts/source loss.
+    # Program publishing is loopback-only; phones may publish only camera paths.
+    config = {
+        "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
+        "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
+        "rtmp": True, "rtmpAddress": ":1935", "hls": True, "hlsAddress": ":8888",
+        "webrtc": True, "webrtcAddress": ":8889", "srt": False,
+        "authInternalUsers": [
+            {"user": "any", "ips": [], "permissions": [
+                {"action": "publish", "path": "~^cam[123]$"}, {"action": "read"}]},
+            {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
+                {"action": "api"}, {"action": "publish", "path": "program"}]},
+        ],
+        "paths": {c: {"overridePublisher": False} for c in CAMERA_IDS},
+    }
+    config["paths"]["program"] = {"alwaysAvailable": True, "alwaysAvailableTracks": [
+        {"codec": "H264"}, {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]}
+    Path(MEDIAMTX_CONFIG).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    Path(MEDIAMTX_CONFIG).write_text(json.dumps(config, indent=2))  # JSON is valid YAML
     return MEDIAMTX_CONFIG
 
 
-def start_mediamtx() -> bool:
-    """Start the MediaMTX process.  Returns True on success."""
-    global _mediamtx_proc
-
-    if _mediamtx_proc and _mediamtx_proc.poll() is None:
-        logger.warning("MediaMTX is already running (PID %d)", _mediamtx_proc.pid)
-        return True
-
-    if not os.path.isfile(MEDIAMTX_BIN):
-        logger.error("MediaMTX binary not found — call ensure_mediamtx() first")
-        return False
-
-    generate_mediamtx_config()
-
-    try:
-        _mediamtx_proc = subprocess.Popen(
-            [MEDIAMTX_BIN, MEDIAMTX_CONFIG],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        logger.info("MediaMTX started (PID %d)", _mediamtx_proc.pid)
-
-        # Start camera status polling
-        _start_camera_polling()
-        return True
-
-    except FileNotFoundError:
-        logger.error("MediaMTX binary not executable or not found at %s", MEDIAMTX_BIN)
-        return False
-    except Exception:
-        logger.exception("Failed to start MediaMTX")
-        return False
+def _paths():
+    response = requests.get(f"{MEDIAMTX_API}/v3/paths/list", timeout=2)
+    response.raise_for_status()
+    return {p["name"]: bool(p.get("ready")) for p in response.json().get("items", [])}
 
 
-def stop_mediamtx() -> None:
-    """Stop the MediaMTX process and camera polling."""
-    global _mediamtx_proc
-
-    _stop_camera_polling()
-
-    if _mediamtx_proc is None:
-        logger.info("MediaMTX is not running")
-        return
-
-    try:
-        os.killpg(os.getpgid(_mediamtx_proc.pid), signal.SIGTERM)
-        _mediamtx_proc.wait(timeout=5)
-        logger.info("MediaMTX stopped")
-    except ProcessLookupError:
-        logger.info("MediaMTX process already exited")
-    except subprocess.TimeoutExpired:
-        logger.warning("MediaMTX did not stop gracefully — sending SIGKILL")
+def start_mediamtx():
+    global _mediamtx_proc, _error, _thread
+    with _lock:
+        if get_mediamtx_running():
+            return True
         try:
-            os.killpg(os.getpgid(_mediamtx_proc.pid), signal.SIGKILL)
-            _mediamtx_proc.wait(timeout=3)
-        except Exception:
-            logger.exception("Failed to kill MediaMTX")
-    except Exception:
-        logger.exception("Error stopping MediaMTX")
-    finally:
-        _mediamtx_proc = None
+            try:
+                _paths()
+            except requests.RequestException:
+                pass
+            else:
+                _error = "MediaMTX API port is already in use by another server"
+                return False
+            generate_mediamtx_config()
+            _mediamtx_proc = Process([MEDIAMTX_BIN, MEDIAMTX_CONFIG], cwd=Path(MEDIAMTX_CONFIG).parent)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline and _mediamtx_proc.poll() is None:
+                try:
+                    _paths()
+                    if _thread is None or not _thread.is_alive():
+                        _stop.clear()
+                        _thread = threading.Thread(target=_supervise, daemon=True, name="media-supervisor")
+                        _thread.start()
+                    return True
+                except requests.RequestException:
+                    time.sleep(.1)
+            raise RuntimeError(_mediamtx_proc.error or "MediaMTX did not become ready")
+        except Exception as exc:
+            _error = str(exc)
+            _kill_process(_mediamtx_proc)
+            return False
 
 
-def get_mediamtx_running() -> bool:
-    """Return True if the MediaMTX process is currently alive."""
+def get_mediamtx_running():
     return _mediamtx_proc is not None and _mediamtx_proc.poll() is None
 
 
-# ---------------------------------------------------------------------------
-#  Camera status polling
-# ---------------------------------------------------------------------------
-
-def get_camera_status() -> dict[str, bool]:
-    """Return a dict like {"cam1": True, "cam2": False, "cam3": False}."""
+def get_camera_status():
     return dict(_camera_status)
 
 
-def _poll_camera_status() -> None:
-    """Background thread: queries MediaMTX API every 2 s to update _camera_status."""
-    while not _camera_poll_stop.is_set():
-        try:
-            resp = requests.get(
-                f"{MEDIAMTX_API}/v3/paths/list",
-                timeout=2,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items") or []
+def get_active_camera():
+    relay = _relay_proc
+    return _active_camera if relay and relay.healthy() else None
 
-            live_paths: set[str] = set()
-            for item in items:
-                name = item.get("name", "")
-                # A camera is considered "publishing" when it has at least
-                # one reader/source and the source type is not empty/"").
-                ready = item.get("ready", False)
-                if ready:
-                    live_paths.add(name)
 
-            for cam in CAMERA_IDS:
-                _camera_status[cam] = cam in live_paths
-
-        except requests.ConnectionError:
-            # MediaMTX not yet ready — mark all cameras offline
-            for cam in CAMERA_IDS:
-                _camera_status[cam] = False
-        except Exception:
-            logger.debug("Camera status poll failed", exc_info=True)
-
-        _camera_poll_stop.wait(2)
-
-
-def _start_camera_polling() -> None:
-    """Start the background camera-polling thread (idempotent)."""
-    global _camera_poll_thread
-
-    if _camera_poll_thread and _camera_poll_thread.is_alive():
-        return
-
-    _camera_poll_stop.clear()
-    _camera_poll_thread = threading.Thread(
-        target=_poll_camera_status,
-        daemon=True,
-        name="camera-poll",
-    )
-    _camera_poll_thread.start()
-    logger.info("Camera status polling started")
-
-
-def _stop_camera_polling() -> None:
-    """Signal the camera-polling thread to stop and wait for it."""
-    global _camera_poll_thread
-
-    _camera_poll_stop.set()
-    if _camera_poll_thread:
-        _camera_poll_thread.join(timeout=5)
-        _camera_poll_thread = None
-    logger.info("Camera status polling stopped")
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2.  Two-Stage Seamless Switcher
-# ═══════════════════════════════════════════════════════════════════════════
-
-# ── helpers ─────────────────────────────────────────────────────────────────
-
-def _kill_process(proc: subprocess.Popen | None, label: str) -> None:
-    """Gracefully terminate then kill a subprocess."""
-    if proc is None or proc.poll() is not None:
-        return
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        proc.wait(timeout=5)
-        logger.info("%s stopped (PID %d)", label, proc.pid)
-    except ProcessLookupError:
-        pass
-    except subprocess.TimeoutExpired:
-        logger.warning("%s did not stop gracefully — SIGKILL", label)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            proc.wait(timeout=3)
-        except Exception:
-            logger.exception("Failed to kill %s", label)
-    except Exception:
-        logger.exception("Error stopping %s", label)
-
-
-def _ensure_scoreboard_file() -> None:
-    """Create the scoreboard file with sane defaults if it doesn't exist."""
-    os.makedirs("static", exist_ok=True)
-    if not os.path.isfile(SCOREBOARD_PATH):
-        update_scoreboard_overlay("HOME", 0, "AWAY", 0, "00:00")
-
-
-# ── Stage A — Persistent YouTube Encoder ────────────────────────────────
-
-def start_youtube_stream(stream_key: str) -> bool:
-    """
-    Launch the persistent Stage-A FFmpeg process:
-      • Pulls from rtmp://127.0.0.1:1935/program
-      • Burns in the drawtext scoreboard overlay (reload=1)
-      • Encodes 1080p/720p @ 30 fps → YouTube RTMP
-    """
-    global _youtube_proc, _youtube_stream_key
-
-    if _youtube_proc and _youtube_proc.poll() is None:
-        logger.warning("YouTube encoder already running (PID %d)", _youtube_proc.pid)
-        return True
-
-    _ensure_scoreboard_file()
-    _youtube_stream_key = stream_key
-    destination = f"{YOUTUBE_RTMP_BASE}/{stream_key}"
-
-    scoreboard_abs = os.path.abspath(SCOREBOARD_PATH)
-
-    # drawtext filter — white text on semi-transparent black bar, bottom-left
-    drawtext_filter = (
-        f"drawtext="
-        f"textfile='{scoreboard_abs}':"
-        f"reload=1:"
-        f"fontcolor=white:"
-        f"fontsize=28:"
-        f"box=1:"
-        f"boxcolor=black@0.6:"
-        f"boxborderw=8:"
-        f"x=20:"
-        f"y=h-th-20:"
-        f"font=monospace"
-    )
-
-    cmd = [
-        "ffmpeg",
-        "-re",
-        "-live_start_index", "-1",
-        # Input from the /program path on MediaMTX
-        "-i", f"{RTMP_BASE}/program",
-        # Video filter — scoreboard overlay
-        "-vf", drawtext_filter,
-        # Video encoding
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-b:v", "4500k",
-        "-maxrate", "4500k",
-        "-bufsize", "9000k",
-        "-g", "60",
-        "-r", "30",
-        "-pix_fmt", "yuv420p",
-        # Scale to 720p for reliable upload bandwidth (change to 1920:1080 for 1080p)
-        "-s", "1280x720",
-        # Audio encoding
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-ar", "44100",
-        # Output to YouTube RTMP
-        "-f", "flv",
-        destination,
-    ]
-
-    logger.info("Starting YouTube encoder → %s", destination)
-    logger.debug("Stage A cmd: %s", " ".join(cmd))
-
-    try:
-        _youtube_proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            preexec_fn=os.setsid,
-        )
-        logger.info("YouTube encoder started (PID %d)", _youtube_proc.pid)
-        return True
-
-    except FileNotFoundError:
-        logger.error("ffmpeg not found in PATH — install ffmpeg first")
-        return False
-    except Exception:
-        logger.exception("Failed to start YouTube encoder")
-        return False
-
-
-def stop_youtube_stream() -> None:
-    """Stop Stage A (YouTube encoder) and Stage B (camera relay)."""
-    global _youtube_proc, _relay_proc, _active_camera, _youtube_stream_key
-
-    with _relay_lock:
-        _kill_process(_relay_proc, "Camera relay (Stage B)")
-        _relay_proc = None
-        _active_camera = None
-
-    _kill_process(_youtube_proc, "YouTube encoder (Stage A)")
-    _youtube_proc = None
-    _youtube_stream_key = None
-    logger.info("YouTube streaming stopped")
-
-
-def get_youtube_running() -> bool:
-    """Return True if the YouTube encoder is alive."""
-    return _youtube_proc is not None and _youtube_proc.poll() is None
-
-
-def get_active_camera() -> str | None:
-    """Return the currently active camera id (e.g. 'cam1') or None."""
-    return _active_camera
-
-
-def get_youtube_stream_key() -> str | None:
-    """Return the currently configured YouTube stream key."""
-    return _youtube_stream_key
-
-
-def _parse_usb_audio_device(mode: str) -> str | None:
-    """
-    Extract the audio device string from a 'usb:<device>' mode value.
-
-    Returns the device portion (e.g. 'hw:1,0' from 'usb:hw:1,0') or None
-    if the mode string is malformed.
-    """
-    if not mode.startswith("usb:"):
-        return None
-    device = mode[4:]  # Strip leading 'usb:'
-    if not device:
-        return None
-    return device
-
-
-# ── Stage B — Camera Relay (seamless switch) ────────────────────────────
-
-def switch_camera(cam_id: str) -> bool:
-    """
-    Seamless camera switch.
-
-    Relays the requested camera feed to rtmp://127.0.0.1:1935/program using
-    ``ffmpeg -c copy`` (Stage B).  The persistent Stage-A YouTube encoder
-    keeps pulling from /program and never drops the YouTube connection.
-
-    Audio behaviour:
-      • mode='cam1'  → always take audio from cam1 (main commentary mic)
-      • mode='active' → take audio from whichever camera is switched on-air
-      • mode='usb:<device>' → take audio from a USB device via PulseAudio/ALSA
-    """
-    global _relay_proc, _active_camera
-
-    cam_id = cam_id.lower().strip()
-    if cam_id not in CAMERA_IDS:
-        logger.error("Invalid camera id '%s' — must be one of %s", cam_id, CAMERA_IDS)
-        return False
-
-    with _relay_lock:
-        # Kill existing relay
-        if _relay_proc and _relay_proc.poll() is None:
-            logger.info(
-                "Stopping current relay (%s) to switch to %s",
-                _active_camera, cam_id,
-            )
-            _kill_process(_relay_proc, "Camera relay (Stage B)")
-            _relay_proc = None
-
-        # Build the relay command
-        video_source = f"{RTMP_BASE}/{cam_id}"
-        destination = f"{RTMP_BASE}/program"
-
-        usb_device = _parse_usb_audio_device(_audio_source_mode)
-
-        if usb_device is not None:
-            # Take video from selected cam, audio from USB device
-            # Try PulseAudio first (PipeWire with PulseAudio compat),
-            # fall back to ALSA device strings (hw:X,Y)
-            if usb_device.startswith("hw:") or usb_device.startswith("plughw:"):
-                audio_input_fmt = "alsa"
-            else:
-                audio_input_fmt = "pulse"
-
-            cmd = [
-                "ffmpeg",
-                "-re",
-                # Input 0 — video source (selected camera)
-                "-i", video_source,
-                # Input 1 — audio source (USB device)
-                "-f", audio_input_fmt,
-                "-i", usb_device,
-                # Map video from input 0, audio from input 1
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                # Video: copy (no re-encode), Audio: encode raw PCM → AAC
-                "-c:v", "copy",
-                "-c:a", "aac",
-                "-b:a", "128k",
-                "-ar", "44100",
-                "-f", "flv",
-                destination,
-            ]
-        elif _audio_source_mode == "cam1" and cam_id != "cam1":
-            # Take video from selected cam, audio from cam1
-            audio_source = f"{RTMP_BASE}/cam1"
-            cmd = [
-                "ffmpeg",
-                "-re",
-                # Input 0 — video source (selected camera)
-                "-i", video_source,
-                # Input 1 — audio source (cam1 / main mic)
-                "-i", audio_source,
-                # Map video from input 0, audio from input 1
-                "-map", "0:v:0",
-                "-map", "1:a:0",
-                # Copy codecs (no re-encode) for zero-latency relay
-                "-c", "copy",
-                "-f", "flv",
-                destination,
-            ]
-        else:
-            # Take both video and audio from the same camera
-            cmd = [
-                "ffmpeg",
-                "-re",
-                "-i", video_source,
-                "-c", "copy",
-                "-f", "flv",
-                destination,
-            ]
-
-        logger.info("Switching to %s (audio: %s)", cam_id, _audio_source_mode)
-        logger.debug("Stage B cmd: %s", " ".join(cmd))
-
-        try:
-            _relay_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,
-            )
-            _active_camera = cam_id
-            logger.info(
-                "Camera relay started: %s → /program (PID %d)",
-                cam_id, _relay_proc.pid,
-            )
-            return True
-
-        except FileNotFoundError:
-            logger.error("ffmpeg not found in PATH — install ffmpeg first")
-            return False
-        except Exception:
-            logger.exception("Failed to start camera relay for %s", cam_id)
-            return False
-
-
-# ── Audio source toggle ────────────────────────────────────────────────
-
-def set_audio_source(mode: str) -> bool:
-    """
-    Set audio source mode.
-
-    Args:
-        mode: 'cam1'   — always use cam1 audio (main commentary mic)
-              'active' — use audio from whichever camera is currently on-air
-              'usb:<device>' — use a USB audio device, e.g. 'usb:hw:1,0'
-                               or 'usb:alsa_input.usb-...' (PulseAudio name)
-
-    If a camera relay is running and the mode changes, the relay is
-    restarted automatically to apply the new audio mapping.
-    """
-    global _audio_source_mode
-
-    mode = mode.strip()
-
-    # Validate the mode
-    if mode.lower() in ("cam1", "active"):
-        mode = mode.lower()
-    elif mode.startswith("usb:"):
-        device = _parse_usb_audio_device(mode)
-        if device is None:
-            logger.error(
-                "Invalid USB audio mode '%s' — expected 'usb:<device>', "
-                "e.g. 'usb:hw:1,0' or 'usb:alsa_input.usb-...'", mode,
-            )
-            return False
-    else:
-        logger.error(
-            "Invalid audio mode '%s' — must be 'cam1', 'active', or 'usb:<device>'",
-            mode,
-        )
-        return False
-
-    previous = _audio_source_mode
-    _audio_source_mode = mode
-    logger.info("Audio source mode set to '%s'", mode)
-
-    # If mode changed and a camera relay is active, restart it to pick up
-    # the new audio mapping.
-    if previous != mode and _active_camera:
-        logger.info("Re-switching camera %s to apply new audio mode", _active_camera)
-        switch_camera(_active_camera)
-
-    return True
-
-
-def get_audio_source() -> str:
-    """Return current audio source mode ('cam1', 'active', or 'usb:<device>')."""
+def get_audio_source():
     return _audio_source_mode
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 3.  Scoreboard Overlay
-# ═══════════════════════════════════════════════════════════════════════════
+def get_youtube_running():
+    encoder = _youtube_proc
+    return bool(encoder and encoder.healthy())
 
-def update_scoreboard_overlay(
-    home_name: str,
-    home_score: int,
-    away_name: str,
-    away_score: int,
-    clock_str: str,
-) -> None:
-    """
-    Atomically write the scoreboard text file that FFmpeg's
-    ``drawtext=textfile=…:reload=1`` reads on each frame.
 
-    Uses tempfile + os.replace for atomic replacement so FFmpeg never
-    reads a partially-written file.
-    """
-    text = f" {home_name}  {home_score} - {away_score}  {away_name}   |   {clock_str} "
-    target_path = os.path.join("static", "scoreboard.txt")
-    os.makedirs("static", exist_ok=True)
+def get_stream_status():
+    # Status must remain responsive while a control operation awaits readiness.
+    active = get_youtube_running()
+    state = "reconnecting" if _want_stream and _state == "live" and not active else _state
+    return {"active": active, "state": state,
+            "active_camera": get_active_camera(), "selected_camera": _active_camera,
+            "pending_camera": _pending_camera,
+            "audio_source": _audio_source_mode, "audio_actual": _relay_audio,
+            "audio_warning": _audio_warning if _relay_proc else "",
+            "started_at": _started_at,
+            "error": _error, "profile": _profile, "fallback": get_active_camera() is None}
 
-    fd, tmp_path = tempfile.mkstemp(dir="static", suffix=".tmp", text=True)
+
+def _ffmpeg():
+    return ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "warning",
+            "-nostats", "-progress", "pipe:1"]
+
+
+def _input(path):
+    return ["-rtsp_transport", "tcp", "-timeout", "5000000", "-i", f"{RTSP_BASE}/{path}"]
+
+
+def _probe(cam):
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(text)
-        os.replace(tmp_path, target_path)
-        logger.debug("Scoreboard updated: %s", text.strip())
-    except Exception:
-        logger.exception("Failed to write scoreboard overlay")
-        # Clean up orphaned temp file
+        result = subprocess.run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
+                                 "-timeout", "3000000", "-show_streams", "-of", "json",
+                                 f"{RTSP_BASE}/{cam}"], capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        raise ValueError(f"Timed out reading {cam}") from None
+    if result.returncode:
+        raise ValueError(f"Cannot read {cam}")
+    return {s["codec_type"] for s in json.loads(result.stdout).get("streams", [])}
+
+
+def _usb_device_available(device):
+    from network_manager import get_usb_audio_devices
+    return device in {d["id"] for d in get_usb_audio_devices()}
+
+
+def _wanted_audio_available(cam, mode):
+    """Whether the operator's chosen audio source can be used for cam right now."""
+    if mode.startswith("usb:"):
+        return _usb_device_available(mode[4:])
+    if mode == "cam1":
         try:
-            os.unlink(tmp_path)
+            return "audio" in _probe("cam1")
+        except ValueError:
+            return False
+    return True
+
+
+def _audio_degraded(mode, actual):
+    return (mode == "cam1" and actual != "cam1") or (mode.startswith("usb:") and actual != mode)
+
+
+def _relay_command(cam, mode):
+    """Return (command, audio actually used, warning). Only missing video is fatal: a
+    missing commentary source degrades to the camera's own audio (or silence) so the
+    picture never goes to fallback because of a microphone."""
+    tracks = _probe(cam)
+    if "video" not in tracks:
+        raise ValueError(f"{cam} has no video")
+    cmd = _ffmpeg() + _input(cam)
+    warning = ""
+    if mode.startswith("usb:"):
+        device = mode[4:]
+        if _usb_device_available(device):
+            fmt = "alsa" if device.startswith(("hw:", "plughw:")) else "pulse"
+            cmd += ["-thread_queue_size", "512", "-f", fmt, "-i", device]
+            return _relay_output(cmd, "1:a:0"), mode, ""
+        warning = "USB microphone unavailable"
+    elif mode == "cam1" and cam != "cam1":
+        try:
+            commentary = "audio" in _probe("cam1")
+        except ValueError:
+            commentary = False
+        if commentary:
+            return _relay_output(cmd + _input("cam1"), "1:a:0"), "cam1", ""
+        warning = "Cam 1 commentary unavailable"
+    if "audio" in tracks:
+        actual = "cam1" if cam == "cam1" else "camera"
+        if warning:
+            warning += f"; using {cam} audio"
+        return _relay_output(cmd, "0:a:0"), actual, warning
+    if mode == "cam1" and cam == "cam1":
+        warning = "Cam 1 has no audio"
+    cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    return _relay_output(cmd, "1:a:0"), "silence", f"{warning}; broadcasting silence" if warning else ""
+
+
+def _relay_output(cmd, audio):
+    return cmd + ["-map", "0:v:0", "-map", audio,
+        "-vf", "scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p", "-g", "30", "-b:v", "4500k",
+        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-af", "aresample=async=1",
+        "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"]
+
+
+def _wait_progress(proc, timeout=12, aborted=lambda: False):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline and proc.poll() is None and not aborted():
+        if proc.healthy():
+            return True
+        time.sleep(.1)
+    return False
+
+
+SUPERSEDED = "Superseded by a newer request"
+BUSY = "A cut is already in progress"
+
+
+def switch_camera(cam_id, automatic=False):
+    """Operator cuts supersede any cut in flight. Automatic (supervisor) cuts never wait
+    and never supersede an operator."""
+    global _generation, _pending_camera
+    if cam_id not in CAMERA_IDS:
+        return False, "Invalid camera"
+    with _lock:
+        if not get_mediamtx_running():
+            return False, "MediaMTX is not ready"
+        if not automatic:
+            _generation += 1
+            _pending_camera = cam_id
+        generation = _generation
+    if not _switch_lock.acquire(blocking=not automatic):
+        return False, BUSY
+    try:
+        return _replace_relay(cam_id, generation)
+    finally:
+        _switch_lock.release()
+        with _lock:
+            if generation == _generation and not automatic:
+                _pending_camera = None
+
+
+def _replace_relay(cam_id, generation):
+    global _relay_proc, _active_camera, _error, _relay_audio, _audio_warning, _relay_failures
+    current = lambda: generation == _generation
+    if not current():
+        return False, SUPERSEDED
+    mode = _audio_source_mode
+    try:
+        # Probe and validate before disturbing the current publisher.
+        cmd, audio, warning = _relay_command(cam_id, mode)
+    except Exception as exc:
+        if current():
+            _error = str(exc)
+        return False, str(exc)
+    with _lock:
+        if not current():
+            return False, SUPERSEDED
+        old, _relay_proc = _relay_proc, None
+    _kill_process(old)
+    try:
+        candidate = Process(cmd)
+    except OSError as exc:
+        _error = f"Cannot start camera relay: {exc}"
+        return False, _error
+    ok = _wait_progress(candidate, aborted=lambda: not current())
+    with _lock:
+        installed = ok and current()
+        if installed:
+            _relay_proc, _active_camera = candidate, cam_id
+            _relay_audio, _audio_warning = audio, warning
+            _error, _relay_failures = "", 0
+    if installed:
+        if warning:
+            logger.warning("Relay %s: %s", cam_id, warning)
+        return True, f"Camera {cam_id} selected" + (f" ({warning})" if warning else "")
+    message = candidate.error or "Camera relay did not produce frames"
+    _kill_process(candidate)
+    if not current():
+        return False, SUPERSEDED
+    # _active_camera keeps the prior selection: the supervisor restores it when its
+    # camera is publishing, and program shows fallback meanwhile.
+    _error = message
+    return False, message
+
+
+def set_audio_source(mode):
+    global _audio_source_mode
+    if mode not in ("cam1", "active") and not (mode.startswith("usb:") and mode[4:]):
+        return False, "Invalid audio source"
+    if mode.startswith("usb:") and not _usb_device_available(mode[4:]):
+        return False, "Unknown audio device"
+    with _lock:
+        previous, camera = _audio_source_mode, _active_camera
+        _audio_source_mode = mode
+    if previous != mode and camera:
+        ok, message = switch_camera(camera)
+        if not ok and message != SUPERSEDED:
+            with _lock:
+                if _audio_source_mode == mode:
+                    _audio_source_mode = previous
+            return False, message
+        if ok and _audio_warning:
+            return True, f"Audio source updated ({_audio_warning})"
+    return True, "Audio source updated"
+
+
+def _launch_encoder():
+    global _youtube_proc
+    width, height, bitrate = PROFILES[_profile]
+    # Disable drawtext expansion: team names are literal text, including percent signs.
+    escaped = SCOREBOARD_PATH.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
+    vf = (f"scale={width}:{height},drawtext=textfile='{escaped}':reload=1:expansion=none:"
+          "fontcolor=white:fontsize=28:box=1:boxcolor=black@0.6:boxborderw=8:x=20:y=h-th-20")
+    cmd = _ffmpeg() + _input("program") + [
+        "-map", "0:v:0", "-map", "0:a:0", "-vf", vf,
+        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", "9000k", "-g", "60",
+        "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-ar", "48000", "-ac", "2", "-rw_timeout", "10000000", "-f", "flv",
+        f"{YOUTUBE_RTMP_BASE}/{_youtube_stream_key}"]
+    _youtube_proc = Process(cmd, secret=_youtube_stream_key)
+
+
+def start_youtube_stream(stream_key, profile="720p"):
+    global _want_stream, _youtube_stream_key, _state, _error, _profile, _retry_at, _retries
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
+        return False, "Invalid stream key"
+    if profile not in PROFILES:
+        return False, "Invalid quality profile"
+    if _want_stream:
+        return False, "Stream is already starting or running; stop before changing settings"
+    if not all(shutil.which(binary) for binary in ("ffmpeg", "ffprobe")):
+        return False, "Install ffmpeg and ffprobe before streaming"
+    if not get_mediamtx_running():
+        return False, "MediaMTX is not ready"
+    if not Path(SCOREBOARD_PATH).is_file():
+        return False, "Scoreboard is not initialized"
+    if not get_active_camera():
+        # Selecting a camera can take seconds; do it without holding _lock.
+        try:
+            live = _paths()
+        except requests.RequestException:
+            return False, "Cannot query camera readiness"
+        preferred = [_active_camera] if _active_camera else []
+        camera = next((c for c in preferred + CAMERA_IDS if live.get(c)), None)
+        if camera is None:
+            return False, "No camera is publishing"
+        ok, message = switch_camera(camera)
+        if not ok:
+            return False, message
+    with _lock:
+        if _want_stream:
+            return False, "Stream is already starting or running; stop before changing settings"
+        _youtube_stream_key, _profile = stream_key, profile
+        try:
+            _launch_encoder()
         except OSError:
-            pass
+            _youtube_stream_key = None
+            return False, "Unable to launch encoder"
+        _want_stream, _state, _error = True, "starting", ""
+        _retry_at, _retries = 0, 0
+        return True, "Encoder starting; watch the live status for confirmation"
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# 4.  Convenience / Shutdown
-# ═══════════════════════════════════════════════════════════════════════════
+def stop_youtube_stream():
+    global _want_stream, _youtube_proc, _relay_proc, _active_camera, _generation
+    global _youtube_stream_key, _state, _error, _started_at, _pending_camera
+    with _lock:
+        _want_stream = False
+        _generation += 1  # abort any cut in flight
+        encoder, relay = _youtube_proc, _relay_proc
+        _youtube_proc = _relay_proc = None
+        _active_camera = _youtube_stream_key = _started_at = _pending_camera = None
+        _state, _error = "stopped", ""
+    _kill_process(encoder)
+    _kill_process(relay)
+    return True, "Streaming stopped"
 
-def shutdown_all() -> None:
-    """Tear down every managed process in the correct order."""
-    logger.info("Shutting down all media engine processes …")
-    stop_youtube_stream()
-    stop_mediamtx()
-    logger.info("All media engine processes stopped")
+
+def _supervise_relay(now):
+    """Restart a dead relay with backoff, and restore the chosen commentary source after
+    a degraded relay once that source is available again. Never holds _lock while slow."""
+    global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at
+    with _lock:
+        relay, camera, mode = _relay_proc, _active_camera, _audio_source_mode
+        dead = relay and (relay.poll() is not None or
+                          (not relay.healthy() and now - relay.launched > 15))
+        if dead:
+            _relay_proc = None
+    if dead:
+        _kill_process(relay)
+        relay = None
+    if not camera or _switch_lock.locked():
+        return
+    if relay is None:
+        if _camera_status.get(camera) and now >= _relay_retry_at:
+            ok, message = switch_camera(camera, automatic=True)
+            if not ok and message not in (BUSY, SUPERSEDED):
+                _relay_failures += 1
+                _relay_retry_at = now + min(30, 2 ** min(_relay_failures, 5))
+    elif _audio_degraded(mode, _relay_audio) and now >= _restore_check_at and relay.healthy():
+        _restore_check_at = now + 10
+        if _wanted_audio_available(camera, mode):
+            logger.info("Restoring %s audio on %s", mode, camera)
+            switch_camera(camera, automatic=True)
+
+
+def _supervise_once():
+    global _camera_status, _state, _error, _started_at, _retry_at, _retries, _mediamtx_retry_at
+    try:
+        paths = _paths()
+        _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS + ["program"]}
+    except (requests.RequestException, ValueError, KeyError):
+        _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
+    now = time.monotonic()
+    # Cameras need MediaMTX whether or not we are live.
+    if not get_mediamtx_running():
+        if now >= _mediamtx_retry_at:
+            _mediamtx_retry_at = now + 5
+            logger.warning("MediaMTX is not running; restarting")
+            start_mediamtx()
+        if not get_mediamtx_running():
+            return
+    _supervise_relay(now)
+    with _lock:
+        if not _want_stream:
+            return
+        if _youtube_proc and _youtube_proc.healthy():
+            _state = "live"
+            _error = ""
+            _retries = 0
+            if _started_at is None:
+                _started_at = datetime.now(timezone.utc).isoformat()
+            return
+        if _youtube_proc and _youtube_proc.poll() is None and now - _youtube_proc.launched < 20:
+            return
+        _state = "reconnecting"
+        _error = (_youtube_proc.error if _youtube_proc else "") or "Encoder stopped producing frames"
+        _kill_process(_youtube_proc)
+        if now >= _retry_at:
+            _retries += 1
+            _retry_at = now + min(30, 2 ** min(_retries, 5))
+            try:
+                _launch_encoder()
+            except OSError:
+                _state, _error = "failed", "Cannot restart encoder"
+
+
+def _supervise():
+    while not _stop.wait(2):
+        try:
+            _supervise_once()
+        except Exception:
+            logger.exception("Media supervisor failed")
+
+
+def shutdown_all():
+    global _mediamtx_proc
+    _stop.set()
+    if _thread and _thread is not threading.current_thread():
+        _thread.join(timeout=20)
+    with _lock:
+        stop_youtube_stream()
+        _kill_process(_mediamtx_proc)
+        _mediamtx_proc = None

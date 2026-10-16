@@ -14,6 +14,7 @@ Run: python app.py
 """
 
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -22,96 +23,29 @@ from functools import wraps
 
 from flask import Flask, jsonify, render_template, request
 
-# ---------------------------------------------------------------------------
-# Graceful imports for companion modules (may not exist yet during early dev)
-# ---------------------------------------------------------------------------
-try:
-    from network_manager import (
-        get_network_status,
-        connect_usb,
-        start_hotspot,
-        stop_hotspot,
-        get_usb_audio_devices,
-    )
-except ImportError:
-    logging.warning("network_manager module not found — network endpoints will return stub data")
+import atexit
+import json
+import secrets
+import signal
+from pathlib import Path
+from urllib.parse import urlsplit
+from werkzeug.exceptions import HTTPException
+from network_manager import (get_network_status, connect_usb, start_hotspot,
+                             stop_hotspot, get_usb_audio_devices, get_firewall_status)
+from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
+                          get_mediamtx_running, get_stream_status, start_youtube_stream,
+                          stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
+                          SUPERSEDED)
 
-    def get_network_status():
-        return {
-            "wifi_ip": "10.42.0.1",
-            "usb_iface": None,
-            "usb_status": "Module not loaded",
-            "hotspot_active": False,
-            "internet_ok": False,
-        }
+def init_mediamtx():
+    if not ensure_mediamtx():
+        raise RuntimeError("MediaMTX installation failed; check prerequisites and logs")
+    with _init_lock:
+        if not _workers_stop.is_set() and not start_mediamtx():
+            raise RuntimeError("MediaMTX could not start; check prerequisites and logs")
 
-    def connect_usb(iface=None):
-        return False, "network_manager module not loaded"
-
-    def start_hotspot(ssid, password):
-        return False, "network_manager module not loaded"
-
-    def stop_hotspot():
-        return False, "network_manager module not loaded"
-
-    def get_usb_audio_devices():
-        return []
-
-try:
-    from media_engine import (
-        ensure_mediamtx,
-        start_mediamtx,
-        get_camera_status,
-        get_mediamtx_running,
-        get_youtube_running,
-        get_active_camera,
-        get_audio_source as get_audio_source_mode,
-        start_youtube_stream,
-        stop_youtube_stream,
-        switch_camera,
-        set_audio_source,
-    )
-
-    def init_mediamtx():
-        ensure_mediamtx()
-        start_mediamtx()
-
-    def get_mediamtx_status():
-        return {"running": get_mediamtx_running()}
-
-    def get_stream_status():
-        return {
-            "active": get_youtube_running(),
-            "active_camera": get_active_camera(),
-            "audio_source": get_audio_source_mode(),
-        }
-
-except ImportError:
-    logging.warning("media_engine module not found — media endpoints will return stub data")
-
-    def init_mediamtx():
-        logging.info("MediaMTX init skipped (media_engine not loaded)")
-
-    def get_camera_status():
-        return {"cam1": False, "cam2": False, "cam3": False}
-
-    def get_mediamtx_status():
-        return {"running": False}
-
-    def start_youtube_stream(stream_key):
-        return False, "media_engine module not loaded"
-
-    def stop_youtube_stream():
-        return False, "media_engine module not loaded"
-
-    def switch_camera(cam_id):
-        return False, "media_engine module not loaded"
-
-    def set_audio_source(mode):
-        return False, "media_engine module not loaded"
-
-    def get_stream_status():
-        return {"active": False, "active_camera": "cam1", "audio_source": "cam1"}
+def get_mediamtx_status():
+    return {"running": get_mediamtx_running()}
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -128,16 +62,35 @@ log = logging.getLogger("app")
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
-# ---------------------------------------------------------------------------
-# CORS — allow any origin on the local network
-# ---------------------------------------------------------------------------
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024
+app.config["OPERATOR_PASSWORD"] = os.environ.get("MCC_OPERATOR_PASSWORD")
+
+@app.before_request
+def protect_controls():
+    password = app.config.get("OPERATOR_PASSWORD")
+    auth = request.authorization
+    if not password:
+        return jsonify(ok=False, error="Operator password has not been configured"), 503
+    if not auth or auth.username != "operator" or not secrets.compare_digest((auth.password or "").encode(), password.encode()):
+        return jsonify(ok=False, error="Operator login required"), 401, {
+            "WWW-Authenticate": 'Basic realm="Matchday operator"', "Cache-Control": "no-store"}
+    if request.method == "POST":
+        origin = request.headers.get("Origin")
+        if origin and origin != request.host_url.rstrip("/"):
+            return jsonify(ok=False, error="Cross-origin control requests are forbidden"), 403
+        if not request.is_json or not isinstance(request.get_json(silent=True), dict):
+            return jsonify(ok=False, error="A JSON object is required"), 400
 
 @app.after_request
-def add_cors_headers(response):
-    response.headers["Access-Control-Allow-Origin"] = "*"
-    response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+def secure_headers(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
     return response
+
+@app.errorhandler(HTTPException)
+def http_error(error):
+    return jsonify(ok=False, error=error.description), error.code
 
 # ---------------------------------------------------------------------------
 # Scoreboard & match clock state  (server-side, thread-safe)
@@ -145,7 +98,7 @@ def add_cors_headers(response):
 SCOREBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 SCOREBOARD_PATH = os.path.join(SCOREBOARD_DIR, "scoreboard.txt")
 
-_scoreboard_lock = threading.Lock()
+_scoreboard_lock = threading.RLock()
 _scoreboard = {
     "home_name": "HOME",
     "home_score": 0,
@@ -153,7 +106,7 @@ _scoreboard = {
     "away_score": 0,
 }
 
-_clock_lock = threading.Lock()
+_clock_lock = _scoreboard_lock
 _clock = {
     "running": False,
     "elapsed": 0.0,        # seconds elapsed when last paused / updated
@@ -178,6 +131,10 @@ def _format_clock(total_seconds):
 
 
 def _write_scoreboard_file():
+    with _scoreboard_lock:
+        _write_scoreboard_locked()
+
+def _write_scoreboard_locked():
     """Atomically write scoreboard.txt so FFmpeg drawtext reload=1 never reads a partial file."""
     with _scoreboard_lock:
         home = _scoreboard["home_name"]
@@ -226,9 +183,11 @@ def api_endpoint(f):
     def wrapper(*args, **kwargs):
         try:
             return f(*args, **kwargs)
+        except (ValueError, TypeError) as exc:
+            return jsonify(ok=False, error=str(exc)), 400
         except Exception as exc:
             log.exception("Unhandled error in %s", f.__name__)
-            return jsonify({"ok": False, "error": str(exc)}), 500
+            return jsonify({"ok": False, "error": "Operation failed; inspect server logs"}), 500
     return wrapper
 
 # ===================================================================
@@ -240,7 +199,10 @@ def api_endpoint(f):
 @app.route("/")
 def index():
     """Serve the main dashboard UI."""
-    return render_template("index.html")
+    host = urlsplit(request.host_url).hostname or "localhost"
+    if ":" in host:
+        host = f"[{host}]"
+    return render_template("index.html", media_host=host)
 
 
 # --- Combined status (polled by UI every ~2 s) ------------------------
@@ -249,12 +211,12 @@ def index():
 @api_endpoint
 def api_status():
     """Return combined network + camera + stream + scoreboard status."""
-    network = get_network_status()
+    network = dict(_diagnostics.get("network", {}))
     cameras = get_camera_status()
     mediamtx = get_mediamtx_status()
     stream = get_stream_status()
     scoreboard = _get_scoreboard_state()
-    audio_devices = get_usb_audio_devices()
+    audio_devices = list(_diagnostics.get("audio_devices", []))
 
     return jsonify({
         "ok": True,
@@ -264,6 +226,9 @@ def api_status():
         "stream": stream,
         "scoreboard": scoreboard,
         "audio_devices": audio_devices,
+        "firewall": _diagnostics.get("firewall", {}),
+        "diagnostics_updated_at": _diagnostics.get("updated_at"),
+        "initialization_error": _initialization_error,
     })
 
 
@@ -290,10 +255,12 @@ def api_hotspot_start():
     """Start the Wi-Fi hotspot with the given SSID and password."""
     data = request.get_json(force=True, silent=True) or {}
     ssid = data.get("ssid", "MatchdayLive")
-    password = data.get("password", "matchday123")
+    password = data.get("password", "")
 
-    if len(password) < 8:
-        return jsonify({"ok": False, "error": "Password must be at least 8 characters"}), 400
+    if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32:
+        raise ValueError("SSID must be 1–32 bytes")
+    if not isinstance(password, str) or not 8 <= len(password) <= 63:
+        return jsonify({"ok": False, "error": "Password must be 8–63 characters"}), 400
 
     log.info("Hotspot start requested: ssid=%s", ssid)
     success, msg = start_hotspot(ssid, password)
@@ -318,13 +285,13 @@ def api_hotspot_stop():
 def api_stream_start():
     """Start the YouTube live stream encoder pipeline."""
     data = request.get_json(force=True, silent=True) or {}
-    stream_key = data.get("stream_key", "").strip()
+    stream_key = text_field(data, "stream_key", 200)
 
     if not stream_key:
         return jsonify({"ok": False, "error": "stream_key is required"}), 400
 
     log.info("Stream start requested")
-    success, msg = start_youtube_stream(stream_key)
+    success, msg = start_youtube_stream(stream_key, text_field(data, "profile", 10, "720p"))
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
 
@@ -351,6 +318,9 @@ def api_switch_camera(cam_id):
 
     log.info("Camera switch requested: %s", cam_id)
     success, msg = switch_camera(cam_id)
+    if not success and msg == SUPERSEDED:
+        # A newer cut (or STOP) replaced this one; the client follows the latest request.
+        return jsonify({"ok": False, "superseded": True, "message": msg}), 409
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg, "active_camera": cam_id}), status_code
 
@@ -362,7 +332,7 @@ def api_switch_camera(cam_id):
 def api_audio_source():
     """Set the audio mode — 'cam1', 'active', or 'usb:<device_id>'."""
     data = request.get_json(force=True, silent=True) or {}
-    mode = data.get("mode", "").strip().lower()
+    mode = text_field(data, "mode", 200)
 
     if mode not in ("cam1", "active") and not (mode.startswith("usb:") and len(mode) > 4):
         return jsonify({
@@ -392,23 +362,26 @@ def api_scoreboard_update():
     """Update team names and/or scores, then rewrite the overlay file."""
     data = request.get_json(force=True, silent=True) or {}
 
+    updates = {}
+    for field in ("home_name", "away_name"):
+        if field in data:
+            updates[field] = text_field(data, field, 40).upper() or field.split("_")[0].upper()
+    for field in ("home_score", "away_score"):
+        if field in data:
+            value = data[field]
+            if type(value) is not int or not 0 <= value <= 999:
+                raise ValueError("Scores must be integers between 0 and 999")
+            updates[field] = value
     with _scoreboard_lock:
-        if "home_name" in data:
-            _scoreboard["home_name"] = str(data["home_name"]).strip().upper() or "HOME"
-        if "away_name" in data:
-            _scoreboard["away_name"] = str(data["away_name"]).strip().upper() or "AWAY"
-        if "home_score" in data:
-            try:
-                _scoreboard["home_score"] = max(0, int(data["home_score"]))
-            except (ValueError, TypeError):
-                pass
-        if "away_score" in data:
-            try:
-                _scoreboard["away_score"] = max(0, int(data["away_score"]))
-            except (ValueError, TypeError):
-                pass
+        if "delta" in data:
+            if data.get("team") not in ("home", "away") or type(data["delta"]) is not int or data["delta"] not in (-1, 1):
+                raise ValueError("Score adjustment requires team and delta (+1 or -1)")
+            key = data["team"] + "_score"
+            updates[key] = max(0, min(999, _scoreboard[key] + data["delta"]))
+        _scoreboard.update(updates)
 
     _write_scoreboard_file()
+    _save_match()
     log.info("Scoreboard updated: %s", _get_scoreboard_state())
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
@@ -423,13 +396,16 @@ def api_scoreboard_clock():
     For set_half, also accepts "half": 1 or 2
     """
     data = request.get_json(force=True, silent=True) or {}
-    action = data.get("action", "").strip().lower()
+    action = text_field(data, "action", 20).lower()
 
     if action not in ("start", "pause", "reset", "set_half"):
         return jsonify({
             "ok": False,
             "error": "action must be one of: start, pause, reset, set_half",
         }), 400
+
+    if action == "set_half" and (type(data.get("half")) is not int or data["half"] not in (1, 2)):
+        raise ValueError("Half must be 1 or 2")
 
     with _clock_lock:
         if action == "start":
@@ -471,6 +447,7 @@ def api_scoreboard_clock():
                 log.info("Match clock set to 00:00 for 1st half")
 
     _write_scoreboard_file()
+    _save_match()
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
 
@@ -481,32 +458,116 @@ def api_scoreboard_get():
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
 
-# ===================================================================
-#  Start-up helpers
-# ===================================================================
+# Runtime services are explicit: importing the module starts no processes.
+RUNTIME_DIR = Path(__file__).resolve().parent / "data"
+MATCH_PATH = RUNTIME_DIR / "match.json"
+_workers_stop = threading.Event()
+_init_lock = threading.Lock()
+_workers = []
+_diagnostics = {}
+_initialization_error = None
+
+def text_field(data, field, limit, default=""):
+    value = data.get(field, default)
+    if not isinstance(value, str) or len(value) > limit or any(ord(c) < 32 for c in value):
+        raise ValueError(f"{field} must be text of at most {limit} characters without control characters")
+    return value.strip()
+
+def _save_match():
+    with _scoreboard_lock:
+        state = _get_scoreboard_state()
+        MATCH_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(dir=MATCH_PATH.parent)
+        try:
+            with os.fdopen(fd, "w") as output:
+                json.dump(state, output)
+            os.replace(temporary, MATCH_PATH)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
+
+def _restore_match():
+    if not MATCH_PATH.exists():
+        return
+    try:
+        state = json.loads(MATCH_PATH.read_text())
+        for field in ("home_name", "away_name"):
+            text_field(state, field, 40)
+        for field in ("home_score", "away_score"):
+            if type(state[field]) is not int or not 0 <= state[field] <= 999:
+                raise ValueError("Invalid persisted score")
+        elapsed = float(state["clock_elapsed_secs"])
+        if not math.isfinite(elapsed) or elapsed < 0 or state["half"] not in (1, 2):
+            raise ValueError("Invalid persisted clock")
+        with _scoreboard_lock:
+            _scoreboard.update({key: state[key] for key in _scoreboard})
+            _clock.update(running=False, elapsed=float(state["clock_elapsed_secs"]),
+                          start_ts=None, half=state["half"])
+    except (ValueError, KeyError, OSError, TypeError):
+        log.exception("Cannot restore saved match")
+
+def _overlay_worker():
+    ticks = 0
+    while not _workers_stop.wait(.5):
+        try:
+            _write_scoreboard_file()
+            ticks += 1
+            if ticks % 10 == 0:
+                _save_match()
+        except OSError:
+            log.exception("Cannot update scoreboard")
+
+def _diagnostics_worker():
+    global _diagnostics
+    while not _workers_stop.is_set():
+        try:
+            _diagnostics = {"network": get_network_status(),
+                            "audio_devices": get_usb_audio_devices(),
+                            "firewall": get_firewall_status(), "updated_at": time.time()}
+        except Exception:
+            log.exception("Diagnostics failed")
+        _workers_stop.wait(5)
 
 def _background_init():
-    """Initialise MediaMTX in a background thread so Flask starts immediately."""
+    global _initialization_error
     try:
-        log.info("Background init: starting MediaMTX provisioning…")
         init_mediamtx()
-        log.info("Background init: MediaMTX ready")
-    except Exception:
-        log.exception("Background init: MediaMTX failed to start")
+    except Exception as exc:
+        _initialization_error = str(exc)
+        log.exception("MediaMTX initialization failed")
 
+def initialize():
+    RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    password_file = RUNTIME_DIR / "operator-password"
+    if not app.config["OPERATOR_PASSWORD"]:
+        if not password_file.exists():
+            fd = os.open(password_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w") as output:
+                output.write(secrets.token_urlsafe(24))
+        app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
+        log.info("Login as operator; password is in %s", password_file)
+    _restore_match()
+    _write_scoreboard_file()
+    for target in (_overlay_worker, _diagnostics_worker, _background_init):
+        worker = threading.Thread(target=target, daemon=True)
+        _workers.append(worker)
+        worker.start()
 
-# ===================================================================
-#  Main entry point
-# ===================================================================
+def shutdown():
+    _workers_stop.set()
+    # Join initialization before cleaning up a process it may be starting.
+    for worker in _workers:
+        worker.join(timeout=2)
+    with _init_lock:
+        shutdown_all()
+    _save_match()
 
 if __name__ == "__main__":
-    # Write initial scoreboard file
-    _write_scoreboard_file()
-    log.info("Initial scoreboard written to %s", SCOREBOARD_PATH)
-
-    # Start MediaMTX in background so Flask binds immediately
-    init_thread = threading.Thread(target=_background_init, daemon=True, name="mediamtx-init")
-    init_thread.start()
-
-    log.info("Starting Matchday Live Control Center on 0.0.0.0:5000")
-    app.run(host="0.0.0.0", port=5000, debug=False, threaded=True)
+    from waitress import serve
+    initialize()
+    atexit.register(shutdown)
+    def terminate(signum, frame):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, terminate)
+    signal.signal(signal.SIGINT, terminate)
+    serve(app, host=os.environ.get("MCC_BIND", "0.0.0.0"), port=5000, threads=16)

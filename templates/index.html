@@ -2,35 +2,10 @@
 <html lang="en" class="scroll-smooth">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
   <title>⚽ Matchday Live Control Center</title>
-  <script src="https://cdn.tailwindcss.com"></script>
-  <script>
-    tailwind.config = {
-      darkMode: 'class',
-      theme: {
-        extend: {
-          colors: {
-            slate: {
-              950: '#0f172a',
-              900: '#0f1729',
-              850: '#131c35',
-              800: '#1e293b',
-              700: '#334155',
-              600: '#475569',
-            },
-            brand: {
-              red: '#ef4444',
-              green: '#22c55e',
-              blue: '#3b82f6',
-              amber: '#f59e0b',
-              cyan: '#06b6d4',
-            }
-          }
-        }
-      }
-    }
-  </script>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+
   <style>
     /* Base dark-mode styles */
     body {
@@ -98,6 +73,13 @@
       transform: scale(0.96);
     }
 
+    /* Match mode: one-screen sideline controls; setup sections are hidden */
+    body.match-mode [data-setup] { display: none; }
+    body:not(.match-mode) [data-match] { display: none; }
+    .match-cut { min-height: 84px; }
+    .match-btn { min-height: 48px; white-space: nowrap; }
+    .cut-btn:disabled { cursor: not-allowed; }
+
     /* Score button */
     .btn-score {
       min-width: 48px;
@@ -108,6 +90,8 @@
   </style>
 </head>
 <body class="min-h-screen pb-8">
+  <p id="connection-status" role="status" class="text-center text-sm text-slate-300 p-2">Connecting…</p>
+
 
   <!-- ═══════════════════════════════════════════════════════════════════
        TOAST CONTAINER
@@ -126,13 +110,13 @@
       <!-- Status Badges -->
       <div class="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
         <!-- USB Internet -->
-        <span class="flex items-center gap-1.5" title="USB Internet">
+        <span class="flex items-center gap-1.5" title="General internet connectivity">
           <span id="status-usb-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
-          <span id="status-usb-label" class="text-slate-300">USB</span>
+          <span id="status-usb-label" class="hidden sm:inline text-slate-300">USB</span>
         </span>
         <!-- Hotspot IP -->
         <span class="flex items-center gap-1.5" title="Hotspot">
-          📡 <span id="status-hotspot-ip" class="text-slate-300">10.42.0.1</span>
+          📡 <span id="status-hotspot-ip" class="text-slate-300">{{ media_host }}</span>
         </span>
         <!-- RTMP Server -->
         <span class="flex items-center gap-1.5" title="RTMP Server">
@@ -144,6 +128,10 @@
               class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400">
           OFFLINE
         </span>
+        <button id="mode-toggle" onclick="toggleMode()"
+                class="px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold bg-brand-blue hover:bg-blue-600 text-white transition-colors">
+          ⚽ Match mode
+        </button>
       </div>
     </div>
   </header>
@@ -154,9 +142,79 @@
   <main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
 
     <!-- ─────────────────────────────────────────────────────────────────
+         MATCH MODE: everything needed during play on one phone screen
+         ───────────────────────────────────────────────────────────────── -->
+    <section id="match-panel" data-match class="grid gap-3 lg:grid-cols-2">
+      <div class="space-y-3">
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700">
+          <div class="flex items-center justify-between mb-2">
+            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
+            <button id="match-preview-toggle" onclick="toggleMatchPreview()"
+                    class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
+          </div>
+          <div id="match-preview" class="webrtc-frame border-2 border-red-900">
+            <iframe data-preview="match" data-src="http://{{ media_host }}:8889/program" allow="autoplay"></iframe>
+          </div>
+        </div>
+        <div class="grid grid-cols-3 gap-2">
+          {% for n in [1, 2, 3] %}
+          <button data-cut="cam{{ n }}" onclick="switchCam('cam{{ n }}')"
+                  data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
+            <span class="text-2xl font-extrabold">CAM {{ n }}</span>
+            <span data-cut-state class="text-xs font-semibold uppercase tracking-wider">—</span>
+          </button>
+          {% endfor %}
+        </div>
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 space-y-2">
+          <div class="grid grid-cols-3 rounded-lg overflow-hidden border border-slate-600">
+            <button data-audio="cam1" onclick="setAudioSource('cam1')" class="px-2 py-2.5 text-sm font-medium">🎙 Cam 1 mic</button>
+            <button data-audio="active" onclick="setAudioSource('active')" class="px-2 py-2.5 text-sm font-medium">🔄 Follow cam</button>
+            <button data-audio="usb" onclick="setAudioSource('usb')" class="px-2 py-2.5 text-sm font-medium">🎤 USB mic</button>
+          </div>
+          <div data-usb-picker class="hidden">
+            <select data-usb-select onchange="selectUsbAudioDevice(this.value)" aria-label="USB microphone"
+                    class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-cyan focus:outline-none"></select>
+          </div>
+          <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
+        </div>
+      </div>
+      <div class="space-y-3">
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 grid grid-cols-2 gap-3">
+          {% for team in ['home', 'away'] %}
+          <div class="text-center min-w-0">
+            <div data-bind="{{ team }}_name" class="text-sm font-semibold text-slate-300 uppercase truncate">{{ team|upper }}</div>
+            <div data-bind="{{ team }}_score" class="text-5xl font-extrabold tabular-nums text-white my-1">0</div>
+            <div class="grid grid-cols-2 gap-2">
+              <button onclick="adjustScore('{{ team }}', -1)" aria-label="{{ team }} minus one"
+                      class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg">−</button>
+              <button onclick="adjustScore('{{ team }}', 1)" aria-label="{{ team }} goal"
+                      class="btn-score bg-brand-green hover:bg-green-600 text-white rounded-lg">+</button>
+            </div>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex items-center gap-2">
+          <span data-bind="clock" class="text-4xl font-bold font-mono tabular-nums text-white flex-1">00:00</span>
+          <button id="match-clock-toggle" onclick="toggleClock()"
+                  class="match-btn px-4 rounded-lg font-semibold text-white bg-brand-green">▶ Start</button>
+          <button onclick="clockAction('second_half')"
+                  class="match-btn px-3 rounded-lg font-semibold text-white bg-brand-blue hover:bg-blue-600">2nd half</button>
+        </div>
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex items-center gap-3">
+          <span data-bind="yt_state" class="px-2 py-1 rounded text-xs font-bold bg-slate-700 text-slate-400">OFFLINE</span>
+          <span data-bind="yt_duration" class="font-mono text-lg text-white">00:00:00</span>
+          <button data-when-streaming onclick="stopStream()"
+                  class="hidden ml-auto bg-slate-600 hover:bg-slate-500 text-white font-bold px-4 py-3 rounded-lg">⏹ Stop</button>
+          <button data-when-stopped onclick="matchGoLive()"
+                  class="ml-auto bg-red-600 hover:bg-red-700 text-white font-bold px-4 py-3 rounded-lg">🔴 Go live</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
          2. NETWORK CONTROLS PANEL
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🌐 Network Controls
       </h2>
@@ -181,7 +239,7 @@
           <div class="space-y-2 mb-3">
             <input id="hotspot-ssid" type="text" value="MatchdayLive" placeholder="SSID"
                    class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
-            <input id="hotspot-password" type="text" value="GoalGoal!" placeholder="Password"
+            <input id="hotspot-password" type="text" value="" placeholder="Password (8–63 characters)"
                    class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none">
           </div>
           <div class="flex gap-2">
@@ -211,7 +269,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          3. CAMERA OPERATOR QUICK-COPY CARDS
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🎥 Camera RTMP Links
         <span class="text-xs text-slate-400 font-normal">(Tap to copy on camera phones)</span>
@@ -223,8 +281,8 @@
             <span class="font-semibold text-white">📹 Cam 1</span>
             <span id="cam-badge-cam1" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam1</code>
-          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam1')"
+          <code id="url-cam1" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam1</code>
+          <button onclick="copyRtmp(cameraUrl('cam1'))"
                   class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
             📋 Copy RTMP URL
           </button>
@@ -235,8 +293,8 @@
             <span class="font-semibold text-white">📹 Cam 2</span>
             <span id="cam-badge-cam2" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam2</code>
-          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam2')"
+          <code id="url-cam2" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam2</code>
+          <button onclick="copyRtmp(cameraUrl('cam2'))"
                   class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
             📋 Copy RTMP URL
           </button>
@@ -247,8 +305,8 @@
             <span class="font-semibold text-white">📹 Cam 3</span>
             <span id="cam-badge-cam3" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://10.42.0.1:1935/cam3</code>
-          <button onclick="copyRtmp('rtmp://10.42.0.1:1935/cam3')"
+          <code id="url-cam3" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam3</code>
+          <button onclick="copyRtmp(cameraUrl('cam3'))"
                   class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
             📋 Copy RTMP URL
           </button>
@@ -259,7 +317,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          4. MULTIVIEW GRID + CAMERA SWITCHING
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         📺 Multiview &amp; Camera Switching
       </h2>
@@ -273,7 +331,7 @@
             <span id="mv-badge-cam1" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam1">
-            <iframe src="http://10.42.0.1:8889/cam1" allow="autoplay" loading="lazy"></iframe>
+            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam1" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Cam 2 Preview -->
@@ -283,7 +341,7 @@
             <span id="mv-badge-cam2" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam2">
-            <iframe src="http://10.42.0.1:8889/cam2" allow="autoplay" loading="lazy"></iframe>
+            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam2" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Cam 3 Preview -->
@@ -293,7 +351,7 @@
             <span id="mv-badge-cam3" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam3">
-            <iframe src="http://10.42.0.1:8889/cam3" allow="autoplay" loading="lazy"></iframe>
+            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam3" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Program Output -->
@@ -303,24 +361,27 @@
             <span id="mv-badge-program" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-red-900" id="frame-program">
-            <iframe src="http://10.42.0.1:8889/program" allow="autoplay" loading="lazy"></iframe>
+            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/program" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
       </div>
 
       <!-- Tally / Cut Buttons -->
       <div class="grid grid-cols-3 gap-3 mb-4">
-        <button id="btn-cut-cam1" onclick="switchCam('cam1')"
-                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
-          🎥 CUT TO CAM 1
+        <button id="btn-cut-cam1" data-cut="cam1" onclick="switchCam('cam1')"
+                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
+          <span>🎥 CUT TO CAM 1</span>
+          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
-        <button id="btn-cut-cam2" onclick="switchCam('cam2')"
-                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
-          🎥 CUT TO CAM 2
+        <button id="btn-cut-cam2" data-cut="cam2" onclick="switchCam('cam2')"
+                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
+          <span>🎥 CUT TO CAM 2</span>
+          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
-        <button id="btn-cut-cam3" onclick="switchCam('cam3')"
-                class="btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2">
-          🎥 CUT TO CAM 3
+        <button id="btn-cut-cam3" data-cut="cam3" onclick="switchCam('cam3')"
+                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
+          <span>🎥 CUT TO CAM 3</span>
+          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
       </div>
 
@@ -329,41 +390,41 @@
         <div class="flex items-center gap-3 flex-wrap">
           <span class="text-sm text-slate-400">🔊 Audio Source:</span>
           <div class="flex rounded-lg overflow-hidden border border-slate-600">
-            <button id="audio-cam1" onclick="setAudioSource('cam1')"
+            <button id="audio-cam1" data-audio="cam1" onclick="setAudioSource('cam1')"
                     class="px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors">
               🎙 Main Mic (Cam 1)
             </button>
-            <button id="audio-follow" onclick="setAudioSource('follow')"
+            <button id="audio-follow" data-audio="active" onclick="setAudioSource('active')"
                     class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
               🔄 Follow Active Camera
             </button>
-            <button id="audio-usb" onclick="setAudioSource('usb')"
+            <button id="audio-usb" data-audio="usb" onclick="setAudioSource('usb')"
                     class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
               🎤 USB Microphone
             </button>
           </div>
         </div>
         <!-- USB Audio Device Selector (shown when USB mode active) -->
-        <div id="usb-audio-selector" class="hidden">
+        <div id="usb-audio-selector" data-usb-picker class="hidden">
           <div class="flex items-center gap-2">
             <span class="text-xs text-slate-400">🎤 USB Device:</span>
-            <select id="usb-audio-device"
+            <select id="usb-audio-device" data-usb-select
                     onchange="selectUsbAudioDevice(this.value)"
                     class="flex-1 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-cyan focus:outline-none appearance-none cursor-pointer">
-              <option value="" disabled selected>No USB audio devices detected</option>
             </select>
           </div>
           <p id="usb-audio-active-label" class="text-xs text-slate-500 mt-1 hidden">
             Active: <span id="usb-audio-active-name" class="text-brand-cyan font-medium"></span>
           </p>
         </div>
+        <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
       </div>
     </section>
 
     <!-- ─────────────────────────────────────────────────────────────────
          5. YOUTUBE STREAM CONTROLS
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         ▶️ YouTube Stream
       </h2>
@@ -371,7 +432,8 @@
         <!-- Stream Key Input -->
         <div>
           <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
-          <div class="flex gap-2">
+          <div class="flex flex-col sm:flex-row gap-2">
+            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="720p">720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
             <div class="relative flex-1">
               <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
                      class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
@@ -397,7 +459,7 @@
         <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
           <span class="pulse-live text-red-500 text-lg">🔴</span>
           <span class="text-sm text-slate-300">ON AIR</span>
-          <span id="yt-duration" class="font-mono text-xl text-white font-bold ml-auto">00:00:00</span>
+          <span id="yt-duration" data-bind="yt_duration" class="font-mono text-xl text-white font-bold ml-auto">00:00:00</span>
         </div>
       </div>
     </section>
@@ -405,7 +467,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          6. LIVE FOOTBALL SCOREBOARD CONTROLS
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         ⚽ Scoreboard &amp; Match Clock
       </h2>
@@ -415,13 +477,13 @@
         <!-- Home Team -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Home Team</label>
-          <input id="home-name" type="text" value="HOME" placeholder="Home team name"
+          <input id="home-name" type="text" maxlength="40" value="HOME" placeholder="Home team name"
                  onchange="updateScoreboard()"
                  class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
           <div class="flex items-center justify-center gap-3">
             <button onclick="adjustScore('home', -1)"
                     class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg transition-colors">−</button>
-            <span id="home-score-display" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
+            <span id="home-score-display" data-bind="home_score" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
             <button onclick="adjustScore('home', 1)"
                     class="btn-score bg-slate-700 hover:bg-slate-600 text-brand-green rounded-lg transition-colors">+</button>
           </div>
@@ -429,13 +491,13 @@
         <!-- Away Team -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Away Team</label>
-          <input id="away-name" type="text" value="AWAY" placeholder="Away team name"
+          <input id="away-name" type="text" maxlength="40" value="AWAY" placeholder="Away team name"
                  onchange="updateScoreboard()"
                  class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
           <div class="flex items-center justify-center gap-3">
             <button onclick="adjustScore('away', -1)"
                     class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg transition-colors">−</button>
-            <span id="away-score-display" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
+            <span id="away-score-display" data-bind="away_score" class="text-4xl font-bold text-white tabular-nums w-16 text-center">0</span>
             <button onclick="adjustScore('away', 1)"
                     class="btn-score bg-slate-700 hover:bg-slate-600 text-brand-green rounded-lg transition-colors">+</button>
           </div>
@@ -457,7 +519,7 @@
       <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
         <label class="block text-xs text-slate-400 uppercase tracking-wider mb-3">⏱ Match Clock</label>
         <div class="text-center mb-4">
-          <span id="match-clock-display" class="text-5xl sm:text-6xl font-bold font-mono text-white tabular-nums">00:00</span>
+          <span id="match-clock-display" data-bind="clock" class="text-5xl sm:text-6xl font-bold font-mono text-white tabular-nums">00:00</span>
         </div>
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <button onclick="clockAction('start')"
@@ -483,7 +545,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          7. INTERACTIVE SIDELINE CHECKLIST
          ───────────────────────────────────────────────────────────────── -->
-    <section class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         ✅ Sideline Checklist
       </h2>
@@ -509,17 +571,33 @@
     let state = {
       homeScore: 0,
       awayScore: 0,
-      activeCam: 'cam1',
-      audioSource: 'cam1',         // 'cam1', 'follow', or 'usb:<device_id>'
-      audioDevices: [],              // detected USB audio devices from server
-      selectedUsbDevice: null,       // currently selected USB device id
+      activeCam: null,             // camera actually on air (relay healthy)
+      selectedCam: null,           // operator's selection (may be on fallback)
+      pendingCam: null,            // cut requested from this device, awaiting the server
+      serverPendingCam: null,      // cut in flight from any device
+      cameras: {},
+      audioSource: 'cam1',         // 'cam1', 'active', or 'usb:<device_id>'
+      audioDevices: [],            // detected USB audio devices from server
+      selectedUsbDevice: null,     // currently selected USB device id
+      usbPickerOpen: false,        // picker shown before a device is chosen
       ytLive: false,
       ytStartTime: null,
+      streamState: 'stopped',
       clockRunning: false,
       clockElapsed: 0,             // seconds from server
-      clockLastServerUpdate: null,  // Date.now() of last server sync
+      clockLastServerUpdate: null, // Date.now() of last server sync
       streamKeyVisible: false,
+      matchMode: false,
+      matchPreview: true,
     };
+
+    // localStorage can be unavailable (private mode, blocked storage); never let that break the page.
+    function storeGet(key) { try { return localStorage.getItem(key); } catch { return null; } }
+    function storeSet(key, value) { try { localStorage.setItem(key, value); } catch {} }
+
+    function bind(name, text) {
+      document.querySelectorAll(`[data-bind="${name}"]`).forEach(el => { el.textContent = text; });
+    }
 
     // ──────────────────────── Clipboard (HTTP-safe) ────────────────────────
     function copyToClipboard(text) {
@@ -538,6 +616,8 @@
       }
     }
 
+    let cameraHost = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
+    function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam; }
     function copyRtmp(url) {
       copyToClipboard(url);
       showToast('📋 Copied: ' + url, 'info');
@@ -564,29 +644,32 @@
     }
 
     // ──────────────────────── API Helpers ────────────────────────
-    async function apiPost(url, body = {}) {
+    async function apiRequest(url, body = {}) {
       try {
         const res = await fetch(url, {
           method: 'POST',
+          signal: AbortSignal.timeout(45000),
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
         const data = await res.json();
-        if (data.ok || data.status === 'ok' || res.ok) {
-          showToast(data.message || 'Done', 'success');
-        } else {
-          showToast(data.message || data.error || 'Error', 'error');
-        }
-        return data;
+        return {ok: res.ok && data.ok === true, data};
       } catch (err) {
-        showToast('Request failed: ' + err.message, 'error');
-        return null;
+        return {ok: false, data: {error: 'Request failed: ' + err.message}};
       }
+    }
+
+    // quiet: the UI itself shows the result (scores, clock, tally), so skip the success toast.
+    async function apiPost(url, body = {}, {quiet = false} = {}) {
+      const {ok, data} = await apiRequest(url, body);
+      if (!ok) showToast(data.message || data.error || 'Error', 'error');
+      else if (!quiet) showToast(data.message || 'Done', 'success');
+      return ok ? data : null;
     }
 
     async function apiGet(url) {
       try {
-        const res = await fetch(url);
+        const res = await fetch(url, {signal: AbortSignal.timeout(8000)});
         return await res.json();
       } catch {
         return null;
@@ -596,7 +679,7 @@
     // ──────────────────────── Network ────────────────────────
     function hotspotStart() {
       const ssid = document.getElementById('hotspot-ssid').value.trim();
-      const password = document.getElementById('hotspot-password').value.trim();
+      const password = document.getElementById('hotspot-password').value;
       if (!ssid || !password) {
         showToast('Enter SSID and password', 'warning');
         return;
@@ -604,123 +687,179 @@
       apiPost('/api/network/hotspot-start', { ssid, password });
     }
 
+    // ──────────────────────── Match mode ────────────────────────
+    function applyMode() {
+      document.body.classList.toggle('match-mode', state.matchMode);
+      const toggle = document.getElementById('mode-toggle');
+      toggle.textContent = state.matchMode ? '🛠 Setup' : '⚽ Match mode';
+      toggle.setAttribute('aria-pressed', String(state.matchMode));
+      document.getElementById('match-preview').classList.toggle('hidden', !state.matchPreview);
+      document.getElementById('match-preview-toggle').textContent = state.matchPreview ? 'Hide preview' : 'Show preview';
+      syncPreviews();
+    }
+
+    function toggleMode() {
+      state.matchMode = !state.matchMode;
+      storeSet('mcc-mode', state.matchMode ? 'match' : 'setup');
+      applyMode();
+      window.scrollTo(0, 0);
+    }
+
+    function toggleMatchPreview() {
+      state.matchPreview = !state.matchPreview;
+      storeSet('mcc-match-preview', state.matchPreview ? 'on' : 'off');
+      applyMode();
+    }
+
+    // Only previews that are visible play: a hidden WebRTC iframe still costs network and decoding.
+    function syncPreviews() {
+      document.querySelectorAll('iframe[data-preview]').forEach(frame => {
+        const wanted = frame.dataset.preview === 'match'
+          ? state.matchMode && state.matchPreview
+          : !state.matchMode;
+        if (wanted && frame.getAttribute('src') !== frame.dataset.src) frame.setAttribute('src', frame.dataset.src);
+        if (!wanted && frame.hasAttribute('src')) frame.removeAttribute('src');
+      });
+    }
+
+    function matchGoLive() {
+      if (document.getElementById('stream-key').value.trim()) return goLive();
+      showToast('Enter the stream key in Setup first', 'warning');
+      toggleMode();
+      document.getElementById('stream-key').focus();
+    }
+
+    // Keys 1–3 cut cameras in match mode (laptop keyboard).
+    document.addEventListener('keydown', event => {
+      if (!state.matchMode || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (event.target.closest('input, select, textarea')) return;
+      if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
+    });
+
     // ──────────────────────── Camera Switching ────────────────────────
+    let cutSequence = 0;
     async function switchCam(camId) {
-      await apiPost('/api/switch/' + camId);
-      state.activeCam = camId;
+      const sequence = ++cutSequence;
+      state.pendingCam = camId;
+      updateTallyButtons();
+      const {ok, data} = await apiRequest('/api/switch/' + camId);
+      if (sequence !== cutSequence) return;  // a newer cut on this device owns the tally
+      state.pendingCam = null;
+      if (ok) {
+        state.activeCam = state.selectedCam = data.active_camera;
+        if (/\(.+\)$/.test(data.message || '')) showToast(data.message, 'warning');
+      } else if (!data.superseded) {
+        showToast(data.message || data.error || 'Cut failed', 'error');
+      }
       updateTallyButtons();
     }
 
     function updateTallyButtons() {
-      ['cam1', 'cam2', 'cam3'].forEach(c => {
-        const btn = document.getElementById('btn-cut-' + c);
-        if (c === state.activeCam) {
-          btn.className = 'btn-tally bg-brand-red hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2 ring-2 ring-red-400';
+      const pending = state.pendingCam || state.serverPendingCam;
+      document.querySelectorAll('[data-cut]').forEach(btn => {
+        const cam = btn.dataset.cut;
+        const publishing = !!state.cameras[cam];
+        let look, label;
+        if (cam === pending) {
+          look = 'bg-brand-amber text-white pulse-live'; label = 'Switching…';
+        } else if (cam === state.activeCam) {
+          look = 'bg-brand-red text-white ring-2 ring-red-300'; label = 'On air';
+        } else if (cam === state.selectedCam) {
+          look = 'bg-red-950 text-red-200 ring-2 ring-red-500'; label = publishing ? 'Fallback — retrying' : 'Fallback — no signal';
+        } else if (publishing) {
+          look = 'bg-brand-green hover:brightness-110 text-white'; label = 'Ready';
         } else {
-          btn.className = 'btn-tally bg-brand-green hover:brightness-110 text-white rounded-xl transition-all flex items-center justify-center gap-2';
+          look = 'bg-slate-700 text-slate-400'; label = 'Offline';
         }
+        btn.className = btn.dataset.base + ' ' + look;
+        btn.disabled = !publishing && cam !== state.selectedCam;
+        btn.querySelector('[data-cut-state]').textContent = label;
       });
-      // Update multiview frame borders
       ['cam1', 'cam2', 'cam3'].forEach(c => {
         const frame = document.getElementById('frame-' + c);
         if (!frame) return;
-        if (c === state.activeCam) {
-          frame.classList.remove('border-slate-700');
-          frame.classList.add('border-red-500');
-        } else {
-          frame.classList.remove('border-red-500');
-          frame.classList.add('border-slate-700');
-        }
+        frame.classList.toggle('border-red-500', c === state.activeCam);
+        frame.classList.toggle('border-slate-700', c !== state.activeCam);
       });
     }
 
     // ──────────────────────── Audio Source ────────────────────────
     async function setAudioSource(source) {
-      if (source === 'usb') {
-        // When clicking the USB button, show the dropdown but don't send API call yet
-        // unless a device is already selected
-        if (state.selectedUsbDevice) {
-          state.audioSource = 'usb:' + state.selectedUsbDevice;
-          await apiPost('/api/audio-source', { mode: 'usb:' + state.selectedUsbDevice });
-        } else {
-          state.audioSource = 'usb';
-        }
-      } else {
-        state.audioSource = source;
-        state.selectedUsbDevice = null;
-        await apiPost('/api/audio-source', { mode: source });
+      if (source === 'usb' && !state.selectedUsbDevice) {
+        // Keep the picker open until a device is chosen or another source is selected.
+        state.usbPickerOpen = true;
+        updateAudioToggle();
+        return;
       }
+      if (source !== 'usb') state.usbPickerOpen = false;
+      const mode = source === 'usb' ? 'usb:' + state.selectedUsbDevice : source;
+      const result = await apiPost('/api/audio-source', {mode});
+      if (!result) { updateAudioToggle(); return; }
+      state.audioSource = result.audio_source;
+      state.selectedUsbDevice = mode.startsWith('usb:') ? mode.substring(4) : null;
       updateAudioToggle();
     }
 
     async function selectUsbAudioDevice(deviceId) {
       if (!deviceId) return;
+      const result = await apiPost('/api/audio-source', {mode: 'usb:' + deviceId});
+      if (!result) return;
       state.selectedUsbDevice = deviceId;
-      state.audioSource = 'usb:' + deviceId;
-      await apiPost('/api/audio-source', { mode: 'usb:' + deviceId });
+      state.audioSource = result.audio_source;
+      state.usbPickerOpen = false;
       updateAudioToggle();
     }
 
+    const deviceId = dev => dev.id || dev.device_id || dev.name;
+    let audioDeviceSignature = null;
     function populateUsbDevices(devices) {
       state.audioDevices = devices || [];
-      const select = document.getElementById('usb-audio-device');
-      const currentVal = select.value;
-      select.innerHTML = '';
-      if (state.audioDevices.length === 0) {
-        const opt = document.createElement('option');
-        opt.value = '';
-        opt.disabled = true;
-        opt.selected = true;
-        opt.textContent = 'No USB audio devices detected';
-        select.appendChild(opt);
-      } else {
-        state.audioDevices.forEach(dev => {
-          const opt = document.createElement('option');
-          opt.value = dev.id || dev.device_id || dev.name;
-          opt.textContent = '🎤 ' + (dev.name || dev.label || dev.id);
+      // Rebuilding a <select> closes it on mobile: only rebuild when the device list changes.
+      const signature = JSON.stringify(state.audioDevices.map(d => [deviceId(d), d.name]));
+      if (signature === audioDeviceSignature) return;
+      audioDeviceSignature = signature;
+      document.querySelectorAll('[data-usb-select]').forEach(select => {
+        select.innerHTML = '';
+        if (state.audioDevices.length === 0) {
+          const opt = new Option('No USB audio devices detected', '');
+          opt.disabled = true;
           select.appendChild(opt);
-        });
-        // Restore selection if still valid
-        const validIds = state.audioDevices.map(d => d.id || d.device_id || d.name);
-        if (state.selectedUsbDevice && validIds.includes(state.selectedUsbDevice)) {
-          select.value = state.selectedUsbDevice;
-        } else if (currentVal && validIds.includes(currentVal)) {
-          select.value = currentVal;
+          select.value = '';
+          return;
         }
-      }
+        select.appendChild(new Option('Select a microphone…', ''));
+        state.audioDevices.forEach(dev => {
+          select.appendChild(new Option('🎤 ' + (dev.name || dev.label || dev.id), deviceId(dev)));
+        });
+        const validIds = state.audioDevices.map(deviceId);
+        select.value = state.selectedUsbDevice && validIds.includes(state.selectedUsbDevice) ? state.selectedUsbDevice : '';
+      });
     }
 
     function updateAudioToggle() {
-      const btnCam1 = document.getElementById('audio-cam1');
-      const btnFollow = document.getElementById('audio-follow');
-      const btnUsb = document.getElementById('audio-usb');
-      const usbSelector = document.getElementById('usb-audio-selector');
-      const usbActiveLabel = document.getElementById('usb-audio-active-label');
-      const usbActiveName = document.getElementById('usb-audio-active-name');
-
-      const activeClass  = 'px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors';
-      const defaultClass = 'px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors';
-
-      const isUsb = state.audioSource === 'usb' || state.audioSource.startsWith('usb:');
-
-      btnCam1.className  = (state.audioSource === 'cam1') ? activeClass : defaultClass;
-      btnFollow.className = (state.audioSource === 'follow') ? activeClass : defaultClass;
-      btnUsb.className   = isUsb ? activeClass : defaultClass;
-
-      // Show/hide USB device selector
-      if (isUsb) {
-        usbSelector.classList.remove('hidden');
-        // Show active device label if a device is selected
-        if (state.selectedUsbDevice) {
-          const dev = state.audioDevices.find(d => (d.id || d.device_id || d.name) === state.selectedUsbDevice);
-          const devName = dev ? (dev.name || dev.label || dev.id) : state.selectedUsbDevice;
-          usbActiveName.textContent = devName;
-          usbActiveLabel.classList.remove('hidden');
-        } else {
-          usbActiveLabel.classList.add('hidden');
+      const isUsb = state.audioSource.startsWith('usb:');
+      const current = isUsb ? 'usb' : state.audioSource;
+      document.querySelectorAll('[data-audio]').forEach(btn => {
+        const on = btn.dataset.audio === current;
+        btn.classList.toggle('bg-brand-blue', on);
+        btn.classList.toggle('text-white', on);
+        btn.classList.toggle('bg-slate-700', !on);
+        btn.classList.toggle('text-slate-300', !on);
+      });
+      const showPicker = isUsb || state.usbPickerOpen;
+      document.querySelectorAll('[data-usb-picker]').forEach(el => el.classList.toggle('hidden', !showPicker));
+      document.querySelectorAll('[data-usb-select]').forEach(select => {
+        if (document.activeElement !== select && state.selectedUsbDevice
+            && [...select.options].some(o => o.value === state.selectedUsbDevice)) {
+          select.value = state.selectedUsbDevice;
         }
+      });
+      const usbActiveLabel = document.getElementById('usb-audio-active-label');
+      if (isUsb && state.selectedUsbDevice) {
+        const dev = state.audioDevices.find(d => deviceId(d) === state.selectedUsbDevice);
+        document.getElementById('usb-audio-active-name').textContent = dev ? (dev.name || dev.label || dev.id) : state.selectedUsbDevice;
+        usbActiveLabel.classList.remove('hidden');
       } else {
-        usbSelector.classList.add('hidden');
         usbActiveLabel.classList.add('hidden');
       }
     }
@@ -738,10 +877,11 @@
         showToast('Enter a YouTube stream key first', 'warning');
         return;
       }
-      await apiPost('/api/stream/start', { stream_key: key });
+      await apiPost('/api/stream/start', { stream_key: key, profile: document.getElementById('quality-profile').value });
     }
 
     async function stopStream() {
+      if (!confirm('Stop the YouTube stream? Viewers will see the broadcast end.')) return;
       await apiPost('/api/stream/stop');
     }
 
@@ -763,43 +903,64 @@
       document.getElementById('yt-timer-row').classList.add('hidden');
       document.getElementById('yt-timer-row').classList.remove('flex');
       if (ytTimerInterval) { clearInterval(ytTimerInterval); ytTimerInterval = null; }
-      document.getElementById('yt-duration').textContent = '00:00:00';
+      bind('yt_duration', '00:00:00');
     }
 
     function updateYtDuration() {
       if (!state.ytStartTime) return;
-      const elapsed = Math.floor((Date.now() - state.ytStartTime) / 1000);
+      const elapsed = Math.max(0, Math.floor((Date.now() - state.ytStartTime) / 1000));
       const h = String(Math.floor(elapsed / 3600)).padStart(2, '0');
       const m = String(Math.floor((elapsed % 3600) / 60)).padStart(2, '0');
       const s = String(elapsed % 60).padStart(2, '0');
-      document.getElementById('yt-duration').textContent = `${h}:${m}:${s}`;
+      bind('yt_duration', `${h}:${m}:${s}`);
     }
 
     // ──────────────────────── Scoreboard ────────────────────────
+    let scoreQueue = Promise.resolve();
     function adjustScore(team, delta) {
-      if (team === 'home') {
-        state.homeScore = Math.max(0, state.homeScore + delta);
-        document.getElementById('home-score-display').textContent = state.homeScore;
-      } else {
-        state.awayScore = Math.max(0, state.awayScore + delta);
-        document.getElementById('away-score-display').textContent = state.awayScore;
-      }
-      updateScoreboard();
+      scoreQueue = scoreQueue.then(async () => {
+        const result = await apiPost('/api/scoreboard/update', {team, delta}, {quiet: true});
+        if (result) applyScoreboard(result.scoreboard);
+      });
     }
 
-    function updateScoreboard() {
-      const homeName = document.getElementById('home-name').value.trim() || 'HOME';
-      const awayName = document.getElementById('away-name').value.trim() || 'AWAY';
-      const clockStr = document.getElementById('match-clock-display').textContent;
-      // Update preview
-      renderScoreboardPreview(homeName, state.homeScore, awayName, state.awayScore, clockStr);
-      // Send to server
-      apiPost('/api/scoreboard', {
-        home_name: homeName,
-        home_score: state.homeScore,
-        away_name: awayName,
-        away_score: state.awayScore,
-      });
+    const dirtyNames = new Set();
+    for (const id of ['home-name', 'away-name']) {
+      document.getElementById(id).addEventListener('input', () => dirtyNames.add(id));
+    }
+    async function updateScoreboard() {
+      const submitted = {};
+      for (const id of ['home-name', 'away-name']) {
+        if (dirtyNames.has(id)) submitted[id.replace('-', '_')] = document.getElementById(id).value.trim();
+      }
+      const result = await apiPost('/api/scoreboard/update', submitted, {quiet: true});
+      if (result) {
+        for (const id of ['home-name', 'away-name']) {
+          if (document.getElementById(id).value.trim() === submitted[id.replace('-', '_')]) dirtyNames.delete(id);
+        }
+        applyScoreboard(result.scoreboard);
+      }
+    }
+
+    function applyScoreboard(sb) {
+      state.homeScore = sb.home_score;
+      state.awayScore = sb.away_score;
+      bind('home_score', state.homeScore);
+      bind('away_score', state.awayScore);
+      bind('home_name', sb.home_name);
+      bind('away_name', sb.away_name);
+      for (const id of ['home-name', 'away-name']) {
+        const input = document.getElementById(id);
+        if (document.activeElement !== input && !dirtyNames.has(id)) input.value = sb[id.replace('-', '_')];
+      }
+      state.clockElapsed = sb.clock_elapsed_secs;
+      state.clockRunning = sb.clock_running;
+      state.clockLastServerUpdate = Date.now();
+      const toggle = document.getElementById('match-clock-toggle');
+      toggle.textContent = state.clockRunning ? '⏸ Pause' : '▶ Start';
+      toggle.classList.toggle('bg-brand-amber', state.clockRunning);
+      toggle.classList.toggle('bg-brand-green', !state.clockRunning);
+      interpolateClock();
     }
 
     function renderScoreboardPreview(home, hs, away, as, clock) {
@@ -817,7 +978,13 @@
 
     // ──────────────────────── Match Clock ────────────────────────
     function clockAction(action) {
-      apiPost('/api/clock/' + action);
+      if (action === 'reset' && !confirm('Reset the match clock to 00:00 (1st half)?')) return;
+      apiPost('/api/scoreboard/clock', action === 'second_half' ? {action: 'set_half', half: 2} : {action}, {quiet: true})
+        .then(result => { if (result) applyScoreboard(result.scoreboard); });
+    }
+
+    function toggleClock() {
+      clockAction(state.clockRunning ? 'pause' : 'start');
     }
 
     function formatClock(totalSeconds) {
@@ -834,7 +1001,7 @@
         displaySeconds = state.clockElapsed + drift;
       }
       const clockStr = formatClock(displaySeconds);
-      document.getElementById('match-clock-display').textContent = clockStr;
+      bind('clock', clockStr);
 
       // Also update the scoreboard preview in real time
       const homeName = document.getElementById('home-name').value.trim() || 'HOME';
@@ -862,7 +1029,7 @@
       const container = document.getElementById('checklist');
       container.innerHTML = '';
       checklistItems.forEach(item => {
-        const checked = localStorage.getItem(item.id) === 'true';
+        const checked = storeGet(item.id) === 'true';
         const div = document.createElement('div');
         div.className = 'flex items-center gap-3 bg-slate-900 rounded-lg px-4 py-3 border border-slate-700 cursor-pointer select-none';
         div.innerHTML = `
@@ -872,14 +1039,14 @@
         `;
         const checkbox = div.querySelector('input');
         checkbox.addEventListener('change', () => {
-          localStorage.setItem(item.id, checkbox.checked);
+          storeSet(item.id, checkbox.checked);
           renderChecklist();
         });
         // Clicking the whole row toggles the checkbox
         div.addEventListener('click', (e) => {
           if (e.target.tagName !== 'INPUT') {
             checkbox.checked = !checkbox.checked;
-            localStorage.setItem(item.id, checkbox.checked);
+            storeSet(item.id, checkbox.checked);
             renderChecklist();
           }
         });
@@ -889,23 +1056,53 @@
 
     renderChecklist();
 
+    // ──────────────────────── Status banner ────────────────────────
+    const bannerStyles = {
+      ok:      'text-center text-sm p-2 text-slate-300',
+      warning: 'text-center text-sm p-2 font-semibold bg-amber-900/60 text-amber-200',
+      error:   'text-center text-sm p-2 font-semibold bg-red-900/70 text-red-100',
+    };
+    function setBanner(text, level) {
+      const banner = document.getElementById('connection-status');
+      banner.textContent = text;
+      banner.className = bannerStyles[level];
+    }
+
     // ──────────────────────── Poll /api/status ────────────────────────
     async function pollStatus() {
       const data = await apiGet('/api/status');
-      if (!data) return;
+      if (!data || !data.ok) {
+        setBanner('Connection lost — controls may be stale', 'error');
+        document.getElementById('status-yt-badge').textContent = 'UNKNOWN';
+        bind('yt_state', 'UNKNOWN');
+        state.activeCam = state.selectedCam = state.serverPendingCam = null;
+        updateTallyButtons();
+        return;
+      }
+      const network = data.network || {};
+      const stream = data.stream || {};
+      if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
+      else if (stream.audio_warning) setBanner('Audio: ' + stream.audio_warning, 'warning');
+      else if (stream.fallback && stream.active) setBanner('Live — fallback video / silence', 'warning');
+      else setBanner('Connected', 'ok');
+
+      if (network.hotspot_active && network.wifi_ip && network.wifi_ip !== 'N/A') {
+        cameraHost = network.wifi_ip;
+      }
+      for (const cam of ['cam1', 'cam2', 'cam3']) document.getElementById('url-' + cam).textContent = cameraUrl(cam);
 
       // --- USB Internet ---
       const usbDot = document.getElementById('status-usb-dot');
       const usbLabel = document.getElementById('status-usb-label');
       const netUsbStatus = document.getElementById('net-usb-status');
-      if (data.internet_ok) {
+      if (network.internet_ok) {
         usbDot.className = 'w-2.5 h-2.5 rounded-full bg-brand-green';
       } else {
         usbDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
       }
-      usbLabel.textContent = data.usb_status || 'USB';
-      netUsbStatus.textContent = data.usb_status || 'Disconnected';
-      if (data.usb_iface) {
+      usbLabel.textContent = network.usb_status || 'USB';
+      netUsbStatus.textContent = network.usb_status || 'Disconnected';
+      if (network.usb_iface) {
         netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
       } else {
         netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
@@ -914,8 +1111,8 @@
       // --- Hotspot ---
       const hotspotIp = document.getElementById('status-hotspot-ip');
       const netHotspot = document.getElementById('net-hotspot-status');
-      hotspotIp.textContent = data.wifi_ip || '10.42.0.1';
-      if (data.hotspot_active) {
+      hotspotIp.textContent = network.wifi_ip || '{{ media_host }}';
+      if (network.hotspot_active) {
         netHotspot.textContent = 'Active';
         netHotspot.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
       } else {
@@ -925,17 +1122,18 @@
 
       // --- RTMP Server ---
       const rtmpDot = document.getElementById('status-rtmp-dot');
-      if (data.mediamtx_running) {
+      if (data.mediamtx && data.mediamtx.running) {
         rtmpDot.className = 'w-2.5 h-2.5 rounded-full bg-brand-green';
       } else {
         rtmpDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
       }
 
       // --- Camera Live Badges ---
+      state.cameras = data.cameras || {};
       ['cam1', 'cam2', 'cam3'].forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);
-        const isLive = data.cameras && data.cameras[c];
+        const isLive = state.cameras[c];
         if (isLive) {
           badge.textContent = 'LIVE';
           badge.className = 'text-xs px-2 py-0.5 rounded font-bold bg-red-900/60 text-red-400 pulse-live';
@@ -955,8 +1153,8 @@
 
       // Program badge
       const mvProgram = document.getElementById('mv-badge-program');
-      if (data.cameras && data.cameras.program) {
-        mvProgram.textContent = 'LIVE';
+      if (state.cameras.program) {
+        mvProgram.textContent = stream.fallback ? 'FALLBACK' : 'LIVE';
         mvProgram.className = 'text-xs px-1.5 py-0.5 rounded bg-red-900/60 text-red-400 font-bold pulse-live';
       } else {
         mvProgram.textContent = 'OFF';
@@ -965,61 +1163,49 @@
 
       // --- YouTube Stream Status ---
       const ytBadge = document.getElementById('status-yt-badge');
-      if (data.youtube_live) {
-        ytBadge.textContent = '🔴 ON AIR';
-        ytBadge.className = 'px-2 py-0.5 rounded text-xs font-bold bg-red-600 text-white pulse-live';
-        if (!state.ytLive) {
-          startYtTimer(data.youtube_started_at);
-        }
-      } else {
-        ytBadge.textContent = 'OFFLINE';
-        ytBadge.className = 'px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400';
-        if (state.ytLive) {
-          stopYtTimer();
-        }
+      const streaming = stream.active || ['starting', 'live', 'reconnecting'].includes(stream.state);
+      const ytLabel = stream.active ? '🔴 ON AIR' : (stream.state || 'stopped').toUpperCase();
+      const ytClass = stream.active
+        ? 'px-2 py-0.5 rounded text-xs font-bold bg-red-600 text-white pulse-live'
+        : streaming ? 'px-2 py-0.5 rounded text-xs font-bold bg-amber-600 text-white'
+        : 'px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400';
+      ytBadge.textContent = ytLabel;
+      ytBadge.className = ytClass;
+      document.querySelectorAll('[data-bind="yt_state"]').forEach(el => { el.textContent = ytLabel; el.className = ytClass + ' py-1'; });
+      document.querySelectorAll('[data-when-streaming]').forEach(el => el.classList.toggle('hidden', !streaming));
+      document.querySelectorAll('[data-when-stopped]').forEach(el => el.classList.toggle('hidden', streaming));
+      if (stream.active) {
+        if (!state.ytLive) startYtTimer(stream.started_at);
+      } else if (state.ytLive) {
+        stopYtTimer();
       }
 
       // --- Active Camera ---
-      if (data.active_cam) {
-        state.activeCam = data.active_cam;
-        updateTallyButtons();
-      }
+      state.activeCam = stream.active_camera || null;
+      state.selectedCam = stream.selected_camera || null;
+      state.serverPendingCam = stream.pending_camera || null;
+      updateTallyButtons();
 
-      // --- Audio Source ---
-      if (data.audio_source) {
-        state.audioSource = data.audio_source;
-        // If the server reports usb:<id>, extract the device id
-        if (data.audio_source.startsWith('usb:')) {
-          state.selectedUsbDevice = data.audio_source.substring(4);
-        }
-        updateAudioToggle();
-      }
-
-      // --- USB Audio Devices ---
+      // --- USB Audio Devices (before the toggle so the picker can restore its value) ---
       if (data.audio_devices !== undefined) {
         populateUsbDevices(data.audio_devices);
       }
 
-      // --- Scoreboard ---
-      if (data.scoreboard) {
-        state.homeScore = data.scoreboard.home_score ?? state.homeScore;
-        state.awayScore = data.scoreboard.away_score ?? state.awayScore;
-        document.getElementById('home-score-display').textContent = state.homeScore;
-        document.getElementById('away-score-display').textContent = state.awayScore;
-        if (data.scoreboard.home_name) {
-          document.getElementById('home-name').value = data.scoreboard.home_name;
+      // --- Audio Source ---
+      if (stream.audio_source) {
+        state.audioSource = stream.audio_source;
+        if (stream.audio_source.startsWith('usb:')) {
+          state.selectedUsbDevice = stream.audio_source.substring(4);
+          state.usbPickerOpen = false;
         }
-        if (data.scoreboard.away_name) {
-          document.getElementById('away-name').value = data.scoreboard.away_name;
-        }
+        updateAudioToggle();
       }
+      document.querySelectorAll('[data-bind="audio_warning"]').forEach(el => {
+        el.textContent = stream.audio_warning ? '⚠ ' + stream.audio_warning : '';
+        el.classList.toggle('hidden', !stream.audio_warning);
+      });
 
-      // --- Match Clock ---
-      if (data.clock !== undefined) {
-        state.clockElapsed = data.clock.elapsed ?? state.clockElapsed;
-        state.clockRunning = data.clock.running ?? state.clockRunning;
-        state.clockLastServerUpdate = Date.now();
-      }
+      if (data.scoreboard) applyScoreboard(data.scoreboard);
 
       // --- Firewall ---
       const fwStatus = document.getElementById('net-firewall-status');
@@ -1038,11 +1224,16 @@
     }
 
     // Initial poll + interval
-    pollStatus();
-    setInterval(pollStatus, 2000);
+    async function pollLoop() {
+      try { await pollStatus(); } finally { setTimeout(pollLoop, 2000); }
+    }
 
-    // Initial tally state
+    state.matchMode = storeGet('mcc-mode') === 'match';
+    state.matchPreview = storeGet('mcc-match-preview') !== 'off';
+    applyMode();
     updateTallyButtons();
+    updateAudioToggle();
+    pollLoop();
   </script>
 </body>
 </html>
