@@ -524,9 +524,10 @@ def _diagnostics_worker():
     global _diagnostics
     while not _workers_stop.is_set():
         try:
-            _diagnostics = {"network": get_network_status(),
+            network = get_network_status()
+            _diagnostics = {"network": network,
                             "audio_devices": get_usb_audio_devices(),
-                            "firewall": get_firewall_status(), "updated_at": time.time()}
+                            "firewall": get_firewall_status(network), "updated_at": time.time()}
         except Exception:
             log.exception("Diagnostics failed")
         _workers_stop.wait(5)

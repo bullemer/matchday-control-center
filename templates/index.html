@@ -266,7 +266,7 @@
             <span class="text-sm text-slate-400">Firewall</span>
             <span id="net-firewall-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Unknown</span>
           </div>
-          <div id="net-firewall-details" class="text-xs text-slate-400 space-y-1">
+          <div id="net-firewall-details" class="text-xs text-slate-400 space-y-2">
             <p>Ports required: 5000, 1935, 8888, 8889, 8189/UDP</p>
           </div>
         </div>
@@ -1152,11 +1152,16 @@
         usbDot.className = 'w-2.5 h-2.5 rounded-full bg-red-500';
       }
       usbLabel.textContent = network.internet_ok ? (network.uplink || 'Internet') : 'No internet';
-      netUsbStatus.textContent = network.usb_status || 'Disconnected';
-      if (network.usb_iface) {
+      // Plain words for the operator; the adapter name stays available as a tooltip.
+      netUsbStatus.textContent = !network.usb_iface ? 'No phone'
+        : network.usb_state === 'connected' ? 'Phone connected' : 'Phone found — tap USB Connect';
+      netUsbStatus.title = network.usb_status || '';
+      if (network.usb_state === 'connected') {
         netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
       } else {
-        netUsbStatus.className = 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
+        netUsbStatus.className = network.usb_iface
+          ? 'text-xs px-2 py-0.5 rounded bg-brand-amber/20 text-brand-amber font-medium'
+          : 'text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300';
       }
 
       // --- Hotspot ---
@@ -1259,18 +1264,54 @@
       if (data.scoreboard) applyScoreboard(data.scoreboard);
 
       // --- Firewall ---
-      const fwStatus = document.getElementById('net-firewall-status');
-      const fwDetails = document.getElementById('net-firewall-details');
-      if (data.firewall) {
-        fwStatus.textContent = data.firewall.status || 'Unknown';
-        if (data.firewall.status === 'inactive' || data.firewall.status === 'disabled') {
-          fwStatus.className = 'text-xs px-2 py-0.5 rounded bg-green-900/50 text-brand-green font-medium';
-        } else {
-          fwStatus.className = 'text-xs px-2 py-0.5 rounded bg-brand-amber/20 text-brand-amber font-medium';
-        }
-        if (data.firewall.details) {
-          fwDetails.innerHTML = `<p class="text-xs text-slate-400">${escHtml(data.firewall.details)}</p>`;
-        }
+      if (data.firewall) renderFirewall(data.firewall);
+    }
+
+    const firewallStyles = {
+      ok:      'bg-green-900/50 text-brand-green',
+      warning: 'bg-brand-amber/20 text-brand-amber',
+      error:   'bg-red-900/60 text-red-300',
+      unknown: 'bg-slate-700 text-slate-300',
+    };
+    let firewallSignature = null;
+    function renderFirewall(fw) {
+      const badge = document.getElementById('net-firewall-status');
+      badge.textContent = fw.label || 'Not checked';
+      badge.className = 'text-xs px-2 py-0.5 rounded font-medium ' + (firewallStyles[fw.status] || firewallStyles.unknown);
+      // Rebuild only on change so a half-selected command is not wiped by the 2 s poll.
+      const signature = JSON.stringify([fw.summary, fw.commands, fw.details]);
+      if (signature === firewallSignature) return;
+      firewallSignature = signature;
+      const box = document.getElementById('net-firewall-details');
+      box.innerHTML = '';
+      const summary = document.createElement('p');
+      summary.className = 'text-xs text-slate-300';
+      summary.textContent = fw.summary || '';
+      box.appendChild(summary);
+      for (const command of fw.commands || []) {
+        const row = document.createElement('div');
+        row.className = 'flex items-center gap-2';
+        const code = document.createElement('code');
+        code.className = 'flex-1 block text-xs text-brand-cyan bg-slate-800 rounded p-2 break-all select-all';
+        code.textContent = command;
+        const copy = document.createElement('button');
+        copy.className = 'text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white';
+        copy.textContent = 'Copy';
+        copy.onclick = () => { copyToClipboard(command); showToast('📋 Copied — run it in a terminal on the laptop', 'info'); };
+        row.append(code, copy);
+        box.appendChild(row);
+      }
+      if (fw.details) {
+        const more = document.createElement('details');
+        more.className = 'text-xs text-slate-500';
+        const label = document.createElement('summary');
+        label.className = 'cursor-pointer';
+        label.textContent = 'Port details';
+        const text = document.createElement('p');
+        text.className = 'mt-1';
+        text.textContent = fw.details;
+        more.append(label, text);
+        box.appendChild(more);
       }
     }
 

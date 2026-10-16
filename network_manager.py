@@ -8,6 +8,7 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 REQUIRED_TCP_PORTS = [5000, 1935, 8888, 8889]
@@ -16,6 +17,11 @@ DEFAULT_HOTSPOT_IP = "10.42.0.1"
 PROFILE = "Matchday-Control-Hotspot"
 PROFILE_FILE = Path(__file__).resolve().parent / "data/hotspot-uuid"
 _network_lock = threading.Lock()
+# Left blank, NetworkManager may advertise mixed WPA1/TKIP, which current phones reject or
+# hide. Pin plain WPA2-AES on 2.4 GHz (5 GHz AP channels are often not allowed on laptops).
+HOTSPOT_RADIO = ["802-11-wireless.band", "bg", "wifi-sec.key-mgmt", "wpa-psk",
+                 "wifi-sec.proto", "rsn", "wifi-sec.pairwise", "ccmp",
+                 "wifi-sec.group", "ccmp", "wifi-sec.pmf", "disable"]
 
 
 def run_cmd(cmd, timeout=10):
@@ -69,8 +75,8 @@ def get_network_status():
 
     Cameras use the app's hotspot when it is active; otherwise they join the same
     Wi-Fi/LAN the laptop is connected to (a USB tether is never a camera network)."""
-    info = dict(wifi_ip="N/A", usb_iface=None, usb_status="Disconnected",
-                hotspot_active=False, hotspot_ssid=None, internet_ok=False,
+    info = dict(wifi_ip="N/A", usb_iface=None, usb_status="Disconnected", usb_state=None,
+                hotspot_active=False, hotspot_ssid=None, hotspot_iface=None, internet_ok=False,
                 lan_iface=None, lan_type=None, lan_name=None, lan_ip=None,
                 camera_mode="none", camera_ip=None, uplink=None)
     ok, raw = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
@@ -89,7 +95,7 @@ def get_network_status():
                 lans.append((kind != "wifi", dev, kind, connection))  # prefer Wi-Fi
         if candidates:
             _, dev, state = sorted(candidates, reverse=True)[0]
-            info.update(usb_iface=dev, usb_status=f"{dev} ({state})")
+            info.update(usb_iface=dev, usb_status=f"{dev} ({state})", usb_state=state)
     uuid = _owned_uuid()
     hotspot_dev = None
     if uuid:
@@ -99,7 +105,7 @@ def get_network_status():
                 key, _, dev = line.partition(":")
                 if key == uuid:
                     hotspot_dev = dev
-                    info["hotspot_active"] = True
+                    info.update(hotspot_active=True, hotspot_iface=dev)
                     info["hotspot_ssid"] = _field(uuid, "802-11-wireless.ssid") or None
                     info["wifi_ip"] = _device_ip(dev) or "N/A"
     for _, dev, kind, connection in sorted(lans):
@@ -148,7 +154,7 @@ def start_hotspot(ssid, password):
         uuid = _owned_uuid()
         if uuid:
             ok, out = run_cmd(["nmcli", "connection", "modify", "uuid", uuid,
-                               "802-11-wireless.ssid", ssid, "wifi-sec.psk", password])
+                               "802-11-wireless.ssid", ssid, "wifi-sec.psk", password, *HOTSPOT_RADIO])
             if ok:
                 ok, out = run_cmd(["nmcli", "connection", "up", "uuid", uuid], timeout=30)
             return ok, "Hotspot started" if ok else "Could not activate hotspot; check NetworkManager permissions"
@@ -171,8 +177,7 @@ def start_hotspot(ssid, password):
         ok, out = run_cmd(["nmcli", "connection", "add", "type", "wifi", "ifname", device,
             "con-name", PROFILE, "connection.uuid", uuid, "ssid", ssid,
             "802-11-wireless.mode", "ap", "ipv4.method", "shared", "ipv6.method", "disabled",
-            "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", password,
-            "connection.autoconnect", "no"])
+            *HOTSPOT_RADIO, "wifi-sec.psk", password, "connection.autoconnect", "no"])
         if not ok:
             return False, "Cannot create hotspot; check NetworkManager permissions"
         PROFILE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -190,8 +195,51 @@ def stop_hotspot():
         return ok, "Hotspot stopped" if ok else out
 
 
-def get_firewall_status():
-    # Listening and firewall reachability are different facts. Never equate them.
+UFW_CONF = Path("/etc/ufw/ufw.conf")
+UFW_DEFAULTS = Path("/etc/default/ufw")
+_reached = {}  # peer IP -> last time it had a connection to the dashboard, RTMP or WebRTC
+
+
+def _conf_value(path, key):
+    try:
+        for line in path.read_text().splitlines():
+            name, _, value = line.partition("=")
+            if name.strip() == key:
+                return value.strip().strip('"').lower()
+    except OSError:
+        return None
+    return None
+
+
+def _peer_ip(address):
+    host = address.rsplit(":", 1)[0].strip("[]")
+    return host[7:] if host.startswith("::ffff:") else host
+
+
+def _same_subnet(a, b):
+    return a.count(".") == 3 and a.split(".")[:3] == b.split(".")[:3]
+
+
+def _firewall_commands(network, tool):
+    hotspot = network.get("camera_mode") == "hotspot"
+    iface = network.get("hotspot_iface") if hotspot else network.get("lan_iface")
+    if tool == "firewalld":
+        return ["sudo firewall-cmd --permanent --add-port={5000,1935,8888,8889}/tcp --add-port=8189/udp",
+                "sudo firewall-cmd --reload"]
+    if not iface:
+        return []
+    if hotspot:
+        # Hotspot phones also need DHCP/DNS from the laptop, and forwarding for internet.
+        return [f"sudo ufw allow in on {iface}", f"sudo ufw route allow in on {iface}"]
+    return [f"sudo ufw allow in on {iface} to any port 5000,1935,8888,8889 proto tcp",
+            f"sudo ufw allow in on {iface} to any port 8189 proto udp"]
+
+
+def get_firewall_status(network=None):
+    """Whether camera phones can reach the app. Rules need root to read, so the strongest
+    evidence is a phone on the camera network actually connecting; configuration that is
+    readable without root (ufw enabled + default policy, firewalld) is the fallback."""
+    network = network or {}
     ok, out = run_cmd(["ss", "-H", "-lntu"])
     listening = set()
     if ok:
@@ -201,16 +249,58 @@ def get_firewall_status():
                 port = fields[4].rsplit(":", 1)[-1]
                 if port.isdigit():
                     listening.add(f"{port}/{fields[0]}")
-    ufw_ok, ufw = run_cmd(["ufw", "status"], timeout=3)
-    inactive = ufw_ok and "Status: inactive" in ufw
     ports = {}
     for proto, numbers in (("tcp", REQUIRED_TCP_PORTS), ("udp", REQUIRED_UDP_PORTS)):
         for port in numbers:
             key = f"{port}/{proto}"
             ports[key] = ("listening; reachability unverified" if key in listening else
                           "not listening" if ok else "unknown")
-    return {"ufw_active": False if inactive else True if ufw_ok else None,
-            "ports": ports, "all_open": None, "status": "unverified",
+    missing = [key for key, value in ports.items() if value == "not listening"]
+
+    now = time.monotonic()
+    ok_est, established = run_cmd(["ss", "-H", "-tn", "state", "established",
+                                   "( sport = :5000 or sport = :1935 or sport = :8889 )"])
+    if ok_est:
+        for line in established.splitlines():
+            fields = line.split()
+            if len(fields) >= 4:
+                ip = _peer_ip(fields[-1])
+                if not ip.startswith("127.") and ip != "::1":
+                    _reached[ip] = now
+    camera_ip = network.get("camera_ip")
+    reached = sorted(ip for ip, seen in _reached.items()
+                     if now - seen < 3600 and camera_ip and _same_subnet(ip, camera_ip))
+
+    ufw_enabled = _conf_value(UFW_CONF, "ENABLED") == "yes"
+    ufw_policy = _conf_value(UFW_DEFAULTS, "DEFAULT_INPUT_POLICY") if ufw_enabled else None
+    fwd_ok, fwd = run_cmd(["systemctl", "is-active", "firewalld"], timeout=3)
+    firewalld = fwd_ok and fwd.strip() == "active"
+
+    commands = []
+    if missing:
+        level, label = "error", "Not listening"
+        summary = f"The server is not listening on {', '.join(missing)}; check that MediaMTX is running."
+    elif reached:
+        level, label = "ok", "Phones reach server"
+        summary = f"Verified: {len(reached)} device(s) on the camera network connected ({', '.join(reached[:4])})."
+    elif ufw_enabled and ufw_policy in ("drop", "reject"):
+        level, label = "warning", "ufw firewall on"
+        summary = ("The ufw firewall blocks incoming connections by default. If phones cannot join or "
+                   "connect, run these once (skip if you already allowed them):")
+        commands = _firewall_commands(network, "ufw")
+    elif firewalld:
+        level, label = "warning", "firewalld on"
+        summary = "firewalld is running. If phones cannot connect, open the app's ports once:"
+        commands = _firewall_commands(network, "firewalld")
+    elif not ufw_enabled and not firewalld and _conf_value(UFW_CONF, "ENABLED") is not None:
+        level, label = "ok", "No firewall"
+        summary = "No firewall is enabled: phones on the camera network can connect."
+    else:
+        level, label = "unknown", "Not checked"
+        summary = "Could not determine the firewall state. Open the dashboard on a phone to test."
+    return {"ufw_active": ufw_enabled, "firewalld_active": firewalld, "ports": ports,
+            "all_open": None, "status": level, "label": label, "summary": summary,
+            "commands": commands, "reached": reached,
             "details": "; ".join(f"{key}: {value}" for key, value in ports.items())}
 
 

@@ -116,11 +116,39 @@ class NetworkTests(unittest.TestCase):
             self.assertTrue(n.stop_hotspot()[0])
             self.assertEqual(run.call_args.args[0],['nmcli','connection','down','uuid','owned'])
 
+    def firewall(self, conf, established='', firewalld='inactive', network=None):
+        def run(cmd, timeout=10):
+            if cmd[:3] == ['ss','-H','-lntu']:
+                return True, 'tcp LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*'
+            if cmd[:2] == ['ss','-H']:
+                return True, established
+            return (firewalld == 'active'), firewalld
+        n._reached.clear()
+        with patch.object(n,'run_cmd',side_effect=run),patch.object(n,'_conf_value',side_effect=lambda path,key: conf.get(key)):
+            return n.get_firewall_status(network or {'camera_mode':'hotspot','camera_ip':'10.42.0.1','hotspot_iface':'wlp1s0'})
+
     def test_firewall_never_claims_deny_is_open(self):
-        with patch.object(n,'run_cmd',side_effect=[(True,'tcp LISTEN 0 128 0.0.0.0:5000 0.0.0.0:*'),(True,'Status: active\n5000/tcp DENY Anywhere')]):
-            status=n.get_firewall_status()
-            self.assertIsNone(status['all_open'])
-            self.assertIn('unverified',status['ports']['5000/tcp'])
+        status=self.firewall({'ENABLED':'yes','DEFAULT_INPUT_POLICY':'drop'})
+        self.assertIsNone(status['all_open'])
+        self.assertIn('unverified',status['ports']['5000/tcp'])
+        self.assertEqual(status['status'],'error')  # 1935 etc. are not listening in this fixture
+
+    def test_enabled_ufw_gives_hotspot_commands(self):
+        with patch.object(n,'REQUIRED_TCP_PORTS',[5000]),patch.object(n,'REQUIRED_UDP_PORTS',[]):
+            status=self.firewall({'ENABLED':'yes','DEFAULT_INPUT_POLICY':'drop'})
+        self.assertEqual(status['status'],'warning')
+        self.assertEqual(status['commands'],['sudo ufw allow in on wlp1s0','sudo ufw route allow in on wlp1s0'])
+
+    def test_disabled_ufw_is_no_firewall(self):
+        with patch.object(n,'REQUIRED_TCP_PORTS',[5000]),patch.object(n,'REQUIRED_UDP_PORTS',[]):
+            status=self.firewall({'ENABLED':'no','DEFAULT_INPUT_POLICY':'drop'})
+        self.assertEqual((status['status'],status['label'],status['commands']),('ok','No firewall',[]))
+
+    def test_phone_connection_verifies_reachability(self):
+        with patch.object(n,'REQUIRED_TCP_PORTS',[5000]),patch.object(n,'REQUIRED_UDP_PORTS',[]):
+            status=self.firewall({'ENABLED':'yes','DEFAULT_INPUT_POLICY':'drop'},
+                                 established='0 0 10.42.0.1:5000 10.42.0.47:51234\n0 0 127.0.0.1:5000 127.0.0.1:4000\n0 0 [::ffff:192.168.9.9]:1935 [::ffff:192.168.9.20]:3333')
+        self.assertEqual((status['status'],status['reached']),('ok',['10.42.0.47']))
 
     def test_password_not_in_timeout(self):
         import subprocess

@@ -6,6 +6,7 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await page.goto('/');
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await expect(page.locator('#net-hotspot-status')).toHaveText('Active');
+  await expect(page.locator('#net-usb-status')).toHaveText('Phone connected');
   await expect(page.locator('#url-cam1')).toHaveText('rtmp://10.55.0.1:1935/cam1');
   await expect(page.locator('#audio-follow')).toHaveClass(/bg-brand-blue/);
   await page.locator('#home-name').fill('Test FC');
@@ -99,6 +100,8 @@ test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address'
     body.network = {internet_ok: true, hotspot_active: false, wifi_ip: 'N/A', usb_iface: null,
       usb_status: 'Disconnected', camera_mode: 'lan', camera_ip: '192.168.1.50', lan_type: 'wifi',
       lan_iface: 'wlan0', lan_name: 'Club WiFi', lan_ip: '192.168.1.50', uplink: 'Club WiFi'};
+    body.firewall = {status: 'warning', label: 'ufw firewall on', summary: 'The ufw firewall blocks incoming connections by default.',
+      commands: ['sudo ufw allow in on wlan0 to any port 5000,1935,8888,8889 proto tcp'], details: '5000/tcp: listening'};
     await route.fulfill({response, json: body});
   });
   await page.goto('/');
@@ -107,6 +110,9 @@ test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address'
   await expect(page.locator('#status-hotspot-ip')).toHaveText('192.168.1.50');
   await expect(page.locator('#status-usb-label')).toHaveText('Club WiFi');
   await expect(page.locator('#hotspot-note')).toBeVisible();
+  await expect(page.locator('#net-usb-status')).toHaveText('No phone');
+  await expect(page.locator('#net-firewall-status')).toHaveText('ufw firewall on');
+  await expect(page.locator('#net-firewall-details code')).toHaveText('sudo ufw allow in on wlan0 to any port 5000,1935,8888,8889 proto tcp');
 });
 
 test('team names keep their own wording on the overlay and can be renamed in match mode', async ({page}) => {
