@@ -35,6 +35,7 @@ from network_manager import (get_network_status, connect_usb, start_hotspot, get
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
+                          get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow,
                           SUPERSEDED)
 
 def init_mediamtx():
@@ -148,6 +149,11 @@ def _write_scoreboard_locked():
 
     text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} "
 
+    try:
+        if Path(SCOREBOARD_PATH).read_text() == text:
+            return
+    except FileNotFoundError:
+        pass
     os.makedirs(SCOREBOARD_DIR, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(dir=SCOREBOARD_DIR, suffix=".tmp", text=True)
     try:
@@ -368,6 +374,40 @@ def api_audio_source():
     return jsonify({"ok": success, "message": msg, "audio_source": mode}), status_code
 
 
+@app.route("/api/audio/levels", methods=["GET"])
+@api_endpoint
+def api_audio_levels():
+    """Peak/RMS levels in dBFS for each input (cameras, microphones) and the program
+    output. Polled several times a second by the meters, so it only reads cached values."""
+    stream = get_stream_status()
+    return jsonify({"ok": True, "levels": get_audio_levels(), "mixer": get_mixer(),
+                    "audio_on_air": stream.get("audio_on_air", []),
+                    "active_camera": stream.get("active_camera"), "live": stream.get("active", False)})
+
+
+@app.route("/api/audio/mix", methods=["POST"])
+@api_endpoint
+def api_audio_mix():
+    """Mixer: {"channel": "cam1"|"usb:<id>", "on": bool?, "gain": dB?} or {"follow": bool}.
+    Gain changes apply live; switching on a source the relay lacks rebuilds it briefly."""
+    data = request.get_json(force=True, silent=True) or {}
+    if "follow" in data:
+        if type(data["follow"]) is not bool:
+            raise ValueError("follow must be true or false")
+        success, msg = set_follow(data["follow"])
+    else:
+        channel = text_field(data, "channel", 200)
+        on, gain = data.get("on"), data.get("gain")
+        if on is not None and type(on) is not bool:
+            raise ValueError("on must be true or false")
+        if gain is not None and (type(gain) not in (int, float) or not math.isfinite(gain)):
+            raise ValueError("gain must be a number of dB")
+        if on is None and gain is None:
+            raise ValueError("Provide on and/or gain")
+        success, msg = set_mix(channel, on=on, gain=gain)
+    return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 502
+
+
 @app.route("/api/audio/devices", methods=["GET"])
 @api_endpoint
 def api_audio_devices():
@@ -415,17 +455,24 @@ def api_scoreboard_clock():
     """
     Control the match clock.
 
-    Accepts JSON with "action": start | pause | reset | set_half
+    Accepts JSON with "action": start | pause | reset | set_half | adjust | set
     For set_half, also accepts "half": 1 or 2
+    For adjust, "seconds" to add (negative to subtract); for set, "seconds" of match time.
+    adjust and set keep the clock running or paused as it was.
     """
     data = request.get_json(force=True, silent=True) or {}
     action = text_field(data, "action", 20).lower()
 
-    if action not in ("start", "pause", "reset", "set_half"):
+    if action not in ("start", "pause", "reset", "set_half", "adjust", "set"):
         return jsonify({
             "ok": False,
-            "error": "action must be one of: start, pause, reset, set_half",
+            "error": "action must be one of: start, pause, reset, set_half, adjust, set",
         }), 400
+    if action in ("adjust", "set"):
+        seconds = data.get("seconds")
+        low = -3600 if action == "adjust" else 0
+        if type(seconds) is not int or not low <= seconds <= 7200:
+            raise ValueError(f"seconds must be a whole number between {low} and 7200")
 
     if action == "set_half" and (type(data.get("half")) is not int or data["half"] not in (1, 2)):
         raise ValueError("Half must be 1 or 2")
@@ -450,6 +497,14 @@ def api_scoreboard_clock():
             _clock["start_ts"] = None
             _clock["half"] = 1
             log.info("Match clock reset to 00:00")
+
+        elif action in ("adjust", "set"):
+            target = max(0.0, (_clock_elapsed() if action == "adjust" else 0.0) + data["seconds"])
+            _clock["elapsed"] = target
+            if _clock["running"]:
+                _clock["start_ts"] = time.monotonic()
+            log.info("Match clock %s to %s", "adjusted" if action == "adjust" else "set",
+                     _format_clock(target))
 
         elif action == "set_half":
             half = data.get("half", 2)
@@ -545,8 +600,10 @@ def _diagnostics_worker():
     while not _workers_stop.is_set():
         try:
             network = get_network_status()
+            audio_devices = get_usb_audio_devices()
+            set_mic_devices(audio_devices)
             _diagnostics = {"network": network,
-                            "audio_devices": get_usb_audio_devices(),
+                            "audio_devices": audio_devices,
                             "firewall": get_firewall_status(network), "updated_at": time.time()}
         except Exception:
             log.exception("Diagnostics failed")

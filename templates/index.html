@@ -7,6 +7,12 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 
   <style>
+    #clock-editor { width: min(24rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
+      margin: auto; padding: 1.25rem; border: 1px solid #475569; border-radius: 1rem;
+      background: #1e293b; color: #fff; }
+    #clock-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #clock-editor input { min-width: 0; }
+    #clock-editor label { min-width: 0; }
     /* Base dark-mode styles */
     body {
       background-color: #0f172a;
@@ -80,6 +86,18 @@
     .match-btn { min-height: 48px; white-space: nowrap; }
     .cut-btn:disabled { cursor: not-allowed; }
 
+    /* Audio level meters: -60..0 dBFS; green to -18, amber to -6, red above */
+    .meter-row { display: grid; grid-template-columns: minmax(0, 9rem) 1fr 4.5rem; align-items: center; gap: .5rem; }
+    .meter-label { font-size: .75rem; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .meter-track { position: relative; height: .75rem; border-radius: .25rem; overflow: hidden;
+      background: linear-gradient(to right, #16a34a 0%, #22c55e 70%, #f59e0b 70%, #f59e0b 90%, #ef4444 90%); }
+    .meter-cover { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: #0b1220; transition: width .08s linear; }
+    .meter-peak { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; left: 0; opacity: 0; }
+    .meter-db { font: 600 .75rem ui-monospace, monospace; color: #94a3b8; text-align: right; }
+    .meter-row.on-air .meter-label { color: #fff; font-weight: 700; }
+    .meter-row.on-air .meter-label::before { content: "● "; color: #ef4444; }
+    .meter-row.out { border-top: 1px solid #334155; padding-top: .5rem; }
+
     /* Score button */
     .btn-score {
       min-width: 48px;
@@ -148,7 +166,7 @@
       <div class="space-y-3">
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700">
           <div class="flex items-center justify-between mb-2">
-            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
+            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program · before scoreboard</span>
             <button id="match-preview-toggle" onclick="toggleMatchPreview()"
                     class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
           </div>
@@ -176,6 +194,8 @@
                     class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-cyan focus:outline-none"></select>
           </div>
           <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
+          <p data-audio-pending class="hidden text-xs text-brand-amber" role="status">Applying audio…</p>
+          <div id="meters-match" data-meters="compact" class="space-y-1.5"></div>
         </div>
       </div>
       <div class="space-y-3">
@@ -194,12 +214,22 @@
           </div>
           {% endfor %}
         </div>
-        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex items-center gap-2">
-          <span data-bind="clock" class="text-4xl font-bold font-mono tabular-nums text-white flex-1">00:00</span>
-          <button id="match-clock-toggle" onclick="toggleClock()"
-                  class="match-btn px-4 rounded-lg font-semibold text-white bg-brand-green">▶ Start</button>
-          <button onclick="clockAction('second_half')"
-                  class="match-btn px-3 rounded-lg font-semibold text-white bg-brand-blue hover:bg-blue-600">2nd half</button>
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 space-y-2">
+          <div class="flex items-center gap-2">
+            <button data-bind="clock" onclick="openClockEditor()" title="Adjust game clock" aria-label="Adjust game clock"
+                    class="text-4xl font-bold font-mono tabular-nums text-white flex-1 text-left">00:00</button>
+            <button id="match-clock-toggle" onclick="toggleClock()"
+                    class="match-btn px-4 rounded-lg font-semibold text-white bg-brand-green">▶ Start</button>
+            <button onclick="clockAction('second_half')"
+                    class="match-btn px-3 rounded-lg font-semibold text-white bg-brand-blue hover:bg-blue-600">2nd half</button>
+          </div>
+          <button onclick="openClockEditor()" class="text-sm text-brand-cyan underline">✎ Adjust clock</button>
+          <div class="grid grid-cols-4 gap-2">
+            <button onclick="adjustClock(-60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−1 min</button>
+            <button onclick="adjustClock(-10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−10 s</button>
+            <button onclick="adjustClock(10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">+10 s</button>
+            <button onclick="adjustClock(60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">+1 min</button>
+          </div>
         </div>
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex items-center gap-3">
           <span data-bind="yt_state" class="px-2 py-1 rounded text-xs font-bold bg-slate-700 text-slate-400">OFFLINE</span>
@@ -365,7 +395,7 @@
         <!-- Program Output -->
         <div>
           <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program Output</span>
+            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program · before scoreboard</span>
             <span id="mv-badge-program" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-red-900" id="frame-program">
@@ -426,6 +456,11 @@
           </p>
         </div>
         <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
+        <div>
+          <p class="text-xs text-slate-400 mb-2">🎚 Audio levels — IN: what each source sends · OUT: what goes to YouTube</p>
+          <p data-audio-pending class="hidden text-xs text-brand-amber" role="status">Applying audio…</p>
+          <div id="meters-setup" data-meters="all" class="space-y-1.5"><p class="text-xs text-slate-500">Waiting for audio…</p></div>
+        </div>
       </div>
     </section>
 
@@ -547,6 +582,21 @@
             ⏩ 2nd Half (45:00)
           </button>
         </div>
+        <button onclick="openClockEditor()" class="mt-3 text-sm text-brand-cyan underline">✎ Adjust clock</button>
+        <!-- Correct the clock without stopping it -->
+        <div class="mt-3 flex flex-wrap items-center gap-2">
+          <div class="grid grid-cols-4 gap-2 flex-1 min-w-[16rem]">
+            <button onclick="adjustClock(-60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−1 min</button>
+            <button onclick="adjustClock(-10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−10 s</button>
+            <button onclick="adjustClock(10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">+10 s</button>
+            <button onclick="adjustClock(60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">+1 min</button>
+          </div>
+          <form class="flex gap-2" onsubmit="event.preventDefault(); setClock(this.elements.time.value) && this.reset();">
+            <input name="time" inputmode="numeric" placeholder="mm:ss" aria-label="Set clock to (mm:ss)"
+                   class="w-24 bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white text-center font-mono focus:border-brand-cyan focus:outline-none">
+            <button class="bg-brand-blue hover:bg-blue-600 text-white font-semibold px-3 py-2 rounded-lg text-sm">Set</button>
+          </form>
+        </div>
       </div>
     </section>
 
@@ -563,6 +613,33 @@
     </section>
 
   </main>
+
+  <dialog id="clock-editor" aria-labelledby="clock-editor-title">
+    <form onsubmit="event.preventDefault(); applyClockEditor();">
+      <h2 id="clock-editor-title" class="text-lg font-semibold">Adjust game clock</h2>
+      <p id="clock-editor-hint" class="text-sm text-slate-300 mt-2"></p>
+      <div class="flex gap-3 mt-4">
+        <label class="flex-1 text-sm">Minutes
+          <input id="clock-minutes" type="number" inputmode="numeric" min="0" max="120" step="1" required
+                 class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg px-3 py-3 text-xl font-mono" autofocus>
+        </label>
+        <label class="flex-1 text-sm">Seconds
+          <input id="clock-seconds" type="number" inputmode="numeric" min="0" max="59" step="1" required
+                 class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg px-3 py-3 text-xl font-mono">
+        </label>
+      </div>
+      <div class="flex gap-2 mt-3">
+        <button type="button" onclick="fillClockEditor(0)" class="flex-1 bg-slate-700 rounded-lg py-3">00:00</button>
+        <button type="button" onclick="fillClockEditor(2700)" class="flex-1 bg-slate-700 rounded-lg py-3">45:00</button>
+        <button type="button" onclick="fillClockEditor(5400)" class="flex-1 bg-slate-700 rounded-lg py-3">90:00</button>
+      </div>
+      <p id="clock-editor-error" role="alert" class="text-sm text-red-400 mt-2"></p>
+      <div class="flex gap-2 mt-4">
+        <button type="button" onclick="document.getElementById('clock-editor').close()" class="flex-1 bg-slate-700 rounded-lg py-3">Cancel</button>
+        <button id="clock-editor-apply" class="flex-1 bg-brand-blue text-white font-semibold rounded-lg py-3">Apply time</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- ═══════════════════════════════════════════════════════════════════
        FOOTER
@@ -608,27 +685,36 @@
     }
 
     // ──────────────────────── Clipboard (HTTP-safe) ────────────────────────
-    function copyToClipboard(text) {
-      if (navigator.clipboard && window.isSecureContext) {
-        navigator.clipboard.writeText(text);
-      } else {
-        const textArea = document.createElement('textarea');
-        textArea.value = text;
-        textArea.style.position = 'fixed';
-        textArea.style.left = '-9999px';
-        document.body.appendChild(textArea);
+    async function copyToClipboard(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {} // Permission denial can still permit the legacy copy action.
+      const previous = document.activeElement;
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      document.body.appendChild(textArea);
+      try {
         textArea.focus();
         textArea.select();
-        document.execCommand('copy');
-        document.body.removeChild(textArea);
-      }
+        return document.execCommand('copy');
+      } catch { return false; }
+      finally { textArea.remove(); previous?.focus(); }
+    }
+
+    async function copyWithFeedback(text) {
+      if (await copyToClipboard(text)) showToast('📋 Copied: ' + text, 'info');
+      else prompt('Automatic copy failed. Copy this text manually:', text);
     }
 
     let cameraHost = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
     function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam; }
     function copyRtmp(url) {
-      copyToClipboard(url);
-      showToast('📋 Copied: ' + url, 'info');
+      return copyWithFeedback(url);
     }
 
     // ──────────────────────── Toast Notifications ────────────────────────
@@ -800,7 +886,7 @@
 
     // Keys 1–3 cut cameras in match mode (laptop keyboard).
     document.addEventListener('keydown', event => {
-      if (!state.matchMode || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (!state.matchMode || document.getElementById('clock-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
     });
@@ -853,7 +939,9 @@
     }
 
     // ──────────────────────── Audio Source ────────────────────────
+    let audioPending = false;
     async function setAudioSource(source) {
+      if (audioPending) return;
       if (source === 'usb' && !state.selectedUsbDevice) {
         // Keep the picker open until a device is chosen or another source is selected.
         state.usbPickerOpen = true;
@@ -862,21 +950,27 @@
       }
       if (source !== 'usb') state.usbPickerOpen = false;
       const mode = source === 'usb' ? 'usb:' + state.selectedUsbDevice : source;
-      const result = await apiPost('/api/audio-source', {mode});
-      if (!result) { updateAudioToggle(); return; }
-      state.audioSource = result.audio_source;
-      state.selectedUsbDevice = mode.startsWith('usb:') ? mode.substring(4) : null;
-      updateAudioToggle();
+      await applyAudioMode(mode);
     }
 
     async function selectUsbAudioDevice(deviceId) {
-      if (!deviceId) return;
-      const result = await apiPost('/api/audio-source', {mode: 'usb:' + deviceId});
-      if (!result) return;
-      state.selectedUsbDevice = deviceId;
-      state.audioSource = result.audio_source;
-      state.usbPickerOpen = false;
+      if (!deviceId || audioPending) return;
+      await applyAudioMode('usb:' + deviceId);
+    }
+
+    async function applyAudioMode(mode) {
+      audioPending = true;
       updateAudioToggle();
+      try {
+        const result = await apiPost('/api/audio-source', {mode});
+        if (!result) return;
+        state.audioSource = result.audio_source;
+        state.selectedUsbDevice = mode.startsWith('usb:') ? mode.substring(4) : null;
+        state.usbPickerOpen = false;
+      } finally {
+        audioPending = false;
+        updateAudioToggle();
+      }
     }
 
     const deviceId = dev => dev.id || dev.device_id || dev.name;
@@ -906,6 +1000,11 @@
     }
 
     function updateAudioToggle() {
+      document.querySelectorAll('[data-audio], [data-usb-select]').forEach(el => {
+        el.disabled = audioPending;
+        el.setAttribute('aria-busy', String(audioPending));
+      });
+      document.querySelectorAll('[data-audio-pending]').forEach(el => el.classList.toggle('hidden', !audioPending));
       const isUsb = state.audioSource.startsWith('usb:');
       const current = isUsb ? 'usb' : state.audioSource;
       document.querySelectorAll('[data-audio]').forEach(btn => {
@@ -940,18 +1039,60 @@
       input.type = state.streamKeyVisible ? 'text' : 'password';
     }
 
+    let startPending = false, startCancelled = false, stopPending = false, streamSequence = 0;
+    function renderStreamControls() {
+      const streaming = (startPending && !startCancelled) || state.ytLive || ['starting', 'live', 'reconnecting'].includes(state.streamState);
+      document.querySelectorAll('[onclick="goLive()"], [onclick="matchGoLive()"]').forEach(btn => {
+        btn.disabled = startPending || stopPending || streaming;
+        btn.setAttribute('aria-busy', String(startPending));
+      });
+      document.querySelectorAll('[onclick="stopStream()"]').forEach(btn => {
+        btn.disabled = stopPending;
+        btn.setAttribute('aria-busy', String(stopPending));
+      });
+      document.querySelectorAll('[data-when-streaming]').forEach(el => el.classList.toggle('hidden', !streaming));
+      document.querySelectorAll('[data-when-stopped]').forEach(el => el.classList.toggle('hidden', streaming));
+      if ((startPending && !startCancelled) || stopPending) {
+        const label = stopPending ? 'STOPPING…' : 'STARTING…';
+        document.getElementById('status-yt-badge').textContent = label;
+        bind('yt_state', label);
+      }
+    }
+
     async function goLive() {
+      if (startPending || stopPending) return;
       const key = document.getElementById('stream-key').value.trim();
       if (!key) {
         showToast('Enter a YouTube stream key first', 'warning');
         return;
       }
-      await apiPost('/api/stream/start', { stream_key: key, profile: document.getElementById('quality-profile').value });
+      const sequence = ++streamSequence;
+      startPending = true;
+      startCancelled = false;
+      renderStreamControls();
+      try {
+        const {ok, data} = await apiRequest('/api/stream/start', {stream_key: key, profile: document.getElementById('quality-profile').value});
+        if (sequence === streamSequence) showToast(data.message || data.error || 'Start failed', ok ? 'success' : 'error');
+      } finally {
+        startPending = false;
+        await pollStatus();
+        renderStreamControls();
+      }
     }
 
     async function stopStream() {
+      if (stopPending) return;
       if (!confirm('Stop the YouTube stream? Viewers will see the broadcast end.')) return;
-      await apiPost('/api/stream/stop');
+      ++streamSequence;
+      startCancelled = true;
+      stopPending = true;
+      renderStreamControls();
+      try { await apiPost('/api/stream/stop'); }
+      finally {
+        stopPending = false;
+        await pollStatus();
+        renderStreamControls();
+      }
     }
 
     let ytTimerInterval = null;
@@ -1062,6 +1203,69 @@
         .then(result => { if (result) applyScoreboard(result.scoreboard); });
     }
 
+    function adjustClock(seconds) {
+      apiPost('/api/scoreboard/clock', {action: 'adjust', seconds}, {quiet: true})
+        .then(result => { if (result) applyScoreboard(result.scoreboard); });
+    }
+
+    // "9" means 9 minutes; "9:30" or "09:30" minutes and seconds.
+    function parseClock(text) {
+      const match = /^\s*(\d{1,3})(?:[:.](\d{1,2}))?\s*$/.exec(text || '');
+      if (!match || Number(match[2] || 0) > 59) return null;
+      return Number(match[1]) * 60 + Number(match[2] || 0);
+    }
+
+    function setClock(text) {
+      const seconds = parseClock(text);
+      if (seconds === null || seconds > 7200) {
+        showToast('Enter the time as mm:ss, e.g. 9:00', 'warning');
+        return false;
+      }
+      apiPost('/api/scoreboard/clock', {action: 'set', seconds}, {quiet: true})
+        .then(result => { if (result) applyScoreboard(result.scoreboard); });
+      return true;
+    }
+
+    function fillClockEditor(seconds) {
+      document.getElementById('clock-minutes').value = Math.floor(seconds / 60);
+      document.getElementById('clock-seconds').value = String(seconds % 60).padStart(2, '0');
+    }
+
+    function openClockEditor() {
+      const elapsed = state.clockElapsed + (state.clockRunning && state.clockLastServerUpdate
+        ? (Date.now() - state.clockLastServerUpdate) / 1000 : 0);
+      fillClockEditor(Math.min(7200, Math.floor(elapsed)));
+      document.getElementById('clock-editor-error').textContent = '';
+      document.getElementById('clock-editor-hint').textContent = state.clockRunning
+        ? 'The clock keeps running. Apply sets it to the time entered below.'
+        : 'The clock stays paused after you apply the new time.';
+      document.getElementById('clock-editor').showModal();
+      document.getElementById('clock-minutes').select();
+    }
+
+    async function applyClockEditor() {
+      const button = document.getElementById('clock-editor-apply');
+      if (button.disabled) return;
+      const minutes = Number(document.getElementById('clock-minutes').value);
+      const seconds = Number(document.getElementById('clock-seconds').value);
+      const error = document.getElementById('clock-editor-error');
+      if (!Number.isInteger(minutes) || !Number.isInteger(seconds) || minutes < 0 || seconds < 0 || seconds > 59 || minutes * 60 + seconds > 7200) {
+        error.textContent = 'Enter a time between 00:00 and 120:00.';
+        return;
+      }
+      button.disabled = true;
+      button.textContent = 'Applying…';
+      try {
+        const {ok, data} = await apiRequest('/api/scoreboard/clock', {action: 'set', seconds: minutes * 60 + seconds});
+        if (!ok) { error.textContent = data.error || data.message || 'Could not update the clock. Try again.'; return; }
+        applyScoreboard(data.scoreboard);
+        document.getElementById('clock-editor').close();
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Apply time';
+      }
+    }
+
     function toggleClock() {
       clockAction(state.clockRunning ? 'pause' : 'start');
     }
@@ -1133,6 +1337,81 @@
 
     renderChecklist();
 
+    // ──────────────────────── Audio level meters ────────────────────────
+    const meterDisplay = {};  // key -> {level, peak, peakAt}: smoothed fall-off and 1.5 s peak hold
+    let meterBusy = false;
+
+    function meterName(key) {
+      if (key === 'program') return 'Program audio';
+      if (key.startsWith('cam')) return 'Cam ' + key.slice(3);
+      const dev = state.audioDevices.find(d => d.pulse_source === key.slice(4) || deviceId(d) === key.slice(4));
+      return '🎤 ' + (dev ? dev.name : 'Microphone');
+    }
+
+    function meterRow(container, key) {
+      let row = container.querySelector(`[data-meter-key="${CSS.escape(key)}"]`);
+      if (row) return row;
+      row = document.createElement('div');
+      row.className = 'meter-row' + (key === 'program' ? ' out' : '');
+      row.dataset.meterKey = key;
+      row.innerHTML = '<span class="meter-label"></span><div class="meter-track"><div class="meter-cover"></div><div class="meter-peak"></div></div><span class="meter-db"></span>';
+      container.appendChild(row);
+      return row;
+    }
+
+    function drawMeter(row, id, value, label, onAir) {
+      const now = Date.now();
+      const m = meterDisplay[id] || (meterDisplay[id] = {level: -60, peak: -60, peakAt: 0});
+      const db = value && typeof value === 'object' ? value.peak : null;
+      // Rise instantly, fall at ~20 dB/s so speech reads as a steady bar.
+      m.level = db === null ? -60 : Math.max(db, m.level - 4);
+      if (db !== null && (db >= m.peak || now - m.peakAt > 1500)) { m.peak = db; m.peakAt = now; }
+      const pct = v => Math.max(0, Math.min(100, (v + 60) / 60 * 100));
+      row.querySelector('.meter-label').textContent = label;
+      row.querySelector('.meter-cover').style.width = (100 - pct(m.level)) + '%';
+      const peak = row.querySelector('.meter-peak');
+      peak.style.left = `calc(${pct(m.peak)}% - 2px)`;
+      peak.style.opacity = db === null ? 0 : 1;
+      row.querySelector('.meter-db').textContent =
+        value === 'no audio' ? 'no audio' : db === null ? '—' : db <= -119 ? 'silent' : db.toFixed(0) + ' dB';
+      row.querySelector('.meter-db').style.color = db !== null && db > -1 ? '#f87171' : '';
+      row.classList.toggle('on-air', !!onAir);
+    }
+
+    function renderMeters(info) {
+      const levels = info.levels || {};
+      const live = new Set(info.audio_on_air || []);
+      const inputs = Object.keys(levels).filter(k => k !== 'program').sort();
+      document.querySelectorAll('[data-meters]').forEach(container => {
+        const compact = container.dataset.meters === 'compact';
+        const keys = (compact ? [...live, 'program'] : [...inputs, 'program']).filter(k => k in levels);
+        if (!keys.length) {
+          container.innerHTML = '<p class="text-xs text-slate-500">No audio sources yet</p>';
+          return;
+        }
+        container.querySelector('p')?.remove();
+        container.querySelectorAll('[data-meter-key]').forEach(row => { if (!keys.includes(row.dataset.meterKey)) row.remove(); });
+        for (const key of keys) {
+          const row = meterRow(container, key);
+          container.appendChild(row);  // keep order: inputs, then OUT
+          const label = compact && key !== 'program' ? 'IN · ' + meterName(key).replace('🎤 ', '') : meterName(key);
+          drawMeter(row, container.id + '|' + key, levels[key], label, key !== 'program' && live.has(key));
+        }
+      });
+    }
+
+    async function pollMeters() {
+      if (meterBusy || document.visibilityState !== 'visible') return;
+      meterBusy = true;
+      try {
+        const info = await apiGet('/api/audio/levels');
+        renderMeters(info && info.ok ? info : {});
+      } finally {
+        meterBusy = false;
+      }
+    }
+    setInterval(pollMeters, 150);
+
     // ──────────────────────── Status banner ────────────────────────
     const bannerStyles = {
       ok:      'text-center text-sm p-2 text-slate-300',
@@ -1197,6 +1476,8 @@
       if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
       else if (stream.audio_warning) setBanner('Audio: ' + stream.audio_warning, 'warning');
       else if (stream.fallback && stream.active) setBanner('Live — fallback video / silence', 'warning');
+      else if (data.diagnostics_updated_at && Date.now() / 1000 - data.diagnostics_updated_at > 20)
+        setBanner('Network and device diagnostics are stale', 'warning');
       else setBanner('Connected', 'ok');
 
       if (network.camera_ip) cameraHost = network.camera_ip;
@@ -1275,6 +1556,7 @@
 
       // --- YouTube Stream Status ---
       const ytBadge = document.getElementById('status-yt-badge');
+      state.streamState = stream.state || 'stopped';
       const streaming = stream.active || ['starting', 'live', 'reconnecting'].includes(stream.state);
       const ytLabel = stream.active ? '🔴 ON AIR' : (stream.state || 'stopped').toUpperCase();
       const ytClass = stream.active
@@ -1292,6 +1574,8 @@
         stopYtTimer();
       }
 
+      renderStreamControls();
+
       // --- Active Camera ---
       state.activeCam = stream.active_camera || null;
       state.selectedCam = stream.selected_camera || null;
@@ -1304,7 +1588,7 @@
       }
 
       // --- Audio Source ---
-      if (stream.audio_source) {
+      if (stream.audio_source && !audioPending) {
         state.audioSource = stream.audio_source;
         if (stream.audio_source.startsWith('usb:')) {
           state.selectedUsbDevice = stream.audio_source.substring(4);
@@ -1353,7 +1637,7 @@
         const copy = document.createElement('button');
         copy.className = 'text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-white';
         copy.textContent = 'Copy';
-        copy.onclick = () => { copyToClipboard(command); showToast('📋 Copied — run it in a terminal on the laptop', 'info'); };
+        copy.onclick = () => copyWithFeedback(command);
         row.append(code, copy);
         box.appendChild(row);
       }

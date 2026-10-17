@@ -63,6 +63,14 @@ class ApiTests(unittest.TestCase):
             start.assert_called_once_with('Net','')
         self.assertEqual(self.post('/api/network/hotspot-start',{'ssid':'Net','password':'short'}).status_code,400)
 
+    def test_audio_levels_endpoint(self):
+        with patch.object(a,'get_audio_levels',return_value={'program':{'peak':-6.0,'rms':-14.0}}):
+            r=self.client.get('/api/audio/levels',headers=self.headers)
+        self.assertEqual(r.status_code,200)
+        self.assertEqual(r.json['levels']['program']['peak'],-6.0)
+        self.assertIn('audio_on_air',r.json)
+        self.assertIn('channels',r.json['mixer'])
+
     def test_audio_case_preserved(self):
         with patch.object(a,'set_audio_source',return_value=(True,'ok')) as fn:
             self.post('/api/audio-source',{'mode':'usb:alsa_input.USB-Device'})
@@ -80,6 +88,23 @@ class ApiTests(unittest.TestCase):
             a._write_scoreboard_file()
         self.assertIn('45:02',Path(a.SCOREBOARD_PATH).read_text())
         self.assertTrue(a.MATCH_PATH.exists())
+
+    def test_clock_set_and_adjust_keep_running(self):
+        with patch.object(a.time,'monotonic',return_value=1000):
+            self.post('/api/scoreboard/clock',{'action':'reset'})
+            self.post('/api/scoreboard/clock',{'action':'start'})
+        with patch.object(a.time,'monotonic',return_value=1096):  # 01:36 running
+            r=self.post('/api/scoreboard/clock',{'action':'set','seconds':540})
+        self.assertEqual((r.json['scoreboard']['clock'],r.json['scoreboard']['clock_running']),('09:00',True))
+        with patch.object(a.time,'monotonic',return_value=1106):  # 10 s later, still running
+            r=self.post('/api/scoreboard/clock',{'action':'adjust','seconds':60})
+        self.assertEqual(r.json['scoreboard']['clock'],'10:10')
+        with patch.object(a.time,'monotonic',return_value=1106):
+            self.post('/api/scoreboard/clock',{'action':'pause'})
+            r=self.post('/api/scoreboard/clock',{'action':'adjust','seconds':-3600})
+        self.assertEqual((r.json['scoreboard']['clock'],r.json['scoreboard']['clock_running']),('00:00',False))
+        for body in [{'action':'set','seconds':-1},{'action':'set','seconds':'9:00'},{'action':'adjust','seconds':1.5},{'action':'set','seconds':9000}]:
+            self.assertEqual(self.post('/api/scoreboard/clock',body).status_code,400)
 
     def test_restore_pauses_clock(self):
         self.post('/api/scoreboard/update',{'home_score':5})
@@ -145,10 +170,10 @@ class NetworkTests(unittest.TestCase):
         self.assertEqual(status['status'],'warning')
         self.assertEqual(status['commands'],['sudo ufw allow in on wlp1s0','sudo ufw route allow in on wlp1s0'])
 
-    def test_disabled_ufw_is_no_firewall(self):
+    def test_disabled_ufw_leaves_reachability_unverified(self):
         with patch.object(n,'REQUIRED_TCP_PORTS',[5000]),patch.object(n,'REQUIRED_UDP_PORTS',[]):
             status=self.firewall({'ENABLED':'no','DEFAULT_INPUT_POLICY':'drop'})
-        self.assertEqual((status['status'],status['label'],status['commands']),('ok','No firewall',[]))
+        self.assertEqual((status['status'],status['label'],status['commands']),('unknown','Reachability unverified',[]))
 
     def test_phone_connection_verifies_reachability(self):
         with patch.object(n,'REQUIRED_TCP_PORTS',[5000]),patch.object(n,'REQUIRED_UDP_PORTS',[]):
@@ -215,10 +240,45 @@ class MediaTests(unittest.TestCase):
             self.assertFalse(m.switch_camera('cam2')[0])
             kill.assert_not_called()
 
+    def mixer(self, **channels):
+        mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS}
+        mix.update(channels)
+        return patch.object(m,'_mix',mix)
+
     def test_audio_failure_rolls_back_mode(self):
-        with patch.object(m,'_active_camera','cam1'),patch.object(m,'_audio_source_mode','cam1'),patch.object(m,'switch_camera',return_value=(False,'bad')):
+        with self.mixer(),patch.object(m,'_follow',False),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_proc',None),patch.object(m,'switch_camera',return_value=(False,'bad')):
             self.assertFalse(m.set_audio_source('active')[0])
             self.assertEqual(m.get_audio_source(),'cam1')
+
+    def test_presets_and_custom_mix(self):
+        with self.mixer(**{'usb:mic':{'on':False,'gain':0.0}}),patch.object(m,'_follow',False),patch.object(m,'_active_camera',None):
+            self.assertEqual(m.get_audio_source(),'cam1')
+            self.assertTrue(m.set_audio_source('active')[0])
+            self.assertEqual(m.get_audio_source(),'active')
+            self.assertEqual(m._effective_mix('cam2'),{'cam2':0.0})  # camera sound follows the cut
+            self.assertTrue(m.set_mix('usb:mic',on=True,gain=-6)[0])
+            self.assertEqual(m.get_audio_source(),'mix')
+            self.assertEqual(m._effective_mix('cam3'),{'cam3':0.0,'usb:mic':-6.0})
+            self.assertTrue(m.set_mix('usb:mic',gain=99)[0])
+            self.assertEqual(m._mix['usb:mic']['gain'],m.GAIN_MAX)
+            self.assertFalse(m.set_mix('nope',on=True)[0])
+
+    def test_gain_change_is_live_without_rebuild(self):
+        relay=MagicMock(); relay.poll.return_value=None
+        with self.mixer(**{'usb:mic':{'on':True,'gain':0.0}}),patch.object(m,'_follow',True),patch.object(m,'_active_camera','cam2'),patch.object(m,'_relay_proc',relay),patch.object(m,'_relay_channels',{'cam2':'m0','usb:mic':'m1'}),patch.object(m,'_relay_missing',set()),patch.object(m,'_send_volume',return_value=True) as send,patch.object(m,'switch_camera') as cut:
+            self.assertTrue(m.set_mix('usb:mic',gain=-20)[0])
+            cut.assert_not_called()
+            self.assertAlmostEqual(dict((c.args[0],c.args[1]) for c in send.call_args_list)['m1'],0.1,places=3)
+            send.reset_mock()
+            self.assertTrue(m.set_mix('usb:mic',on=False)[0])  # off = live mute, still no rebuild
+            cut.assert_not_called()
+            self.assertEqual(dict((c.args[0],c.args[1]) for c in send.call_args_list)['m1'],0.0)
+
+    def test_new_source_rebuilds_relay(self):
+        relay=MagicMock(); relay.poll.return_value=None
+        with self.mixer(),patch.object(m,'_follow',False),patch.object(m,'_active_camera','cam2'),patch.object(m,'_relay_proc',relay),patch.object(m,'_relay_channels',{'cam1':'m0'}),patch.object(m,'_relay_missing',set()),patch.object(m,'_send_volume',return_value=True),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut:
+            self.assertTrue(m.set_mix('cam3',on=True)[0])
+            cut.assert_called_once_with('cam2', automatic=True, expected_stop=m._stop_generation)
 
     def test_start_without_camera_does_not_launch(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value=None),patch.object(m,'_paths',return_value={}),patch.object(m,'_launch_encoder') as launch:
@@ -245,19 +305,31 @@ class MediaTests(unittest.TestCase):
         def probe(cam):
             return {'video'} if cam == 'cam1' else {'video', 'audio'}
         with patch.object(m,'_probe',side_effect=probe):
-            cmd, actual, warning = m._relay_command('cam2','cam1')
-        self.assertEqual(actual,'camera')
+            cmd, channels, missing, warning = m._relay_command('cam2',{'cam1':0.0})
+        self.assertEqual((list(channels),missing),(['cam2'],{'cam1'}))
         self.assertIn('Cam 1 commentary unavailable',warning)
-        self.assertEqual(cmd.count('-i'),1)
+        self.assertEqual(cmd.count('-i'),2)  # camera + generated silence base
         with patch.object(m,'_probe',return_value={'video'}):
-            cmd, actual, warning = m._relay_command('cam1','cam1')
-        self.assertEqual(actual,'silence')
+            cmd, channels, missing, warning = m._relay_command('cam1',{'cam1':0.0})
+        self.assertEqual(channels,{})
+        self.assertIn('broadcasting silence',warning)
         self.assertIn('anullsrc=r=48000:cl=stereo',cmd)
+
+    def test_mix_graph_uses_each_source_once_with_gain(self):
+        with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_usb_device_available',return_value=True):
+            cmd, channels, missing, _ = m._relay_command('cam2',{'cam2':-6.0,'cam1':0.0,'usb:alsa_input.mic':-60.0})
+        graph=cmd[cmd.index('-filter_complex')+1]
+        self.assertEqual(channels,{'cam2':'m0','cam1':'m1','usb:alsa_input.mic':'m2'})
+        self.assertIn('[0:a:0]',graph); self.assertIn('[1:a:0]',graph); self.assertIn('[2:a:0]',graph)
+        self.assertIn('[3:a:0][m0][m1][m2]amix=inputs=4',graph)  # silence base first
+        self.assertIn('volume@m0=0.5012',graph)
+        self.assertIn('alimiter',graph); self.assertIn('azmq=bind_address=tcp',graph)
+        self.assertEqual(cmd[cmd.index('-f',cmd.index('alsa_input.mic')-3)+1],'pulse')
 
     def test_missing_usb_mic_degrades(self):
         with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_usb_device_available',return_value=False):
-            _, actual, warning = m._relay_command('cam2','usb:hw:1,0')
-        self.assertEqual(actual,'camera')
+            _, channels, _, warning = m._relay_command('cam2',{'usb:hw:1,0':0.0})
+        self.assertEqual(list(channels),['cam2'])
         self.assertIn('USB microphone unavailable',warning)
 
     def test_slow_cut_does_not_hold_control_lock(self):
@@ -282,7 +354,7 @@ class MediaTests(unittest.TestCase):
 
     def test_1080p_profile_end_to_end_resolution(self):
         with patch.object(m,'_profile','1080p'),patch.object(m,'_probe',return_value={'video','audio'}):
-            cmd,_,_=m._relay_command('cam2','active')
+            cmd,_,_,_=m._relay_command('cam2',{'cam2':0.0})
             self.assertIn('scale=1920:1080',' '.join(cmd))
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
             with patch.object(m,'Process') as proc,patch.object(m,'_youtube_stream_key','key'):
@@ -295,14 +367,147 @@ class MediaTests(unittest.TestCase):
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
             self.assertTrue(m.start_youtube_stream('key','1080p')[0])
-            cut.assert_called_once_with('cam1')
+            cut.assert_called_once_with('cam1', expected_stop=m._stop_generation)
             m.stop_youtube_stream()
+
+    def test_meter_parses_levels_and_silence(self):
+        meter=object.__new__(m.Meter)
+        meter.peak=meter.rms=None; meter.updated=0.0
+        meter._read(io.StringIO('frame:0 pts:0\nlavfi.astats.Overall.Peak_level=-12.04\nlavfi.astats.Overall.RMS_level=-inf\n'),True)
+        self.assertEqual((meter.peak,meter.rms),(-12.0,-120.0))
+        self.assertGreater(meter.updated,0)
+
+    def test_meters_follow_sources_and_flag_missing_audio(self):
+        started=[]
+        class FakeMeter:
+            def __init__(self,cmd): self.cmd=cmd; self.updated=0.0; self.exit=None; started.append(self)
+            def poll(self): return self.exit
+        with patch.object(m,'Meter',FakeMeter),patch.object(m,'_kill_process'),patch.object(m,'_meters',{}),patch.object(m,'_meter_retry_at',{}),patch.object(m,'_meter_no_audio',set()),patch.object(m,'_mic_sources',['alsa_input.usb-mic']),patch.object(m,'_camera_status',{'cam1':True,'cam2':False,'cam3':False,'program':True}):
+            m._supervise_meters(100)
+            self.assertEqual(sorted(m._meters),['cam1','program','usb:alsa_input.usb-mic'])
+            self.assertIn('-allowed_media_types',m._meters['cam1'].cmd)
+            self.assertEqual(m._meters['usb:alsa_input.usb-mic'].cmd[m._meters['usb:alsa_input.usb-mic'].cmd.index('-f')+1],'pulse')
+            m._meters['cam1'].exit=1  # camera stream without an audio track
+            m._supervise_meters(101)
+            self.assertEqual(m.get_audio_levels()['cam1'],'no audio')
+            self.assertNotIn('cam1',m._meters)  # retried later, not every tick
+            m._supervise_meters(102)
+            self.assertNotIn('cam1',m._meters)
 
     def test_log_redaction(self):
         proc=object.__new__(m.Process)
         proc.secret='SECRET';proc.error=''
         proc._read(io.StringIO('failed rtmp://host/SECRET\n'),False)
         self.assertNotIn('SECRET',proc.error)
+
+class ConcurrencyRegressionTests(unittest.TestCase):
+    def setUp(self):
+        from contextlib import ExitStack
+        self.stack = self.enterContext(ExitStack())
+        values = dict(_want_stream=False, _state='stopped', _active_camera=None,
+                      _relay_proc=None, _youtube_proc=None, _relay_channels={}, _relay_muted=set(),
+                      _relay_missing=set(), _audio_warning='', _generation=0, _stop_generation=0,
+                      _pending_camera=None, _follow=False, _profile='720p', _relay_profile='720p',
+                      _mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS})
+        for key, value in values.items():
+            self.stack.enter_context(patch.object(m, key, value))
+        self.stack.enter_context(patch.object(m, 'get_mediamtx_running', return_value=True))
+        self.stack.enter_context(patch.object(m, '_kill_process'))
+        self.stack.enter_context(patch.object(m.Path, 'is_file', return_value=True))
+        self.stack.enter_context(patch.object(m.shutil, 'which', return_value='/mock'))
+
+    def test_stop_cancels_start_waiting_for_camera_readiness(self):
+        entered, release = threading.Event(), threading.Event()
+        def paths():
+            entered.set()
+            release.wait(3)
+            return {'cam1':True}
+        results = []
+        with patch.object(m, '_paths', side_effect=paths), patch.object(m, 'switch_camera') as cut, patch.object(m, '_launch_encoder') as launch:
+            worker = threading.Thread(target=lambda: results.append(m.start_youtube_stream('key')))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertFalse(m.start_youtube_stream('duplicate')[0])
+                self.assertTrue(m.stop_youtube_stream()[0])
+            finally:
+                release.set()
+                worker.join(3)
+            self.assertEqual(results, [(False, m.SUPERSEDED)])
+            cut.assert_not_called()
+            launch.assert_not_called()
+            self.assertFalse(m._want_stream)
+            self.assertEqual(m._state, 'stopped')
+
+    def test_stop_after_camera_selection_prevents_encoder_launch(self):
+        def selected(*args, **kwargs):
+            m.stop_youtube_stream()
+            return True, 'selected'
+        with patch.object(m, '_paths', return_value={'cam1':True}), patch.object(m, 'switch_camera', side_effect=selected), patch.object(m, '_launch_encoder') as launch:
+            self.assertEqual(m.start_youtube_stream('key'), (False, m.SUPERSEDED))
+            launch.assert_not_called()
+            self.assertEqual(m._state, 'stopped')
+
+    def test_cancelled_start_cannot_register_a_new_cut(self):
+        m.stop_youtube_stream()
+        with patch.object(m, '_replace_relay') as replace:
+            self.assertEqual(m.switch_camera('cam1', expected_stop=0), (False, m.SUPERSEDED))
+            replace.assert_not_called()
+
+    def test_follow_change_waits_for_cut_and_applies_to_new_camera(self):
+        entered, release, audio_entered = threading.Event(), threading.Event(), threading.Event()
+        relay = MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True
+        m._relay_proc=relay; m._active_camera='cam1'; m._relay_channels={'cam1':'m0'}
+        built=[]; results=[]
+        def command(cam, wanted):
+            built.append((cam, dict(wanted)))
+            if len(built)==1:
+                entered.set(); release.wait(3)
+            return ['mock'], {c:f'm{i}' for i,c in enumerate(wanted)}, set(), ''
+        def audio():
+            audio_entered.set()
+            results.append(m.set_audio_source('active'))
+        with patch.object(m,'_relay_command',side_effect=command), patch.object(m,'Process',return_value=relay), patch.object(m,'_wait_progress',return_value=True):
+            cut=threading.Thread(target=lambda: results.append(m.switch_camera('cam2')))
+            cut.start()
+            self.assertTrue(entered.wait(2))
+            change=threading.Thread(target=audio); change.start()
+            try:
+                self.assertTrue(audio_entered.wait(2))
+                self.assertEqual(m.get_audio_source(),'cam1')
+            finally:
+                release.set(); cut.join(3); change.join(3)
+            self.assertEqual(len(results),2)
+            self.assertTrue(all(r[0] for r in results), results)
+            self.assertEqual(built[-1],('cam2',{'cam2':0.0}))
+            self.assertEqual(m.get_stream_status()['audio_on_air'],['cam2'])
+
+    def test_muted_channel_removed_and_restored_in_status(self):
+        relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True
+        m._relay_proc=relay; m._active_camera='cam1'; m._relay_channels={'cam1':'m0'}
+        with patch.object(m,'_send_volume',return_value=True), patch.object(m,'switch_camera') as cut:
+            self.assertTrue(m.set_mix('cam1',on=False)[0])
+            self.assertEqual(m.get_stream_status()['audio_on_air'],[])
+            self.assertTrue(m.set_mix('cam1',on=True)[0])
+            self.assertEqual(m.get_stream_status()['audio_on_air'],['cam1'])
+            cut.assert_not_called()
+
+    def test_mixer_rebuild_preserves_newer_operator_cut_generation(self):
+        m._active_camera='cam1'
+        m._generation=12
+        m._pending_camera='cam3'
+        with patch.object(m, '_replace_relay', return_value=(True,'selected')) as replace:
+            self.assertTrue(m.set_audio_source('active')[0])
+            self.assertEqual(m._generation,12)
+            self.assertEqual(m._pending_camera,'cam3')
+            replace.assert_called_once_with('cam1',12)
+
+    def test_encoder_recovery_does_not_run_relay_probes(self):
+        m._want_stream=True
+        with patch.object(m,'_relay_command',side_effect=AssertionError('slow probe')), patch.object(m,'_launch_encoder') as launch, patch.object(m,'_retry_at',0):
+            m._supervise_encoder()
+            launch.assert_called_once()
+
 
 if __name__=='__main__':
     unittest.main()

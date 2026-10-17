@@ -320,8 +320,8 @@ def get_firewall_status(network=None):
         summary = "firewalld is running. If phones cannot connect, open the app's ports once:"
         commands = _firewall_commands(network, "firewalld")
     elif not ufw_enabled and not firewalld and _conf_value(UFW_CONF, "ENABLED") is not None:
-        level, label = "ok", "No firewall"
-        summary = "No firewall is enabled: phones on the camera network can connect."
+        level, label = "unknown", "Reachability unverified"
+        summary = "UFW and firewalld are not enabled. Other firewall rules or Wi-Fi isolation may still block phones; test from a camera phone."
     else:
         level, label = "unknown", "Not checked"
         summary = "Could not determine the firewall state. Open the dashboard on a phone to test."

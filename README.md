@@ -73,6 +73,15 @@ always-available program path supplies fallback video and silence when that publ
 is absent. A separate encoder reads the continuous program over loopback RTSP,
 adds the scoreboard, and publishes RTMPS to YouTube.
 
+STOP cancels an in-flight GO LIVE operation, including camera readiness checks; a cancelled
+start cannot launch an encoder afterward. Duplicate starts are rejected.
+Audio changes are serialized with cuts so Follow camera applies to the newly selected
+camera, and meter highlights report the actual unmuted relay inputs. Compact meters
+show all active mixed inputs rather than guessing an input.
+
+The program preview is before the scoreboard overlay; its audio meter measures the
+local program, not YouTube reception. Clipboard denial offers a manual copy fallback.
+
 A cut probes the new source before stopping the old relay. Probing and waiting for
 frames never block STOP, status, or other controls; a newer cut supersedes one still in
 progress, and STOP aborts it. During relay replacement,
@@ -83,7 +92,8 @@ the previous selection for recovery. Audio changes also restart the relay.
 Media processes run under a small watchdog, so they exit if the control app dies
 (even with SIGKILL) instead of continuing to stream. MediaMTX is restarted
 automatically if it exits, whether or not the stream is live.
-The supervisor monitors advancing frames, reports stalled output, and retries failed
+A separate encoder watchdog checks output every half-second independently of slower
+camera recovery and microphone probes. The supervisor monitors advancing frames, reports stalled output, and retries failed
 encoders with bounded backoff. Active-camera loss leaves program fallback available;
 the selected source is retried when it returns. The dashboard reports fallback and
 connection loss explicitly. “Live” indicates the local encoder is producing output;

@@ -148,3 +148,135 @@ test('hotspot form keeps the saved password and buttons follow the hotspot state
   await page.locator('#hotspot-stop-btn').click();
   expect(asked).toContain('Stop the hotspot?');
 });
+
+test('audio meters show every input and the YouTube output', async ({page}) => {
+  await page.goto('/');
+  const setup = page.locator('#meters-setup');
+  await expect(setup.locator('.meter-row')).toHaveCount(4);
+  await expect(setup.locator('[data-meter-key="cam1"] .meter-db')).toHaveText('-12 dB');
+  await expect(setup.locator('[data-meter-key="cam2"] .meter-db')).toHaveText('no audio');
+  await expect(setup.locator('[data-meter-key="usb:alsa_input.usb-test"] .meter-label')).toHaveText('🎤 Test USB Mic');
+  await expect(setup.locator('.meter-row').last()).toHaveAttribute('data-meter-key', 'program');
+  await expect(setup.locator('[data-meter-key="program"] .meter-label')).toHaveText('Program audio');
+  // -0.5 dBFS is close to clipping: highlighted red.
+  await expect(setup.locator('[data-meter-key="program"] .meter-db')).toHaveCSS('color', 'rgb(248, 113, 113)');
+  const cover = await setup.locator('[data-meter-key="cam1"] .meter-cover').evaluate(el => el.style.width);
+  expect(cover).toBe('20%');  // -12 dB on a -60..0 scale fills 80%
+  await page.locator('#mode-toggle').click();
+  await expect(page.locator('#meters-match .meter-row')).toHaveCount(2);
+  await expect(page.locator('#meters-match .meter-row').last()).toHaveAttribute('data-meter-key', 'program');
+  await page.locator('#mode-toggle').click();
+});
+
+test('match clock can be set and nudged while it runs', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  const clock = page.locator('#match-clock-display');
+  await page.getByLabel('Set clock to (mm:ss)').fill('9:00');
+  await page.getByLabel('Set clock to (mm:ss)').press('Enter');
+  await expect(clock).toHaveText(/^09:0\d$/);
+  await page.getByRole('button', {name: '+1 min'}).first().click();
+  await expect(clock).toHaveText(/^10:0\d$/);
+  await page.getByRole('button', {name: '−10 s'}).first().click();
+  await expect(clock).toHaveText(/^09:[56]\d$/);
+  await page.getByLabel('Set clock to (mm:ss)').fill('nonsense');
+  await page.getByLabel('Set clock to (mm:ss)').press('Enter');
+  await expect(page.locator('#toast-container')).toContainText('mm:ss');
+  await page.locator('#mode-toggle').click();
+  await page.getByRole('button', {name:'Adjust game clock', exact:true}).click();
+  await page.getByLabel('Minutes', {exact:true}).fill('12');
+  await page.getByLabel('Seconds', {exact:true}).fill('0');
+  await page.getByRole('button', {name:'Apply time', exact:true}).click();
+  await expect(page.locator('#match-panel [data-bind="clock"]')).toHaveText(/^12:0\d$/);
+  await page.locator('#mode-toggle').click();
+});
+
+
+test('compact meters follow actual mixed audio and clear muted inputs', async ({page}) => {
+  let active = ['usb:alsa_input.usb-test'];
+  await page.route('**/api/audio/levels', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.audio_on_air = active;
+    await route.fulfill({response, json: body});
+  });
+  await page.goto('/');
+  await page.locator('#mode-toggle').click();
+  const meters = page.locator('#meters-match');
+  await expect(meters.locator('.on-air')).toHaveCount(1);
+  await expect(meters.locator('.on-air')).toHaveAttribute('data-meter-key', 'usb:alsa_input.usb-test');
+  active = ['cam1', 'usb:alsa_input.usb-test'];
+  await expect(meters.locator('.on-air')).toHaveCount(2);
+  active = [];
+  await expect(meters.locator('.on-air')).toHaveCount(0);
+  await expect(meters.locator('.meter-row')).toHaveCount(1);
+  await expect(meters.locator('.meter-row')).toHaveAttribute('data-meter-key','program');
+});
+
+test('clipboard denial offers manual copy without a success toast', async ({page}) => {
+  await page.goto('/');
+  await page.evaluate(() => {
+    Object.defineProperty(navigator, 'clipboard', {value:{writeText:async()=>{throw Error('denied');}}, configurable:true});
+    document.execCommand = () => false;
+  });
+  const dialogSeen = page.waitForEvent('dialog');
+  const copy = page.evaluate(() => copyRtmp('rtmp://test/cam1'));
+  const dialog = await dialogSeen;
+  expect(dialog.message()).toContain('Automatic copy failed');
+  expect(dialog.defaultValue()).toBe('rtmp://test/cam1');
+  await dialog.dismiss();
+  await copy;
+  await expect(page.locator('#toast-container')).not.toContainText('Copied');
+});
+
+test('start is guarded against duplicate taps and STOP stays available', async ({page}) => {
+  let release;
+  const held = new Promise(resolve => { release = resolve; });
+  let starts = 0;
+  await page.route('**/api/stream/start', async route => {
+    starts++;
+    await held;
+    await route.fulfill({status:409,json:{ok:false,message:'Superseded by a newer request'}});
+  });
+  await page.route('**/api/stream/stop', route => route.fulfill({json:{ok:true,message:'Stopped'}}));
+  await page.goto('/');
+  await page.locator('#stream-key').fill('test-key');
+  await page.locator('[onclick="goLive()"]').click();
+  await expect(page.locator('[onclick="goLive()"]')).toBeDisabled();
+  await page.evaluate(() => { goLive(); });
+  await expect(page.locator('[onclick="stopStream()"]').last()).toBeEnabled();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('[onclick="stopStream()"]').last().click();
+  release();
+  await expect(page.locator('[onclick="goLive()"]')).toBeEnabled();
+  expect(starts).toBe(1);
+});
+
+
+test('clock editor preserves running state, edits survive polls, and cancel does not apply', async ({page}) => {
+  await page.setViewportSize({width:390,height:844});
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.evaluate(() => clockAction('pause'));
+  await expect.poll(async()=> (await (await page.request.get('/api/scoreboard')).json()).scoreboard.clock_running).toBe(false);
+  await page.getByRole('button', {name:'✎ Adjust clock',exact:true}).last().click();
+  await page.getByLabel('Minutes',{exact:true}).fill('63');
+  await page.getByLabel('Seconds',{exact:true}).fill('27');
+  await page.waitForTimeout(2200);
+  await expect(page.getByLabel('Minutes',{exact:true})).toHaveValue('63');
+  await page.screenshot({path:'/tmp/mcc-clock-editor.png'});
+  await page.getByRole('button',{name:'Apply time',exact:true}).click();
+  await expect(page.locator('#match-clock-display')).toHaveText('63:27');
+  expect((await (await page.request.get('/api/scoreboard')).json()).scoreboard.clock_running).toBe(false);
+  await page.evaluate(() => clockAction('start'));
+  await expect.poll(async()=> (await (await page.request.get('/api/scoreboard')).json()).scoreboard.clock_running).toBe(true);
+  await page.getByRole('button', {name:'✎ Adjust clock',exact:true}).last().click();
+  await page.getByRole('button',{name:'45:00',exact:true}).click();
+  await page.getByRole('button',{name:'Apply time',exact:true}).click();
+  await expect(page.locator('#match-clock-display')).toHaveText(/^45:0[0-9]$/);
+  expect((await (await page.request.get('/api/scoreboard')).json()).scoreboard.clock_running).toBe(true);
+  await page.getByRole('button', {name:'✎ Adjust clock',exact:true}).last().click();
+  await page.getByRole('button',{name:'00:00',exact:true}).click();
+  await page.getByRole('button',{name:'Cancel',exact:true}).click();
+  await expect(page.locator('#match-clock-display')).toHaveText(/^45:0[0-9]$/);
+});

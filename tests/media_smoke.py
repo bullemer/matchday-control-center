@@ -33,6 +33,7 @@ def run():
         m.RTSP_BASE = 'rtsp://127.0.0.1:28554'
         m.MEDIAMTX_API = 'http://127.0.0.1:29997'
         m.YOUTUBE_RTMP_BASE = m.RTMP_BASE  # cam3 is a local test sink
+        m.ZMQ_ADDRESS = 'tcp://127.0.0.1:28799'
         def config():
             original_config()
             p = Path(m.MEDIAMTX_CONFIG)
@@ -44,21 +45,26 @@ def run():
         m.generate_mediamtx_config = config
         try:
             assert m.start_mediamtx(), m.get_stream_status()
-            def source(camera, color):
+            def source(camera, color, tone=440):
                 cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
                        '-re', '-f', 'lavfi', '-i', f'color=c={color}:s=640x360:r=30',
-                       '-f', 'lavfi', '-i', 'sine=frequency=440:sample_rate=48000',
+                       '-f', 'lavfi', '-i', f'sine=frequency={tone}:sample_rate=48000',
                        '-c:v','libx264','-preset','ultrafast','-tune','zerolatency',
                        '-pix_fmt','yuv420p','-g','30','-c:a','aac','-ac','2',
                        '-f','flv',f'{m.RTMP_BASE}/{camera}']
                 return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            sources += [source('cam1', 'red'), source('cam2', 'blue')]
+            sources += [source('cam1', 'red'), source('cam2', 'blue', 660)]
             wait(lambda: m.get_camera_status()['cam1'] and m.get_camera_status()['cam2'])
             assert m.set_audio_source('active')[0]
             assert m.start_youtube_stream('cam3')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
             encoder_pid = m._youtube_proc.proc.pid
             print('PASS: encoder is producing frames', flush=True)
+            def metered():
+                levels = m.get_audio_levels()
+                return all(isinstance(levels.get(k), dict) and levels[k]['peak'] > -40 for k in ('cam1', 'cam2', 'program'))
+            wait(metered)
+            print(f"PASS: audio meters report live levels {m.get_audio_levels()}", flush=True)
             for camera in ['cam2', 'cam1', 'cam2']:
                 ok, message = m.switch_camera(camera)
                 assert ok, message
@@ -68,19 +74,29 @@ def run():
             assert m.set_audio_source('cam1')[0]
             assert m._youtube_proc.proc.pid == encoder_pid
             print('PASS: locked commentary audio preserves output encoder', flush=True)
-            assert m.get_stream_status()['audio_actual'] == 'cam1'
+            assert m.get_stream_status()['audio_on_air'] == ['cam1'], m.get_stream_status()
             sources[0].terminate()
             sources[0].wait(timeout=5)
             lost = time.monotonic()
-            wait(lambda: m.get_active_camera() == 'cam2' and m.get_stream_status()['audio_actual'] == 'camera'
+            wait(lambda: m.get_active_camera() == 'cam2' and m.get_stream_status()['audio_on_air'] == ['cam2']
                  and time.monotonic() - lost > 3, seconds=40)
             assert m.get_stream_status()['audio_warning'], m.get_stream_status()
             assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print(f'PASS: commentary loss keeps cam2 picture with its own audio ({time.monotonic() - lost:.1f}s)', flush=True)
             sources[0] = source('cam1', 'red')
-            wait(lambda: m.get_stream_status()['audio_actual'] == 'cam1' and m.get_active_camera() == 'cam2', seconds=40)
+            wait(lambda: m.get_stream_status()['audio_on_air'] == ['cam1'] and m.get_active_camera() == 'cam2', seconds=40)
             assert not m.get_stream_status()['audio_warning']
             print('PASS: commentary restored automatically when cam1 returns', flush=True)
+            assert m.set_mix('cam2', on=True, gain=0)[0]  # a new source: relay is rebuilt once
+            wait(lambda: sorted(m.get_stream_status()['audio_on_air']) == ['cam1', 'cam2'])
+            relay_pid = m._relay_proc.proc.pid
+            program = lambda: (m.get_audio_levels().get('program') or {}).get('peak', -120)
+            assert m.set_mix('cam1', on=False)[0] and m.set_mix('cam2', gain=-60)[0]
+            wait(lambda: program() < -60)
+            assert m.set_mix('cam2', gain=0)[0]
+            wait(lambda: program() > -30)
+            assert m._relay_proc.proc.pid == relay_pid and m._youtube_proc.proc.pid == encoder_pid
+            print('PASS: live mixing: mute and faders change program level without restarting', flush=True)
             sources[1].terminate()
             sources[1].wait(timeout=5)
             wait(lambda: m.get_active_camera() is None)
