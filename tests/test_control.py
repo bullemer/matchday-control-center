@@ -20,6 +20,8 @@ class ApiTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         for name, value in [('SCOREBOARD_DIR', self.tmp.name), ('SCOREBOARD_PATH',self.tmp.name+'/scoreboard.txt'), ('MATCH_PATH',Path(self.tmp.name)/'match.json')]:
             p=patch.object(a,name,value); p.start(); self.addCleanup(p.stop)
+        overlay_patch=patch.object(a, 'browser_overlay', a.BrowserOverlay(Path(self.tmp.name)/'overlay.png'))
+        overlay_patch.start(); self.addCleanup(overlay_patch.stop)
         self.old_score, self.old_clock = copy.deepcopy(a._scoreboard), copy.deepcopy(a._clock)
         self.addCleanup(lambda: a._scoreboard.update(self.old_score))
         self.addCleanup(lambda: a._clock.update(self.old_clock))
@@ -29,6 +31,19 @@ class ApiTests(unittest.TestCase):
 
     def post(self,url,body):
         return self.client.post(url,json=body,headers=self.headers)
+
+    def test_external_source_validation_persistence_and_builtin_restoration(self):
+        self.assertEqual(self.post('/api/scoreboard/update', {'source':'score67'}).status_code, 400)
+        self.assertEqual(self.post('/api/scoreboard/update', {'source':'other'}).status_code, 400)
+        result = self.post('/api/scoreboard/update', {'source':'score67', 'overlay_url':'https://score67.de/s/game?k=private&preview=1'})
+        self.assertEqual(result.status_code, 200)
+        self.assertEqual(Path(a.SCOREBOARD_PATH).read_text(), '')
+        a._scoreboard['source'] = 'builtin'
+        a._restore_match()
+        self.assertEqual(a._scoreboard['source'], 'score67')
+        self.assertEqual(a._scoreboard['overlay_url'], 'https://score67.de/s/game/overlay?k=private')
+        self.post('/api/scoreboard/update', {'source':'builtin', 'visible':True})
+        self.assertIn('HOME', Path(a.SCOREBOARD_PATH).read_text())
 
     def test_scoreboard_visibility_preserves_match_and_persists(self):
         self.post('/api/scoreboard/update',{'home_score':3})
@@ -410,10 +425,11 @@ class MediaTests(unittest.TestCase):
             cmd,_,_,_,_,_=m._relay_command('cam2',{'cam2':0.0})
             self.assertIn('scale=1920:1080',' '.join(cmd))
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
-            with patch.object(m,'Process') as proc,patch.object(m,'_youtube_stream_key','key'):
+            with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_youtube_stream_key','key'):
                 m._launch_encoder()
             enc=proc.call_args.args[0]
-            vf=enc[enc.index('-vf')+1]
+            self.assertEqual(enc[enc.index('-f')+1], 'image2')
+            vf=enc[enc.index('-filter_complex')+1]
             self.assertIn('scale=1920:1080',vf); self.assertIn('fontsize=42',vf)
             self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
 

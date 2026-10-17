@@ -42,6 +42,10 @@ source venv/bin/activate
 # Install on first run or when the pinned dependency file changes.
 if [ ! -f venv/.requirements-installed ] || ! cmp -s requirements.txt venv/.requirements-installed; then
     python -m pip install -q -r requirements.txt
+    if ! python -m playwright install chromium; then
+        echo "[WARN] Chromium installation failed; built-in scoring remains available."
+        echo "       Retry later: venv/bin/python -m playwright install chromium"
+    fi
     cp requirements.txt venv/.requirements-installed
 fi
 

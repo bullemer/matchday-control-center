@@ -1,6 +1,8 @@
 """Supervised local media pipeline. All control mutations share one lock."""
 from __future__ import annotations
 
+from browser_overlay import FRAME_PATH, ensure_frame
+
 import hashlib
 import json
 import logging
@@ -827,8 +829,12 @@ def _launch_encoder():
     vf = (f"scale={width}:{height},drawtext=textfile='{escaped}':reload=1:expansion=none:"
           f"fontcolor=white:fontsize={font}:box=1:boxcolor=black@0.6:boxborderw={font // 3}:"
           f"x={font * 2 // 3}:y=h-th-{font * 2 // 3}")
+    ensure_frame(FRAME_PATH)
+    # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
+    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=auto[vout]"
     cmd = _ffmpeg() + _input("program") + [
-        "-map", "0:v:0", "-map", "0:a:0", "-vf", vf,
+        "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
+        "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0",
         "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
         "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
         "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",

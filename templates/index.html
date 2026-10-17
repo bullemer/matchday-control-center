@@ -240,6 +240,7 @@
             <input type="checkbox" role="switch" data-scoreboard-visible checked class="overlay-switch"
                    onchange="setScoreboardVisible(this.checked)">Scoreboard on video
           </label></div>
+          <p data-scoreboard-source-status class="text-xs text-slate-300" role="status"></p>
           <div class="grid grid-cols-4 gap-2">
             <button onclick="adjustClock(-60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−1 min</button>
             <button onclick="adjustClock(-10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−10 s</button>
@@ -539,6 +540,19 @@
             <input type="checkbox" role="switch" data-scoreboard-visible checked class="overlay-switch"
                    onchange="setScoreboardVisible(this.checked)">Scoreboard on video
           </label></div>
+      <div class="mb-4 space-y-2">
+        <label for="scoreboard-source" class="block text-sm text-slate-300">Scoreboard source</label>
+        <select id="scoreboard-source" onchange="scoreboardSourceDirty=true; renderSourceForm()" class="w-full bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white">
+          <option value="builtin">Built-in scoreboard</option><option value="score67">Score67 OBS overlay</option>
+        </select>
+        <div id="score67-fields" hidden>
+          <label for="scoreboard-url" class="block text-sm text-slate-300 mb-2">Score67 OBS overlay link</label>
+          <input id="scoreboard-url" type="url" maxlength="2048" placeholder="https://score67.de/s/your-board/overlay" autocomplete="off" spellcheck="false" oninput="scoreboardSourceDirty=true" class="w-full bg-slate-900 border border-slate-600 rounded px-3 py-2 text-white">
+          <p class="text-xs text-slate-400 mt-2">Paste “Copy OBS overlay link” from Score67, including its private access key if present. Update scores and clock in Score67. Its design and position are preserved.</p>
+        </div>
+        <button id="scoreboard-source-save" onclick="saveScoreboardSource()" class="bg-brand-blue hover:bg-blue-600 text-white rounded px-4 py-2">Apply scoreboard source</button>
+      </div>
+      <p data-scoreboard-source-status class="text-sm text-slate-300 mb-3" role="status"></p>
       <!-- Score Controls -->
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
         <!-- Home Team -->
@@ -581,6 +595,8 @@
           </span>
         </div>
       </div>
+
+      <img id="score67-preview" hidden alt="Rendered Score67 overlay on a dark preview background" class="w-full bg-slate-900 rounded-lg mb-4">
 
       <!-- Match Clock -->
       <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
@@ -1244,6 +1260,27 @@
 
     // ──────────────────────── Scoreboard ────────────────────────
     let scoreboardVisible = true, visibilityPending = false;
+    let scoreboardSource = 'builtin', scoreboardSourceDirty = false, sourcePending = false;
+    function renderSourceForm() {
+      document.getElementById('score67-fields').hidden = document.getElementById('scoreboard-source').value !== 'score67';
+    }
+    async function saveScoreboardSource() {
+      if (sourcePending) return;
+      const source = document.getElementById('scoreboard-source').value;
+      const overlay_url = document.getElementById('scoreboard-url').value;
+      sourcePending = true;
+      document.getElementById('scoreboard-source-save').disabled = true;
+      try {
+        const result = await apiPost('/api/scoreboard/update', {source, overlay_url});
+        if (result) {
+          if (source === document.getElementById('scoreboard-source').value && overlay_url === document.getElementById('scoreboard-url').value) scoreboardSourceDirty = false;
+          applyScoreboard(result.scoreboard);
+        }
+      } finally {
+        sourcePending = false;
+        document.getElementById('scoreboard-source-save').disabled = false;
+      }
+    }
     function renderScoreboardVisibility() {
       document.querySelectorAll('[data-scoreboard-visible]').forEach(input => {
         input.checked = scoreboardVisible;
@@ -1306,6 +1343,27 @@
     function applyScoreboard(sb, updateVisibility = true) {
       if (updateVisibility) scoreboardVisible = sb.visible !== false;
       renderScoreboardVisibility();
+      scoreboardSource = sb.source || 'builtin';
+      if (!scoreboardSourceDirty) {
+        document.getElementById('scoreboard-source').value = scoreboardSource;
+        document.getElementById('scoreboard-url').value = sb.overlay_url || '';
+        renderSourceForm();
+      }
+      const external = scoreboardSource === 'score67';
+      const status = sb.overlay_status || {};
+      const message = external ? 'Score67 selected — scores and clock are controlled in Score67. ' +
+        (!scoreboardVisible ? 'Hidden on video.' : status.state === 'ready' ? 'Overlay ready.' : ['error', 'stale'].includes(status.state) ? status.message : 'Loading overlay…') : '';
+      document.querySelectorAll('[data-scoreboard-source-status]').forEach(el => el.textContent = message);
+      // Local controls cannot change a scoreboard supplied by Score67.
+      document.querySelectorAll('[onclick], #home-name, #away-name').forEach(el => {
+        if (el.matches('#home-name, #away-name') || /^(adjustScore|renameTeam|clockAction|adjustClock|toggleClock|openClockEditor)\(/.test(el.getAttribute('onclick') || '')) {
+          el.disabled = external;
+          el.style.opacity = external ? '.4' : '';
+        }
+      });
+      const preview = document.getElementById('score67-preview');
+      preview.hidden = !external || !scoreboardVisible || !['ready', 'stale'].includes(status.state);
+      if (!preview.hidden && !state.matchMode) preview.src = '/api/scoreboard/preview?t=' + Date.now();
       state.homeScore = sb.home_score;
       state.awayScore = sb.away_score;
       bind('home_score', state.homeScore);
@@ -1329,6 +1387,10 @@
     function renderScoreboardPreview(home, hs, away, as, clock) {
       if (!scoreboardVisible) {
         document.getElementById('scoreboard-preview').textContent = 'Scoreboard hidden on video — scores and clock continue.';
+        return;
+      }
+      if (scoreboardSource === 'score67') {
+        document.getElementById('scoreboard-preview').textContent = 'Score67 OBS overlay · final stream output';
         return;
       }
       document.getElementById('scoreboard-preview').innerHTML =

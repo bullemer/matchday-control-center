@@ -130,6 +130,37 @@ chosen composition when it returns. Main-camera loss uses the existing program f
 Layout changes replace the relay while keeping the YouTube encoder alive; fallback may
 briefly appear during replacement. Layout selections are kept for the current app session.
 
+## Scoreboard sources
+
+“Scoreboard on video” in Match mode or Setup hides/shows the selected scoreboard
+without stopping the stream. Scores and clocks keep running while hidden.
+In Setup → Scoreboard & Match Clock, choose **Built-in scoreboard** or
+**Score67 OBS overlay**, then click **Apply scoreboard source**.
+
+For Score67, paste its “Copy OBS overlay link”, for example
+`https://score67.de/s/your-board/overlay`. Keep the `k` access key on private links.
+The viewer link is also accepted and converted to an overlay link. Position, view,
+language and delay options are preserved; `preview=1` is removed for transparency.
+Control the external scores, clock and design in Score67. The local match controls
+are disabled while that source is selected. The master visibility switch works
+with both sources, and the choice/link are saved locally with the match.
+
+A headless Chromium browser renders Score67 at its OBS viewport (1920 × 1080).
+Transparent frames refresh about twice per second and are scaled onto the final
+stream, including PiP/split layouts. This suits a scoreboard clock; it is not a
+full-frame-rate browser animation source. The authenticated preview in Setup shows
+the rendered overlay; the camera/program previews remain before the scoreboard.
+Chromium closes when Score67 is hidden or deselected. A failed page is cleared and
+retried automatically; lost state updates show a connection warning while Score67
+keeps the last received scores. Score67's own hidden/no-match state also produces
+an empty overlay.
+
+`start.sh` installs the pinned Playwright runtime and Chromium when dependencies
+change. Manual setup: `venv/bin/python -m playwright install chromium`.
+If Chromium reports missing system libraries, install its platform prerequisites.
+Built-in scoring and video streaming still work if the browser cannot start.
+The private link is stored in `data/match.json` (mode 600); do not share that file.
+
 ## API
 
 All routes require the operator login. POST requests require JSON objects and reject
@@ -148,9 +179,10 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/layout` | `mode`: single/pip/split, `main`, `secondary`, `position`: top-left/top-right/bottom-left/bottom-right |
 | POST | `/api/audio-source` | `mode`: `cam1`, `active`, or `usb:<device id>` |
 | GET | `/api/audio/devices` | Audio devices |
-| POST | `/api/scoreboard/update` | Names/scores, or atomic `team` + `delta` adjustment |
+| POST | `/api/scoreboard/update` | Names/scores, atomic `team` + `delta`, `visible`, `source` (builtin/score67), `overlay_url` |
 | POST | `/api/scoreboard/clock` | `action`: start/pause/reset/set_half; `half`: 1 or 2 |
-| GET | `/api/scoreboard` | Match state |
+| GET | `/api/scoreboard` | Match state and overlay render status |
+| GET | `/api/scoreboard/preview` | Authenticated transparent Score67 PNG |
 
 Network/audio/firewall diagnostics are collected in a shared background worker;
 opening additional dashboards does not start additional probe subprocesses.
@@ -177,3 +209,6 @@ A real venue rehearsal is still required for physical USB tethering, AP driver/P
 behavior, microphone capture, phone WebRTC compatibility, and YouTube reception.
 Local recording, audio meters, QR onboarding, and adaptive bandwidth control remain
 possible future features; they are not implemented by this reliability repair.
+
+Optional browser/encoder integration check: `venv/bin/python tests/overlay_smoke.py`.
+Pass a local `score67-de/backend` path to exercise its actual OBS template and scripts.

@@ -356,3 +356,28 @@ test('operator can apply PiP and side-by-side layouts with separate cameras', as
   await expect(page.locator('#layout-editor')).not.toBeVisible();
   expect(sent[1]).toEqual({mode:'split',main:'cam2',secondary:'cam3',position:'top-right'});
 });
+
+test('Score67 source keeps edits, preserves private keys and uses the master switch', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  try {
+    await page.locator('#scoreboard-source').selectOption('score67');
+    await page.locator('#scoreboard-url').fill('https://score67.de/s/test?k=private&pos=tr&preview=1');
+    await page.waitForTimeout(2200);
+    await expect(page.locator('#scoreboard-source')).toHaveValue('score67');
+    await page.locator('#scoreboard-source-save').click();
+    await expect(page.locator('#scoreboard-url')).toHaveValue('https://score67.de/s/test/overlay?k=private&pos=tr');
+    await expect(page.locator('#home-name')).toBeDisabled();
+    await expect(page.locator('[data-scoreboard-source-status]').last()).toContainText('controlled in Score67');
+    const toggle = page.locator('[data-scoreboard-visible]').last();
+    await toggle.uncheck();
+    await expect(page.locator('#scoreboard-preview')).toContainText('hidden on video');
+    await toggle.check();
+    await expect(page.locator('#scoreboard-preview')).toContainText('Score67 OBS overlay');
+    await page.setViewportSize({width:390,height:844});
+    expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+    await page.screenshot({path:'/tmp/mcc-score67-settings.png',fullPage:true});
+  } finally {
+    await page.request.post('/api/scoreboard/update',{data:{source:'builtin',visible:true,overlay_url:''}});
+  }
+});

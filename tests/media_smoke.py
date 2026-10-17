@@ -27,6 +27,7 @@ def run():
     original_config = m.generate_mediamtx_config
     with tempfile.TemporaryDirectory() as tmp:
         m.MEDIAMTX_CONFIG = tmp + '/mediamtx.json'
+        m.FRAME_PATH = Path(tmp) / 'overlay.png'
         m.SCOREBOARD_PATH = tmp + '/scoreboard.txt'
         Path(m.SCOREBOARD_PATH).write_text('TEST 0 - 0 TEST | 00:00')
         m.RTMP_BASE = 'rtmp://127.0.0.1:21935'

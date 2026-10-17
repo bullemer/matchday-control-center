@@ -21,7 +21,11 @@ import threading
 import time
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, render_template, request, send_file
+
+from browser_overlay import BrowserOverlay, normalize_url
+
+browser_overlay = BrowserOverlay()
 
 import atexit
 import json
@@ -108,6 +112,8 @@ _scoreboard = {
     "away_name": "AWAY",
     "away_score": 0,
     "visible": True,
+    "source": "builtin",
+    "overlay_url": "",
 }
 
 _clock_lock = _scoreboard_lock
@@ -148,7 +154,7 @@ def _write_scoreboard_locked():
     with _clock_lock:
         clock_str = _format_clock(_clock_elapsed())
 
-    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if _scoreboard["visible"] else ""
+    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if _scoreboard["visible"] and _scoreboard["source"] == "builtin" else ""
 
     try:
         if Path(SCOREBOARD_PATH).read_text() == text:
@@ -180,6 +186,7 @@ def _get_scoreboard_state():
         sb["clock_running"] = _clock["running"]
         sb["clock_elapsed_secs"] = round(elapsed, 1)
         sb["half"] = _clock["half"]
+    sb["overlay_status"] = browser_overlay.status()
     return sb
 
 # ---------------------------------------------------------------------------
@@ -444,6 +451,12 @@ def api_scoreboard_update():
     data = request.get_json(force=True, silent=True) or {}
 
     updates = {}
+    if "source" in data:
+        if data["source"] not in ("builtin", "score67"):
+            raise ValueError("Choose built-in or Score67 scoreboard")
+        updates["source"] = data["source"]
+    if "overlay_url" in data:
+        updates["overlay_url"] = normalize_url(data["overlay_url"])
     if "visible" in data:
         if type(data["visible"]) is not bool:
             raise ValueError("visible must be true or false")
@@ -464,11 +477,15 @@ def api_scoreboard_update():
                 raise ValueError("Score adjustment requires team and delta (+1 or -1)")
             key = data["team"] + "_score"
             updates[key] = max(0, min(999, _scoreboard[key] + data["delta"]))
+        candidate = dict(_scoreboard, **updates)
+        if candidate["source"] == "score67" and not candidate["overlay_url"]:
+            raise ValueError("Paste the Score67 OBS overlay link first")
         _scoreboard.update(updates)
+        browser_overlay.configure(_scoreboard["source"], _scoreboard["visible"], _scoreboard["overlay_url"])
 
     _write_scoreboard_file()
     _save_match()
-    log.info("Scoreboard updated: %s", _get_scoreboard_state())
+    log.info("Scoreboard updated (source=%s, visible=%s)", _scoreboard["source"], _scoreboard["visible"])
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
 
@@ -552,6 +569,12 @@ def api_scoreboard_clock():
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
 
+@app.route("/api/scoreboard/preview", methods=["GET"])
+@api_endpoint
+def api_scoreboard_preview():
+    return send_file(browser_overlay.path, mimetype="image/png", conditional=False)
+
+
 @app.route("/api/scoreboard", methods=["GET"])
 @api_endpoint
 def api_scoreboard_get():
@@ -600,6 +623,10 @@ def _restore_match():
         elapsed = float(state["clock_elapsed_secs"])
         if not math.isfinite(elapsed) or elapsed < 0 or state["half"] not in (1, 2):
             raise ValueError("Invalid persisted clock")
+        state.setdefault("source", "builtin")
+        state["overlay_url"] = normalize_url(state.get("overlay_url", ""))
+        if state["source"] not in ("builtin", "score67") or (state["source"] == "score67" and not state["overlay_url"]):
+            raise ValueError("Invalid persisted scoreboard source")
         state.setdefault("visible", True)  # saved matches from before the visibility control
         if type(state["visible"]) is not bool:
             raise ValueError("Invalid persisted scoreboard visibility")
@@ -657,6 +684,8 @@ def initialize():
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     _restore_match()
+    browser_overlay.start()
+    browser_overlay.configure(_scoreboard["source"], _scoreboard["visible"], _scoreboard["overlay_url"])
     _write_scoreboard_file()
     for target in (_overlay_worker, _diagnostics_worker, _background_init):
         worker = threading.Thread(target=target, daemon=True)
@@ -670,6 +699,7 @@ def shutdown():
         worker.join(timeout=2)
     with _init_lock:
         shutdown_all()
+    browser_overlay.stop()
     _save_match()
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ a._refresh_network=lambda: None
 a.get_audio_levels=lambda: {'cam1':{'peak':-12.0,'rms':-20.0},'cam2':'no audio',
     'usb:alsa_input.usb-test':{'peak':-30.0,'rms':-38.0},'program':{'peak':-0.5,'rms':-9.0}}
 with tempfile.TemporaryDirectory() as tmp:
+    a.browser_overlay=a.BrowserOverlay(Path(tmp)/'overlay.png')
     a.SCOREBOARD_DIR=tmp
     a.SCOREBOARD_PATH=tmp+'/scoreboard.txt'
     a.MATCH_PATH=Path(tmp)/'match.json'
