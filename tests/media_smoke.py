@@ -60,6 +60,34 @@ def run():
             wait(lambda: m.get_stream_status()['state'] == 'live')
             encoder_pid = m._youtube_proc.proc.pid
             print('PASS: encoder is producing frames', flush=True)
+            def picture():
+                result = subprocess.run(['ffmpeg','-v','error','-rtsp_transport','tcp','-timeout','5000000',
+                    '-i',f'{m.RTSP_BASE}/program','-an','-frames:v','1','-vf','scale=160:90',
+                    '-pix_fmt','rgb24','-f','rawvideo','-'],capture_output=True,timeout=15)
+                assert result.returncode == 0, result.stderr
+                assert len(result.stdout) == 160*90*3
+                return result.stdout
+            def pixel(frame,x,y):
+                i=(y*160+x)*3
+                return frame[i:i+3]
+            for mode in ('pip','split'):
+                assert m.set_layout(mode,'cam1','cam2')[0],m.get_stream_status()
+                frame=picture()
+                red=pixel(frame,40,70 if mode=='pip' else 45)
+                blue=pixel(frame,120,22 if mode=='pip' else 45)
+                assert red[0]>150 and red[2]<80,(mode,red)
+                assert blue[2]>150 and blue[0]<80,(mode,blue)
+                assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running()
+                print(f'PASS: {mode} shows both cameras in the expected positions without restarting output',flush=True)
+            sources[1].terminate(); sources[1].wait(timeout=5)
+            wait(lambda: m.get_stream_status()['secondary_camera'] is None and bool(m.get_stream_status()['layout_warning']),seconds=40)
+            assert m.get_active_camera()=='cam1' and m._youtube_proc.proc.pid==encoder_pid
+            print('PASS: missing second camera falls back to main-only output',flush=True)
+            sources[1]=source('cam2','blue',660)
+            wait(lambda:m.get_stream_status()['secondary_camera']=='cam2',seconds=40)
+            assert m._youtube_proc.proc.pid==encoder_pid
+            print('PASS: returning second camera restores the selected layout',flush=True)
+            assert m.set_layout('single','cam1','cam2')[0]
             def metered():
                 levels = m.get_audio_levels()
                 return all(isinstance(levels.get(k), dict) and levels[k]['peak'] > -40 for k in ('cam1', 'cam2', 'program'))

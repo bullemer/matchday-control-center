@@ -10,6 +10,8 @@ import subprocess
 import threading
 import time
 
+import requests
+
 logger = logging.getLogger(__name__)
 REQUIRED_TCP_PORTS = [5000, 1935, 8888, 8889]
 REQUIRED_UDP_PORTS = [8189]
@@ -68,6 +70,22 @@ def _is_usb_device(dev):
 def _device_ip(dev):
     ok, ip = run_cmd(["nmcli", "-g", "IP4.ADDRESS", "device", "show", dev])
     return ip.splitlines()[0].split("/")[0] if ok and ip else None
+
+
+def _internet_available():
+    # ICMP may be blocked or unavailable to an unprivileged app even with working
+    # internet. A verified HTTPS response also confirms external connectivity;
+    # an HTTP error is a service response, not evidence of an offline network.
+    ok, _ = run_cmd(["ping", "-c", "1", "-W", "1", "8.8.8.8"], timeout=2)
+    if ok:
+        return True
+    for url in ("https://www.youtube.com/", "https://www.cloudflare.com/"):
+        try:
+            with requests.head(url, timeout=2, allow_redirects=False):
+                return True
+        except requests.RequestException:
+            continue
+    return False
 
 
 def get_network_status():
@@ -129,9 +147,8 @@ def get_network_status():
             info["uplink"] = info["lan_name"] or dev
         else:
             info["uplink"] = dev
-    # A route-independent ping is only general connectivity, not proof of a tether uplink.
-    ok, _ = run_cmd(["ping", "-c", "1", "-W", "1", "8.8.8.8"], timeout=2)
-    info["internet_ok"] = ok
+    # General internet connectivity is independent of which uplink is selected.
+    info["internet_ok"] = _internet_available()
     return info
 
 

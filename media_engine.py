@@ -44,6 +44,9 @@ _thread = None
 _encoder_thread = None
 _mediamtx_proc = _youtube_proc = _relay_proc = None
 _active_camera = None
+_layout = {"mode": "single", "main": "cam1", "secondary": "cam2", "position": "top-right"}
+_relay_secondary = None
+_layout_warning = ""
 # Audio mixer. Channels are the cameras and detected microphones ("usb:<device id>");
 # each has on/off and a gain in dB. With _follow, only the on-air camera's channel is on
 # among the cameras (its sound follows the cut). Gains change live over ZMQ; switching a
@@ -424,6 +427,9 @@ def get_stream_status():
     return {"active": active, "state": state,
             "active_camera": get_active_camera(), "selected_camera": _active_camera,
             "pending_camera": _pending_camera,
+            "layout": dict(_layout),
+            "secondary_camera": _relay_secondary if get_active_camera() else None,
+            "layout_warning": _layout_warning if _relay_proc else "",
             "audio_source": get_audio_source(),
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
@@ -470,8 +476,28 @@ def _db_to_volume(db):
     return 10 ** (db / 20)
 
 
+def _video_filters(width, height, secondary_index, layout):
+    def fit(pad, w, h, label):
+        return (f"[{pad}]setpts=PTS-STARTPTS,scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30[{label}]")
+    if secondary_index is None or layout["mode"] == "single":
+        return [fit("0:v:0", width, height, "vout")]
+    if layout["mode"] == "split":
+        left = width // 4 * 2  # keep both halves even at 854px width
+        return [fit("0:v:0", left, height, "left"),
+                fit(f"{secondary_index}:v:0", width-left, height, "right"),
+                "[left][right]hstack=inputs=2:shortest=0[vout]"]
+    inset_w, inset_h = width // 4 * 2, height // 4 * 2
+    x = "W-w-16" if layout["position"].endswith("right") else "16"
+    y = "H-h-16" if layout["position"].startswith("bottom") else "16"
+    return [fit("0:v:0", width, height, "main"),
+            fit(f"{secondary_index}:v:0", inset_w, inset_h, "inset"),
+            f"[main][inset]overlay=x={x}:y={y}:eof_action=pass:repeatlast=0[vout]"]
+
+
 def _relay_command(cam, wanted):
-    """Return (command, {channel: volume filter}, missing channels, warning) for cutting
+    """Return command, channel filters, missing audio, audio warning, second camera,
+    and video warning for cutting
     to cam with the wanted {channel: gain dB} mix. Only missing video is fatal: if no
     wanted audio source is available, the camera's own sound (or silence) is used so the
     picture never goes to fallback because of a microphone."""
@@ -480,6 +506,24 @@ def _relay_command(cam, wanted):
         raise ValueError(f"{cam} has no video")
     cmd = _ffmpeg() + _input(cam)
     sources, missing, notes, next_input = [], set(), [], 1
+    layout = dict(_layout)
+    secondary, secondary_index, video_warning = None, None, ""
+    inputs_by_camera = {cam: (0, tracks)}
+    if layout["mode"] != "single":
+        selected = layout["secondary"]
+        if selected == cam:
+            raise ValueError("Choose different main and second cameras")
+        try:
+            secondary_tracks = _probe(selected)
+        except ValueError:
+            secondary_tracks = set()
+        if "video" in secondary_tracks:
+            secondary, secondary_index = selected, next_input
+            inputs_by_camera[selected] = (next_input, secondary_tracks)
+            cmd += _input(selected)
+            next_input += 1
+        else:
+            video_warning = f"{selected} is offline — showing main camera only"
     for channel, gain in wanted.items():
         if channel == cam:
             if "audio" in tracks:
@@ -487,6 +531,13 @@ def _relay_command(cam, wanted):
             else:
                 missing.add(channel)
                 notes.append(f"{cam} has no audio")
+        elif channel in inputs_by_camera:
+            index, channel_tracks = inputs_by_camera[channel]
+            if "audio" in channel_tracks:
+                sources.append((channel, f"{index}:a:0", gain))
+            else:
+                missing.add(channel)
+                notes.append(f"{channel} has no audio")
         elif channel in CAMERA_IDS:
             if _channel_available(channel):
                 sources.append((channel, f"{next_input}:a:0", gain))
@@ -525,12 +576,12 @@ def _relay_command(cam, wanted):
                  f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0,"
                  f"azmq=bind_address={address}[aout]")
     width, height, _, bitrate = PROFILES[_profile]
-    return cmd + ["-filter_complex", ";".join(parts), "-map", "0:v:0", "-map", "[aout]",
-        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+    parts += _video_filters(width, height, secondary_index, layout)
+    return cmd + ["-filter_complex", ";".join(parts), "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
         "-c:a", "aac", "-ar", "48000", "-ac", "2",
-        "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"], channels, missing, warning
+        "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"], channels, missing, warning, secondary, video_warning
 
 
 def _send_volume(name, volume):
@@ -590,14 +641,14 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
 
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
-    global _relay_failures, _relay_profile, _relay_muted
+    global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
     wanted, profile = _effective_mix(cam_id), _profile
     try:
         # Probe and validate before disturbing the current publisher.
-        cmd, channels, missing, warning = _relay_command(cam_id, wanted)
+        cmd, channels, missing, warning, secondary, video_warning = _relay_command(cam_id, wanted)
     except Exception as exc:
         if current():
             _error = str(exc)
@@ -619,6 +670,8 @@ def _replace_relay(cam_id, generation):
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
             _relay_muted = set()
+            _relay_secondary, _layout_warning = secondary, video_warning
+            _layout = {**_layout, "main": cam_id}
             _error, _relay_failures = "", 0
     if installed:
         if warning:
@@ -632,6 +685,44 @@ def _replace_relay(cam_id, generation):
     # camera is publishing, and program shows fallback meanwhile.
     _error = message
     return False, message
+
+
+def set_layout(mode, main, secondary="cam2", position="top-right"):
+    """Configure composition; replace only the relay, keeping the output encoder alive."""
+    global _layout, _generation, _pending_camera, _active_camera
+    if mode not in ("single", "pip", "split"):
+        return False, "Choose full-screen, picture-in-picture, or side-by-side"
+    if main not in CAMERA_IDS or secondary not in CAMERA_IDS:
+        return False, "Invalid camera"
+    if mode != "single" and main == secondary:
+        return False, "Choose different main and second cameras"
+    if position not in ("top-left", "top-right", "bottom-left", "bottom-right"):
+        return False, "Invalid picture-in-picture position"
+    with _lock:
+        token = _stop_generation
+        _generation += 1
+        generation = _generation
+        _pending_camera = main
+    with _switch_lock:
+        with _lock:
+            if token != _stop_generation or generation != _generation:
+                return False, SUPERSEDED
+            previous = _layout
+            _layout = dict(mode=mode, main=main, secondary=secondary, position=position)
+            if _relay_proc is None and not _camera_status.get(main):
+                _active_camera = main
+                _pending_camera = None
+                return True, "Layout saved; waiting for the main camera"
+        try:
+            ok, message = _replace_relay(main, generation)
+            with _lock:
+                if not ok and generation == _generation:
+                    _layout = previous
+            return (True, "Layout applied") if ok else (False, message)
+        finally:
+            with _lock:
+                if generation == _generation:
+                    _pending_camera = None
 
 
 def _apply_mix():
@@ -796,7 +887,10 @@ def _start_youtube_stream(stream_key, profile, token):
         if token != _stop_generation:
             return False, SUPERSEDED
         preferred = [_active_camera] if _active_camera else []
-        camera = next((c for c in preferred + CAMERA_IDS if live.get(c)), None)
+        if _layout["mode"] != "single":
+            preferred = [_layout["main"]]
+        candidates = preferred if _layout["mode"] != "single" else preferred + CAMERA_IDS
+        camera = next((c for c in candidates if live.get(c)), None)
         if camera is None:
             return False, "No camera is publishing"
         ok, message = switch_camera(camera, expected_stop=token)
@@ -821,7 +915,7 @@ def _start_youtube_stream(stream_key, profile, token):
 def stop_youtube_stream():
     global _want_stream, _youtube_proc, _relay_proc, _active_camera, _generation
     global _youtube_stream_key, _state, _error, _started_at, _pending_camera
-    global _relay_channels, _relay_missing, _relay_muted, _stop_generation
+    global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
     with _lock:
         _want_stream = False
         _stop_generation += 1
@@ -831,6 +925,7 @@ def stop_youtube_stream():
         _active_camera = _youtube_stream_key = _started_at = _pending_camera = None
         _relay_channels, _relay_missing, _relay_muted = {}, set(), set()
         _state, _error = "stopped", ""
+        _relay_secondary, _layout_warning = None, ""
     _kill_process(encoder)
     _kill_process(relay)
     return True, "Streaming stopped"
@@ -864,7 +959,9 @@ def _supervise_relay(now):
         lost = [c for c in channels if c != camera and (
             (c in CAMERA_IDS and not _camera_status.get(c)) or (c.startswith("usb:") and c[4:] not in _mic_ids))]
         returned = [c for c in missing if c != camera and c in _mix and _channel_available(c)] if missing else []
-        if lost or returned:
+        secondary = _layout["secondary"] if _layout["mode"] != "single" else None
+        video_changed = secondary and bool(_camera_status.get(secondary)) != bool(_relay_secondary)
+        if lost or returned or video_changed:
             _restore_check_at = now + 10
             logger.info("Rebuilding audio on %s (lost %s, returned %s)", camera, lost, returned)
             switch_camera(camera, automatic=True)

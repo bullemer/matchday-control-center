@@ -30,6 +30,45 @@ class ApiTests(unittest.TestCase):
     def post(self,url,body):
         return self.client.post(url,json=body,headers=self.headers)
 
+    def test_scoreboard_visibility_preserves_match_and_persists(self):
+        self.post('/api/scoreboard/update',{'home_score':3})
+        self.post('/api/scoreboard/clock',{'action':'set','seconds':123})
+        self.post('/api/scoreboard/clock',{'action':'start'})
+        response=self.post('/api/scoreboard/update',{'visible':False})
+        self.assertEqual(response.status_code,200)
+        self.assertFalse(response.json['scoreboard']['visible'])
+        self.assertTrue(response.json['scoreboard']['clock_running'])
+        self.assertEqual(Path(a.SCOREBOARD_PATH).read_text(),'')
+        self.post('/api/scoreboard/update',{'team':'home','delta':1})
+        a._write_scoreboard_file()
+        self.assertEqual(Path(a.SCOREBOARD_PATH).read_text(),'')
+        a._scoreboard['visible']=True
+        a._restore_match()
+        self.assertFalse(a._scoreboard['visible'])
+        self.assertEqual(a._scoreboard['home_score'],4)
+        self.post('/api/scoreboard/update',{'visible':True})
+        self.assertIn('4 - 0',Path(a.SCOREBOARD_PATH).read_text())
+        self.assertIn('02:03',Path(a.SCOREBOARD_PATH).read_text())
+        for value in ('false',0,None):
+            self.assertEqual(self.post('/api/scoreboard/update',{'visible':value}).status_code,400)
+
+    def test_legacy_match_defaults_to_visible(self):
+        state=a._get_scoreboard_state()
+        state.pop('visible')
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._scoreboard['visible']=False
+        a._restore_match()
+        self.assertTrue(a._scoreboard['visible'])
+
+    def test_layout_api_validates_and_applies(self):
+        with patch.object(a,'set_layout',return_value=(True,'Layout applied')) as layout:
+            response=self.post('/api/layout',{'mode':'pip','main':'cam1','secondary':'cam2'})
+            self.assertEqual(response.status_code,200)
+            layout.assert_called_once_with('pip','cam1','cam2','top-right')
+            self.assertEqual(self.post('/api/layout',{'mode':'split','main':'cam1','secondary':'cam1'}).status_code,400)
+            self.assertEqual(self.post('/api/layout',{'mode':'wrong','main':'cam1'}).status_code,400)
+            self.assertEqual(self.post('/api/layout',{'mode':'pip','main':'cam1','position':'wrong'}).status_code,400)
+
     def test_auth_and_origin(self):
         self.assertEqual(self.client.get('/api/status').status_code,401)
         r=self.client.post('/api/stream/stop',json={},headers={**self.headers,'Origin':'https://evil.invalid'})
@@ -137,6 +176,20 @@ class ApiTests(unittest.TestCase):
 
 
 class NetworkTests(unittest.TestCase):
+    def test_https_confirms_internet_when_ping_is_blocked(self):
+        with patch.object(n,'run_cmd',return_value=(False,'ping unavailable')), patch.object(n.requests,'head') as head:
+            self.assertTrue(n._internet_available())
+            head.assert_called_once_with('https://www.youtube.com/',timeout=2,allow_redirects=False)
+
+    def test_internet_uses_second_https_host_if_first_unreachable(self):
+        with patch.object(n,'run_cmd',return_value=(False,'')), patch.object(n.requests,'head',side_effect=[n.requests.Timeout(),MagicMock()]) as head:
+            self.assertTrue(n._internet_available())
+            self.assertEqual(head.call_count,2)
+
+    def test_offline_requires_all_connectivity_probes_to_fail(self):
+        with patch.object(n,'run_cmd',return_value=(False,'')), patch.object(n.requests,'head',side_effect=n.requests.ConnectionError()):
+            self.assertFalse(n._internet_available())
+
     def test_stop_does_not_disconnect_unowned_wifi(self):
         with patch.object(n,'_owned_uuid',return_value=None),patch.object(n,'run_cmd') as run:
             self.assertFalse(n.stop_hotspot()[0])
@@ -305,19 +358,19 @@ class MediaTests(unittest.TestCase):
         def probe(cam):
             return {'video'} if cam == 'cam1' else {'video', 'audio'}
         with patch.object(m,'_probe',side_effect=probe):
-            cmd, channels, missing, warning = m._relay_command('cam2',{'cam1':0.0})
+            cmd, channels, missing, warning, _, _ = m._relay_command('cam2',{'cam1':0.0})
         self.assertEqual((list(channels),missing),(['cam2'],{'cam1'}))
         self.assertIn('Cam 1 commentary unavailable',warning)
         self.assertEqual(cmd.count('-i'),2)  # camera + generated silence base
         with patch.object(m,'_probe',return_value={'video'}):
-            cmd, channels, missing, warning = m._relay_command('cam1',{'cam1':0.0})
+            cmd, channels, missing, warning, _, _ = m._relay_command('cam1',{'cam1':0.0})
         self.assertEqual(channels,{})
         self.assertIn('broadcasting silence',warning)
         self.assertIn('anullsrc=r=48000:cl=stereo',cmd)
 
     def test_mix_graph_uses_each_source_once_with_gain(self):
         with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_usb_device_available',return_value=True):
-            cmd, channels, missing, _ = m._relay_command('cam2',{'cam2':-6.0,'cam1':0.0,'usb:alsa_input.mic':-60.0})
+            cmd, channels, missing, _, _, _ = m._relay_command('cam2',{'cam2':-6.0,'cam1':0.0,'usb:alsa_input.mic':-60.0})
         graph=cmd[cmd.index('-filter_complex')+1]
         self.assertEqual(channels,{'cam2':'m0','cam1':'m1','usb:alsa_input.mic':'m2'})
         self.assertIn('[0:a:0]',graph); self.assertIn('[1:a:0]',graph); self.assertIn('[2:a:0]',graph)
@@ -328,7 +381,7 @@ class MediaTests(unittest.TestCase):
 
     def test_missing_usb_mic_degrades(self):
         with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_usb_device_available',return_value=False):
-            _, channels, _, warning = m._relay_command('cam2',{'usb:hw:1,0':0.0})
+            _, channels, _, warning, _, _ = m._relay_command('cam2',{'usb:hw:1,0':0.0})
         self.assertEqual(list(channels),['cam2'])
         self.assertIn('USB microphone unavailable',warning)
 
@@ -354,7 +407,7 @@ class MediaTests(unittest.TestCase):
 
     def test_1080p_profile_end_to_end_resolution(self):
         with patch.object(m,'_profile','1080p'),patch.object(m,'_probe',return_value={'video','audio'}):
-            cmd,_,_,_=m._relay_command('cam2',{'cam2':0.0})
+            cmd,_,_,_,_,_=m._relay_command('cam2',{'cam2':0.0})
             self.assertIn('scale=1920:1080',' '.join(cmd))
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
             with patch.object(m,'Process') as proc,patch.object(m,'_youtube_stream_key','key'):
@@ -399,6 +452,74 @@ class MediaTests(unittest.TestCase):
         proc.secret='SECRET';proc.error=''
         proc._read(io.StringIO('failed rtmp://host/SECRET\n'),False)
         self.assertNotIn('SECRET',proc.error)
+
+class LayoutTests(unittest.TestCase):
+    def test_pip_reuses_secondary_for_audio(self):
+        layout=dict(mode='pip',main='cam1',secondary='cam2',position='top-right')
+        with patch.object(m,'_layout',layout),patch.object(m,'_probe',return_value={'video','audio'}):
+            cmd, channels, _, _, secondary, warning=m._relay_command('cam1',{'cam2':0.0})
+        self.assertEqual(cmd.count(m.RTSP_BASE+'/cam2'),1)
+        self.assertEqual(secondary,'cam2')
+        self.assertFalse(warning)
+        graph=cmd[cmd.index('-filter_complex')+1]
+        self.assertIn('overlay=x=W-w-16:y=16',graph)
+        self.assertIn('[1:a:0]',graph)
+        self.assertEqual(list(channels),['cam2'])
+
+    def test_offline_second_camera_keeps_main_video(self):
+        def probe(cam):
+            if cam=='cam2': raise ValueError('offline')
+            return {'video','audio'}
+        with patch.object(m,'_layout',dict(mode='split',main='cam1',secondary='cam2',position='top-right')),patch.object(m,'_probe',side_effect=probe):
+            cmd,_,_,_,secondary,warning=m._relay_command('cam1',{'cam1':0})
+        self.assertIsNone(secondary)
+        self.assertIn('main camera only',warning)
+        self.assertNotIn('hstack',' '.join(cmd))
+        self.assertIn('[vout]',' '.join(cmd))
+
+    def test_stop_cancels_queued_layout_change(self):
+        entered, gate=threading.Event(),threading.Lock()
+        class WaitingLock:
+            def __enter__(self): entered.set(); gate.acquire()
+            def __exit__(self,*args): gate.release()
+        gate.acquire()
+        results=[]
+        previous=dict(m._layout)
+        with patch.object(m,'_switch_lock',WaitingLock()),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None),patch.object(m,'_stop_generation',0),patch.object(m,'_replace_relay') as replace:
+            worker=threading.Thread(target=lambda:results.append(m.set_layout('pip','cam1','cam2')))
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(2))
+                # STOP invalidates pending work without waiting on the composition lock.
+                with m._lock:
+                    m._stop_generation+=1; m._generation+=1; m._pending_camera=None
+            finally:
+                gate.release(); worker.join(3)
+            self.assertEqual(results,[(False,m.SUPERSEDED)])
+            replace.assert_not_called()
+            self.assertEqual(m._layout,previous)
+
+    def test_invalid_pair_does_not_change_layout_or_relay(self):
+        before=dict(m._layout)
+        with patch.object(m,'_replace_relay') as replace:
+            self.assertFalse(m.set_layout('pip','cam1','cam1')[0])
+            self.assertFalse(m.set_layout('bad','cam1','cam2')[0])
+            self.assertFalse(m.set_layout('pip','cam1','cam2','bad')[0])
+            replace.assert_not_called()
+        self.assertEqual(m._layout,before)
+
+    def test_failed_layout_restores_previous_configuration(self):
+        previous=dict(mode='single',main='cam1',secondary='cam2',position='top-right')
+        with patch.object(m,'_layout',previous),patch.object(m,'_relay_proc',MagicMock()),patch.object(m,'_replace_relay',return_value=(False,'No video')),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None):
+            self.assertFalse(m.set_layout('split','cam1','cam2')[0])
+            self.assertEqual(m._layout,previous)
+
+    def test_offline_main_can_be_configured_before_cameras_connect(self):
+        with patch.object(m,'_layout',dict(m._layout)),patch.object(m,'_relay_proc',None),patch.object(m,'_camera_status',{}),patch.object(m,'_active_camera',None),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None):
+            self.assertTrue(m.set_layout('pip','cam3','cam2')[0])
+            self.assertEqual(m._layout['main'],'cam3')
+            self.assertEqual(m._active_camera,'cam3')
+
 
 class ConcurrencyRegressionTests(unittest.TestCase):
     def setUp(self):
@@ -463,7 +584,7 @@ class ConcurrencyRegressionTests(unittest.TestCase):
             built.append((cam, dict(wanted)))
             if len(built)==1:
                 entered.set(); release.wait(3)
-            return ['mock'], {c:f'm{i}' for i,c in enumerate(wanted)}, set(), ''
+            return ['mock'], {c:f'm{i}' for i,c in enumerate(wanted)}, set(), '', None, ''
         def audio():
             audio_entered.set()
             results.append(m.set_audio_source('active'))

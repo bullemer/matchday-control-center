@@ -60,7 +60,10 @@ workers: the hardware process manager and live match state are process-local.
    (can be hidden), cut buttons with tally, audio source, score, clock and stream
    status. Keys 1–3 cut cameras on a laptop keyboard. The mode is remembered per device,
    and hidden previews stop playing to save CPU, battery and Wi-Fi.
-   Update scores and clock. The overlay refreshes every half-second. Match state is
+   Update scores and clock. Use **Scoreboard on video** in Setup or Match mode to hide
+   or show the overlay without interrupting the stream. Scores and the clock continue
+   while hidden, and the visibility setting is saved with the match.
+   The overlay refreshes every half-second. Match state is
    saved after changes and every five seconds, and restored with the clock **paused**.
 7. STOP LIVE ends both encoder and camera relay. Ctrl+C / SIGTERM also cleans up the
    managed media processes. The hotspot remains under its explicit start/stop controls.
@@ -112,6 +115,21 @@ existing binary is rejected; move it aside to provision the supported version.
 Generated configuration, certificates, credentials, and match state are under `data/`.
 Never commit this directory. MediaMTX is not automatically upgraded on launch.
 
+## Video layouts
+
+Use **Layout** above the program preview in Match mode, or beside Multiview in Setup.
+Choose **Full-screen**, **Picture-in-picture**, or **Side-by-side (50 / 50)**, select
+Main camera and Second camera, and apply. PiP uses half the output width and height
+(one-quarter of its area) in a selectable corner. Side-by-side puts the main camera
+on the left and the second on the right; both pictures fit without stretching or cropping.
+Audio remains under the existing audio controls; Follow camera follows the main camera.
+The scoreboard is applied over the composed output, so top corners are preferable for PiP.
+
+If the second camera disappears, recovery rebuilds a main-only view and restores the
+chosen composition when it returns. Main-camera loss uses the existing program fallback.
+Layout changes replace the relay while keeping the YouTube encoder alive; fallback may
+briefly appear during replacement. Layout selections are kept for the current app session.
+
 ## API
 
 All routes require the operator login. POST requests require JSON objects and reject
@@ -127,6 +145,7 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/stream/start` | `stream_key`, optional `profile`: `1080p`, `720p` or `480p` |
 | POST | `/api/stream/stop` | Stop streaming |
 | POST | `/api/switch/<cam_id>` | Select cam1/cam2/cam3 |
+| POST | `/api/layout` | `mode`: single/pip/split, `main`, `secondary`, `position`: top-left/top-right/bottom-left/bottom-right |
 | POST | `/api/audio-source` | `mode`: `cam1`, `active`, or `usb:<device id>` |
 | GET | `/api/audio/devices` | Audio devices |
 | POST | `/api/scoreboard/update` | Names/scores, or atomic `team` + `delta` adjustment |

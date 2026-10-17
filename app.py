@@ -36,7 +36,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow,
-                          SUPERSEDED)
+                          SUPERSEDED, set_layout)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -107,6 +107,7 @@ _scoreboard = {
     "home_score": 0,
     "away_name": "AWAY",
     "away_score": 0,
+    "visible": True,
 }
 
 _clock_lock = _scoreboard_lock
@@ -147,7 +148,7 @@ def _write_scoreboard_locked():
     with _clock_lock:
         clock_str = _format_clock(_clock_elapsed())
 
-    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} "
+    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if _scoreboard["visible"] else ""
 
     try:
         if Path(SCOREBOARD_PATH).read_text() == text:
@@ -353,6 +354,24 @@ def api_switch_camera(cam_id):
     return jsonify({"ok": success, "message": msg, "active_camera": cam_id}), status_code
 
 
+@app.route("/api/layout", methods=["POST"])
+@api_endpoint
+def api_layout():
+    data = request.get_json()
+    mode = text_field(data, "mode", 10)
+    main = text_field(data, "main", 10)
+    secondary = text_field(data, "secondary", 10, "cam2")
+    position = text_field(data, "position", 20, "top-right")
+    if mode not in ("single", "pip", "split") or main not in ("cam1", "cam2", "cam3") or secondary not in ("cam1", "cam2", "cam3"):
+        raise ValueError("Invalid layout or camera")
+    if mode != "single" and main == secondary:
+        raise ValueError("Choose different main and second cameras")
+    if position not in ("top-left", "top-right", "bottom-left", "bottom-right"):
+        raise ValueError("Invalid picture-in-picture position")
+    ok, message = set_layout(mode, main, secondary, position)
+    return jsonify(ok=ok, message=message, stream=get_stream_status()), 200 if ok else 409 if message == SUPERSEDED else 502
+
+
 # --- Audio source ------------------------------------------------------
 
 @app.route("/api/audio-source", methods=["POST"])
@@ -425,6 +444,10 @@ def api_scoreboard_update():
     data = request.get_json(force=True, silent=True) or {}
 
     updates = {}
+    if "visible" in data:
+        if type(data["visible"]) is not bool:
+            raise ValueError("visible must be true or false")
+        updates["visible"] = data["visible"]
     for field in ("home_name", "away_name"):
         if field in data:
             # Team names are shown exactly as typed; empty falls back to HOME / AWAY.
@@ -577,6 +600,9 @@ def _restore_match():
         elapsed = float(state["clock_elapsed_secs"])
         if not math.isfinite(elapsed) or elapsed < 0 or state["half"] not in (1, 2):
             raise ValueError("Invalid persisted clock")
+        state.setdefault("visible", True)  # saved matches from before the visibility control
+        if type(state["visible"]) is not bool:
+            raise ValueError("Invalid persisted scoreboard visibility")
         with _scoreboard_lock:
             _scoreboard.update({key: state[key] for key in _scoreboard})
             _clock.update(running=False, elapsed=float(state["clock_elapsed_secs"]),

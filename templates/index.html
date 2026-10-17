@@ -7,12 +7,24 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 
   <style>
-    #clock-editor { width: min(24rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
+    #clock-editor, #layout-editor { width: min(24rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
       margin: auto; padding: 1.25rem; border: 1px solid #475569; border-radius: 1rem;
       background: #1e293b; color: #fff; }
-    #clock-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #clock-editor::backdrop, #layout-editor::backdrop { background: rgb(0 0 0 / .65); }
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
+    body.match-mode main { padding-top: .5rem; }
+    #match-panel .overlay-control { font-size: .75rem; white-space: nowrap; }
+    .preview-offline { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; color: #94a3b8; font-size: .875rem; }
+    .preview-offline[hidden] { display: none; }
+    .overlay-switch { appearance: none; flex-shrink: 0; width: 36px; height: 22px;
+      border-radius: 12px; background: #475569; position: relative; cursor: pointer; }
+    .overlay-switch::before { content: ''; position: absolute; width: 16px; height: 16px;
+      top: 3px; left: 3px; border-radius: 50%; background: white; transition: transform .15s; }
+    .overlay-switch:checked { background: #22c55e; }
+    .overlay-switch:checked::before { transform: translateX(14px); }
+    .overlay-switch:focus-visible { outline: 2px solid #38bdf8; outline-offset: 3px; }
+    .overlay-switch:disabled { opacity: .5; cursor: wait; }
     /* Base dark-mode styles */
     body {
       background-color: #0f172a;
@@ -167,6 +179,7 @@
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700">
           <div class="flex items-center justify-between mb-2">
             <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program · before scoreboard</span>
+            <button onclick="openLayoutEditor()" aria-label="Video layout" class="text-xs px-2 py-1 rounded bg-brand-blue text-white">Layout</button>
             <button id="match-preview-toggle" onclick="toggleMatchPreview()"
                     class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
           </div>
@@ -223,7 +236,10 @@
             <button onclick="clockAction('second_half')"
                     class="match-btn px-3 rounded-lg font-semibold text-white bg-brand-blue hover:bg-blue-600">2nd half</button>
           </div>
-          <button onclick="openClockEditor()" class="text-sm text-brand-cyan underline">✎ Adjust clock</button>
+          <div class="flex items-center justify-between gap-2"><button onclick="openClockEditor()" class="text-sm text-brand-cyan underline">✎ Adjust clock</button><label class="overlay-control inline-flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+            <input type="checkbox" role="switch" data-scoreboard-visible checked class="overlay-switch"
+                   onchange="setScoreboardVisible(this.checked)">Scoreboard on video
+          </label></div>
           <div class="grid grid-cols-4 gap-2">
             <button onclick="adjustClock(-60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−1 min</button>
             <button onclick="adjustClock(-10)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">−10 s</button>
@@ -358,6 +374,7 @@
     <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         📺 Multiview &amp; Camera Switching
+        <button onclick="openLayoutEditor()" aria-label="Video layout" class="ml-auto text-sm px-3 py-2 rounded bg-brand-blue text-white">Layout</button>
       </h2>
 
       <!-- 2x2 WebRTC Grid -->
@@ -369,7 +386,8 @@
             <span id="mv-badge-cam1" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam1">
-            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam1" allow="autoplay" loading="lazy"></iframe>
+            <div class="preview-offline" data-offline="cam1">Camera offline</div>
+            <iframe data-camera="cam1" data-preview="setup" data-src="http://{{ media_host }}:8889/cam1" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Cam 2 Preview -->
@@ -379,7 +397,8 @@
             <span id="mv-badge-cam2" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam2">
-            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam2" allow="autoplay" loading="lazy"></iframe>
+            <div class="preview-offline" data-offline="cam2">Camera offline</div>
+            <iframe data-camera="cam2" data-preview="setup" data-src="http://{{ media_host }}:8889/cam2" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Cam 3 Preview -->
@@ -389,7 +408,8 @@
             <span id="mv-badge-cam3" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-slate-700" id="frame-cam3">
-            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/cam3" allow="autoplay" loading="lazy"></iframe>
+            <div class="preview-offline" data-offline="cam3">Camera offline</div>
+            <iframe data-camera="cam3" data-preview="setup" data-src="http://{{ media_host }}:8889/cam3" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
         <!-- Program Output -->
@@ -515,6 +535,10 @@
         ⚽ Scoreboard &amp; Match Clock
       </h2>
 
+      <div class="mb-4"><label class="overlay-control inline-flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+            <input type="checkbox" role="switch" data-scoreboard-visible checked class="overlay-switch"
+                   onchange="setScoreboardVisible(this.checked)">Scoreboard on video
+          </label></div>
       <!-- Score Controls -->
       <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4">
         <!-- Home Team -->
@@ -613,6 +637,39 @@
     </section>
 
   </main>
+
+  <dialog id="layout-editor" aria-labelledby="layout-editor-title">
+    <form onsubmit="event.preventDefault(); applyVideoLayout();" class="space-y-3">
+      <h2 id="layout-editor-title" class="text-lg font-semibold">Video layout</h2>
+      <label class="block text-sm">Layout
+        <select id="layout-mode" onchange="updateLayoutFields()" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
+          <option value="single">Full-screen</option><option value="pip">Picture-in-picture</option><option value="split">Side-by-side (50 / 50)</option>
+        </select>
+      </label>
+      <label class="block text-sm">Main camera
+        <select aria-label="Main camera" id="layout-main" onchange="updateLayoutFields()" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
+          <option value="cam1">Cam 1</option><option value="cam2">Cam 2</option><option value="cam3">Cam 3</option>
+        </select>
+      </label>
+      <label id="layout-secondary-row" class="block text-sm">Second camera
+        <select aria-label="Second camera" id="layout-secondary" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
+          <option value="cam1">Cam 1</option><option value="cam2">Cam 2</option><option value="cam3">Cam 3</option>
+        </select>
+      </label>
+      <label id="layout-position-row" class="block text-sm">Inset corner
+        <select aria-label="Inset corner" id="layout-position" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
+          <option value="top-right">Top right</option><option value="top-left">Top left</option><option value="bottom-right">Bottom right</option><option value="bottom-left">Bottom left</option>
+        </select>
+      </label>
+      <p id="layout-description" class="text-sm text-slate-300"></p>
+      <p class="text-xs text-slate-400">Audio uses your existing audio selection. A layout change may briefly show fallback video.</p>
+      <p id="layout-error" role="alert" class="text-sm text-red-400"></p>
+      <div class="flex gap-2">
+        <button type="button" onclick="document.getElementById('layout-editor').close()" class="flex-1 bg-slate-700 rounded-lg py-3">Cancel</button>
+        <button id="layout-apply" class="flex-1 bg-brand-blue rounded-lg py-3 font-semibold">Apply layout</button>
+      </div>
+    </form>
+  </dialog>
 
   <dialog id="clock-editor" aria-labelledby="clock-editor-title">
     <form onsubmit="event.preventDefault(); applyClockEditor();">
@@ -869,9 +926,17 @@
     // Only previews that are visible play: a hidden WebRTC iframe still costs network and decoding.
     function syncPreviews() {
       document.querySelectorAll('iframe[data-preview]').forEach(frame => {
-        const wanted = frame.dataset.preview === 'match'
+        const visible = frame.dataset.preview === 'match'
           ? state.matchMode && state.matchPreview
           : !state.matchMode;
+        const online = !frame.dataset.camera || !!state.cameras[frame.dataset.camera];
+        const wanted = visible && online;
+        frame.hidden = !wanted;
+        const placeholder = frame.parentElement.querySelector('[data-offline]');
+        if (placeholder) {
+          placeholder.hidden = online;
+          placeholder.textContent = state.connectionLost ? 'Camera status unavailable' : 'Camera offline';
+        }
         if (wanted && frame.getAttribute('src') !== frame.dataset.src) frame.setAttribute('src', frame.dataset.src);
         if (!wanted && frame.hasAttribute('src')) frame.removeAttribute('src');
       });
@@ -886,14 +951,63 @@
 
     // Keys 1–3 cut cameras in match mode (laptop keyboard).
     document.addEventListener('keydown', event => {
-      if (!state.matchMode || document.getElementById('clock-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
+      if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
     });
 
+    function openLayoutEditor() {
+      const layout = state.videoLayout || {mode:'single', main:state.selectedCam || 'cam1', secondary:'cam2', position:'top-right'};
+      for (const key of ['mode','main','secondary','position']) document.getElementById('layout-' + key).value = layout[key];
+      document.getElementById('layout-error').textContent = '';
+      updateLayoutFields();
+      document.getElementById('layout-editor').showModal();
+    }
+
+    function updateLayoutFields() {
+      const mode = document.getElementById('layout-mode').value;
+      const main = document.getElementById('layout-main').value;
+      const secondary = document.getElementById('layout-secondary');
+      for (const option of secondary.options) option.disabled = option.value === main;
+      if (secondary.value === main) secondary.value = [...secondary.options].find(option => !option.disabled).value;
+      document.getElementById('layout-secondary-row').classList.toggle('hidden', mode === 'single');
+      document.getElementById('layout-position-row').classList.toggle('hidden', mode !== 'pip');
+      document.getElementById('layout-description').textContent = {
+        single:'The main camera fills the screen.',
+        pip:'The main camera fills the screen. The second camera takes one-quarter of the image in the selected corner.',
+        split:'Main camera on the left, second camera on the right. Each gets half the screen; pictures are fitted without stretching or cropping.'
+      }[mode];
+    }
+
+    async function applyVideoLayout() {
+      const button = document.getElementById('layout-apply');
+      if (button.disabled) return;
+      const body = {};
+      for (const key of ['mode','main','secondary','position']) body[key] = document.getElementById('layout-' + key).value;
+      button.disabled = true;
+      button.textContent = 'Applying…';
+      try {
+        const {ok, data} = await apiRequest('/api/layout', body);
+        if (!ok) {
+          document.getElementById('layout-error').textContent = data.error || data.message || 'Could not apply layout';
+          return;
+        }
+        document.getElementById('layout-editor').close();
+        showToast(data.message, 'success');
+        await pollStatus();
+      } finally {
+        button.disabled = false;
+        button.textContent = 'Apply layout';
+      }
+    }
+
     // ──────────────────────── Camera Switching ────────────────────────
     let cutSequence = 0;
     async function switchCam(camId) {
+      if (state.videoLayout && state.videoLayout.mode !== 'single' && camId === state.videoLayout.secondary) {
+        showToast('Use Video layout to swap the main and second cameras', 'info');
+        return;
+      }
       const sequence = ++cutSequence;
       state.pendingCam = camId;
       updateTallyButtons();
@@ -914,6 +1028,7 @@
       document.querySelectorAll('[data-cut]').forEach(btn => {
         const cam = btn.dataset.cut;
         const publishing = !!state.cameras[cam];
+        const secondary = state.videoLayout && state.videoLayout.mode !== 'single' && cam === state.videoLayout.secondary;
         let look, label;
         if (cam === pending) {
           look = 'bg-brand-amber text-white pulse-live'; label = 'Switching…';
@@ -921,13 +1036,15 @@
           look = 'bg-brand-red text-white ring-2 ring-red-300'; label = 'On air';
         } else if (cam === state.selectedCam) {
           look = 'bg-red-950 text-red-200 ring-2 ring-red-500'; label = publishing ? 'Fallback — retrying' : 'Fallback — no signal';
+        } else if (secondary && cam === state.secondaryCam) {
+          look = 'bg-brand-blue text-white'; label = state.videoLayout.mode === 'pip' ? 'PiP' : 'Right half';
         } else if (publishing) {
           look = 'bg-brand-green hover:brightness-110 text-white'; label = 'Ready';
         } else {
           look = 'bg-slate-700 text-slate-400'; label = 'Offline';
         }
         btn.className = btn.dataset.base + ' ' + look;
-        btn.disabled = !publishing && cam !== state.selectedCam;
+        btn.disabled = secondary || (!publishing && cam !== state.selectedCam);
         btn.querySelector('[data-cut-state]').textContent = label;
       });
       ['cam1', 'cam2', 'cam3'].forEach(c => {
@@ -1126,6 +1243,30 @@
     }
 
     // ──────────────────────── Scoreboard ────────────────────────
+    let scoreboardVisible = true, visibilityPending = false;
+    function renderScoreboardVisibility() {
+      document.querySelectorAll('[data-scoreboard-visible]').forEach(input => {
+        input.checked = scoreboardVisible;
+        input.disabled = visibilityPending;
+        input.setAttribute('aria-busy', String(visibilityPending));
+      });
+    }
+    async function setScoreboardVisible(visible) {
+      if (visibilityPending) return;
+      const previous = scoreboardVisible;
+      scoreboardVisible = visible;
+      visibilityPending = true;
+      renderScoreboardVisibility();
+      try {
+        const result = await apiPost('/api/scoreboard/update', {visible}, {quiet:true});
+        if (result) applyScoreboard(result.scoreboard);
+        else scoreboardVisible = previous;
+      } finally {
+        visibilityPending = false;
+        renderScoreboardVisibility();
+        interpolateClock();
+      }
+    }
     let scoreQueue = Promise.resolve();
     function adjustScore(team, delta) {
       scoreQueue = scoreQueue.then(async () => {
@@ -1162,7 +1303,9 @@
       }
     }
 
-    function applyScoreboard(sb) {
+    function applyScoreboard(sb, updateVisibility = true) {
+      if (updateVisibility) scoreboardVisible = sb.visible !== false;
+      renderScoreboardVisibility();
       state.homeScore = sb.home_score;
       state.awayScore = sb.away_score;
       bind('home_score', state.homeScore);
@@ -1184,6 +1327,10 @@
     }
 
     function renderScoreboardPreview(home, hs, away, as, clock) {
+      if (!scoreboardVisible) {
+        document.getElementById('scoreboard-preview').textContent = 'Scoreboard hidden on video — scores and clock continue.';
+        return;
+      }
       document.getElementById('scoreboard-preview').innerHTML =
         `<span class="text-lg sm:text-2xl font-bold text-white tracking-wide font-mono">
           ${escHtml(home)} &nbsp; ${hs} - ${as} &nbsp; ${escHtml(away)} &nbsp; | &nbsp; ${clock}
@@ -1468,12 +1615,16 @@
         document.getElementById('status-yt-badge').textContent = 'UNKNOWN';
         bind('yt_state', 'UNKNOWN');
         state.activeCam = state.selectedCam = state.serverPendingCam = null;
+        state.cameras = {};
+        state.connectionLost = true;
+        syncPreviews();
         updateTallyButtons();
         return;
       }
       const network = data.network || {};
       const stream = data.stream || {};
       if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
+      else if (stream.layout_warning) setBanner(stream.layout_warning, 'warning');
       else if (stream.audio_warning) setBanner('Audio: ' + stream.audio_warning, 'warning');
       else if (stream.fallback && stream.active) setBanner('Live — fallback video / silence', 'warning');
       else if (data.diagnostics_updated_at && Date.now() / 1000 - data.diagnostics_updated_at > 20)
@@ -1523,6 +1674,8 @@
 
       // --- Camera Live Badges ---
       state.cameras = data.cameras || {};
+      state.connectionLost = false;
+      syncPreviews();
       ['cam1', 'cam2', 'cam3'].forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);
@@ -1577,6 +1730,8 @@
       renderStreamControls();
 
       // --- Active Camera ---
+      state.videoLayout = stream.layout || state.videoLayout;
+      state.secondaryCam = stream.secondary_camera || null;
       state.activeCam = stream.active_camera || null;
       state.selectedCam = stream.selected_camera || null;
       state.serverPendingCam = stream.pending_camera || null;
@@ -1601,7 +1756,7 @@
         el.classList.toggle('hidden', !stream.audio_warning);
       });
 
-      if (data.scoreboard) applyScoreboard(data.scoreboard);
+      if (data.scoreboard) applyScoreboard(data.scoreboard, !visibilityPending);
 
       // --- Firewall ---
       if (data.firewall) renderFirewall(data.firewall);

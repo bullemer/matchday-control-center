@@ -280,3 +280,79 @@ test('clock editor preserves running state, edits survive polls, and cancel does
   await page.getByRole('button',{name:'Cancel',exact:true}).click();
   await expect(page.locator('#match-clock-display')).toHaveText(/^45:0[0-9]$/);
 });
+
+
+test('scoreboard switch hides only the overlay and stays in sync across modes', async ({page}) => {
+  await page.goto('/');
+  const setup=page.getByRole('switch',{name:'Scoreboard on video'}).last();
+  await expect(setup).toBeChecked();
+  await setup.uncheck();
+  await expect(setup).not.toBeChecked();
+  await expect(page.locator('#scoreboard-preview')).toContainText('Scoreboard hidden on video');
+  await page.locator('#mode-toggle').click();
+  const match=page.locator('#match-panel').getByRole('switch',{name:'Scoreboard on video'});
+  await expect(match).not.toBeChecked();
+  await page.locator('#match-panel').getByLabel('home goal').click();
+  await expect(match).not.toBeChecked();
+  await page.reload();
+  await expect(match).not.toBeChecked();
+  await match.check();
+  await expect(match).toBeChecked();
+  await page.locator('#mode-toggle').click();
+  await expect(setup).toBeChecked();
+  await expect(page.locator('#scoreboard-preview')).not.toContainText('hidden on video');
+});
+
+
+test('offline cameras show a neutral placeholder and load previews only when online', async ({page}) => {
+  let online=false;
+  await page.route('**/api/status',async route=>{
+    const response=await route.fetch();
+    const body=await response.json();
+    body.cameras={cam1:online,cam2:false,cam3:false,program:true};
+    await route.fulfill({response,json:body});
+  });
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  for (const cam of ['cam1','cam2','cam3']) {
+    await expect(page.locator(`[data-offline="${cam}"]`)).toBeVisible();
+    await expect(page.locator(`[data-offline="${cam}"]`)).toHaveText('Camera offline');
+    await expect(page.locator(`iframe[data-camera="${cam}"]`)).not.toHaveAttribute('src', /.+/);
+  }
+  await page.locator('#frame-cam1').screenshot({path:'/tmp/mcc-offline-camera.png'});
+  online=true;
+  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /cam1$/);
+  await expect(page.locator('[data-offline="cam1"]')).toBeHidden();
+  online=false;
+  await expect(page.locator('[data-offline="cam1"]')).toBeVisible();
+  await expect(page.locator('iframe[data-camera="cam1"]')).not.toHaveAttribute('src', /.+/);
+});
+
+
+test('operator can apply PiP and side-by-side layouts with separate cameras', async ({page}) => {
+  const sent=[];
+  await page.route('**/api/layout',async route=>{
+    sent.push(route.request().postDataJSON());
+    await route.fulfill({json:{ok:true,message:'Layout applied'}});
+  });
+  await page.setViewportSize({width:390,height:844});
+  await page.goto('/');
+  await page.getByRole('button',{name:'Video layout',exact:true}).last().click();
+  await page.locator('#layout-mode').selectOption('pip');
+  await page.getByLabel('Main camera',{exact:true}).selectOption('cam1');
+  await page.getByLabel('Second camera',{exact:true}).selectOption('cam2');
+  await expect(page.getByLabel('Inset corner',{exact:true})).toBeVisible();
+  await page.screenshot({path:'/tmp/mcc-layout-editor.png'});
+  await page.getByRole('button',{name:'Apply layout',exact:true}).click();
+  await expect(page.locator('#layout-editor')).not.toBeVisible();
+  expect(sent[0]).toEqual({mode:'pip',main:'cam1',secondary:'cam2',position:'top-right'});
+  await page.locator('#mode-toggle').click();
+  await page.locator('#match-panel').getByRole('button',{name:'Video layout',exact:true}).click();
+  await page.locator('#layout-mode').selectOption('split');
+  await page.getByLabel('Main camera',{exact:true}).selectOption('cam2');
+  await page.getByLabel('Second camera',{exact:true}).selectOption('cam3');
+  await expect(page.getByLabel('Inset corner',{exact:true})).toBeHidden();
+  await page.getByRole('button',{name:'Apply layout',exact:true}).click();
+  await expect(page.locator('#layout-editor')).not.toBeVisible();
+  expect(sent[1]).toEqual({mode:'split',main:'cam2',secondary:'cam3',position:'top-right'});
+});
