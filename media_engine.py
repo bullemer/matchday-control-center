@@ -831,11 +831,13 @@ def _launch_encoder():
           f"x={font * 2 // 3}:y=h-th-{font * 2 // 3}")
     ensure_frame(FRAME_PATH)
     # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
-    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=auto[vout]"
-    cmd = _ffmpeg() + _input("program") + [
+    # Keep composition in the encoder's YUV420 format and bound worker counts:
+    # auto-threading added substantial CPU overhead in real-time 1080p/PiP tests.
+    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420[vout]"
+    cmd = _ffmpeg() + ["-filter_complex_threads", "2"] + _input("program") + [
         "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
         "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0",
-        "-c:v", "libx264", "-preset", "veryfast", "-tune", "zerolatency",
+        "-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency",
         "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
         "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
         "-ar", "48000", "-ac", "2", "-rw_timeout", "10000000", "-f", "flv",

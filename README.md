@@ -76,6 +76,13 @@ always-available program path supplies fallback video and silence when that publ
 is absent. A separate encoder reads the continuous program over loopback RTSP,
 adds the scoreboard, and publishes RTMPS to YouTube.
 
+The final encoder uses two filter threads, six H.264 encoder threads, and explicit
+YUV420 overlay composition to reduce CPU overhead. Resolution, bitrate, the
+`veryfast` preset and the 30 fps target are unchanged. Short synthetic 1080p PiP
+benchmarks on an Intel Core Ultra 7 155H measured about 35% less CPU across the
+sampled media processes; actual savings depend on footage and hardware. This does
+not enable hardware encoding or remove the separate relay stage.
+
 STOP cancels an in-flight GO LIVE operation, including camera readiness checks; a cancelled
 start cannot launch an encoder afterward. Duplicate starts are rejected.
 Audio changes are serialized with cuts so Follow camera applies to the newly selected
