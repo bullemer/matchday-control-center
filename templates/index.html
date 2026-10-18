@@ -5,12 +5,20 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
   <title>⚽ Matchday Live Control Center</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <script src="{{ url_for('static', filename='qrcode.js') }}"></script>
+  <script>
+    try {
+      if (localStorage.getItem('mcc-outdoor-mode') === 'true') {
+        document.documentElement.classList.add('outdoor-mode');
+      }
+    } catch {}
+  </script>
 
   <style>
-    #clock-editor, #layout-editor { width: min(24rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
+    #clock-editor, #layout-editor, #qr-dialog { width: min(26rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem);
       margin: auto; padding: 1.25rem; border: 1px solid #475569; border-radius: 1rem;
       background: #1e293b; color: #fff; }
-    #clock-editor::backdrop, #layout-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #clock-editor::backdrop, #layout-editor::backdrop, #qr-dialog::backdrop { background: rgb(0 0 0 / .65); }
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
     body.match-mode main { padding-top: .5rem; }
@@ -103,7 +111,7 @@
     .meter-label { font-size: .75rem; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .meter-track { position: relative; height: .75rem; border-radius: .25rem; overflow: hidden;
       background: linear-gradient(to right, #16a34a 0%, #22c55e 70%, #f59e0b 70%, #f59e0b 90%, #ef4444 90%); }
-    .meter-cover { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: #0b1220; transition: width .08s linear; }
+    .meter-cover { position: absolute; top: 0; right: 0; bottom: 0; width: 100%; background: #0b1220; transition: width .2s linear; }
     .meter-peak { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff; left: 0; opacity: 0; }
     .meter-db { font: 600 .75rem ui-monospace, monospace; color: #94a3b8; text-align: right; }
     .meter-row.on-air .meter-label { color: #fff; font-weight: 700; }
@@ -116,6 +124,84 @@
       min-height: 48px;
       font-size: 1.5rem;
       font-weight: 700;
+    }
+
+    /* Outdoor Sunlight High-Contrast Mode */
+    .outdoor-mode,
+    .outdoor-mode body {
+      background-color: #f8fafc !important;
+      color: #020617 !important;
+    }
+    .outdoor-mode header {
+      background-color: #ffffff !important;
+      border-bottom: 2px solid #0f172a !important;
+    }
+    .outdoor-mode header h1 {
+      color: #020617 !important;
+    }
+    .outdoor-mode header span {
+      color: #0f172a !important;
+    }
+    .outdoor-mode section,
+    .outdoor-mode .bg-slate-800,
+    .outdoor-mode .bg-slate-900,
+    .outdoor-mode dialog {
+      background-color: #ffffff !important;
+      color: #020617 !important;
+      border-color: #0f172a !important;
+      box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1) !important;
+    }
+    .outdoor-mode .text-white,
+    .outdoor-mode .text-slate-200,
+    .outdoor-mode .text-slate-300,
+    .outdoor-mode .text-slate-400 {
+      color: #0f172a !important;
+    }
+    .outdoor-mode .text-slate-500 {
+      color: #334155 !important;
+    }
+    .outdoor-mode input,
+    .outdoor-mode select,
+    .outdoor-mode textarea {
+      background-color: #f1f5f9 !important;
+      color: #020617 !important;
+      border: 2px solid #0f172a !important;
+    }
+    .outdoor-mode code {
+      background-color: #e2e8f0 !important;
+      color: #0f172a !important;
+      border: 1px solid #94a3b8 !important;
+      font-weight: 700 !important;
+    }
+    .outdoor-mode .border-slate-600,
+    .outdoor-mode .border-slate-700 {
+      border-color: #0f172a !important;
+    }
+    .outdoor-mode .bg-slate-700 {
+      background-color: #e2e8f0 !important;
+      color: #0f172a !important;
+    }
+    .outdoor-mode .meter-track {
+      border: 1px solid #000;
+    }
+    .outdoor-mode .meter-cover {
+      background: #f8fafc !important;
+    }
+    .outdoor-mode .meter-label,
+    .outdoor-mode .meter-db {
+      color: #020617 !important;
+      font-weight: 700 !important;
+    }
+    .outdoor-mode .cut-btn {
+      border: 2px solid #0f172a !important;
+    }
+    .outdoor-mode [data-cut-state="PGM"] {
+      background-color: #dc2626 !important;
+      color: #ffffff !important;
+    }
+    .outdoor-mode [data-cut-state="PVW"] {
+      background-color: #2563eb !important;
+      color: #ffffff !important;
     }
   </style>
 </head>
@@ -158,6 +244,11 @@
               class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400">
           OFFLINE
         </span>
+        <button id="outdoor-toggle" onclick="toggleOutdoorMode()"
+                title="Toggle high-contrast sunlight outdoor mode"
+                class="px-2.5 py-1.5 rounded-lg text-xs sm:text-sm font-semibold bg-slate-800 hover:bg-slate-700 text-amber-300 border border-slate-600 transition-colors">
+          ☀️ Outdoor
+        </button>
         <button id="mode-toggle" onclick="toggleMode()"
                 class="px-3 py-1.5 rounded-lg text-xs sm:text-sm font-semibold bg-brand-blue hover:bg-blue-600 text-white transition-colors">
           ⚽ Match mode
@@ -267,15 +358,21 @@
         🌐 Network Controls
       </h2>
       <!-- Where camera phones connect: the app's hotspot, or the Wi-Fi/LAN the laptop is on -->
-      <div id="camera-network" class="mb-4 rounded-lg p-3 border border-slate-700 bg-slate-900">
-        <p id="camera-network-title" class="text-sm font-semibold text-white">Detecting camera network…</p>
-        <p id="camera-network-hint" class="text-xs text-slate-400 mt-1"></p>
+      <div id="camera-network" class="mb-4 rounded-lg p-3 border border-slate-700 bg-slate-900 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p id="camera-network-title" class="text-sm font-semibold text-white">Detecting camera network…</p>
+          <p id="camera-network-hint" class="text-xs text-slate-400 mt-1"></p>
+        </div>
+        <button id="btn-camera-network-qr" onclick="showCameraQR('cam1')"
+                class="px-3 py-1.5 rounded-lg text-xs font-bold bg-brand-cyan text-slate-950 hover:bg-cyan-300 transition-colors flex items-center gap-1.5 shadow">
+          📱 Onboard Cameras (QR &amp; Tally)
+        </button>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <!-- USB Connect -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm text-slate-400">USB Tethering <span class="text-slate-500">(optional)</span></span>
+            <span class="text-sm text-slate-400">USB Tethering <span class="text-slate-500">(fallback)</span></span>
             <span id="net-usb-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Disconnected</span>
           </div>
           <button onclick="apiPost('/api/network/usb-connect')"
@@ -286,7 +383,7 @@
         <!-- Hotspot Controls -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <div class="flex items-center justify-between mb-3">
-            <span class="text-sm text-slate-400">Wi-Fi Hotspot <span class="text-slate-500">(optional)</span></span>
+            <span class="text-sm text-slate-400">Wi-Fi Hotspot <span class="text-slate-500">(fallback)</span></span>
             <span id="net-hotspot-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Inactive</span>
           </div>
           <p id="hotspot-note" class="hidden text-xs text-brand-amber mb-2"></p>
@@ -325,8 +422,8 @@
          ───────────────────────────────────────────────────────────────── -->
     <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        🎥 Camera RTMP Links
-        <span class="text-xs text-slate-400 font-normal">(Tap to copy on camera phones)</span>
+        🎥 Camera RTMP Links &amp; Tally
+        <span class="text-xs text-slate-400 font-normal">(Tap to scan QR or copy on camera phones)</span>
         <span id="camera-links-network" class="text-xs text-brand-cyan font-normal"></span>
       </h2>
       <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
@@ -337,10 +434,16 @@
             <span id="cam-badge-cam1" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
           <code id="url-cam1" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam1</code>
-          <button onclick="copyRtmp(cameraUrl('cam1'))"
-                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
-            📋 Copy RTMP URL
-          </button>
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick="copyRtmp(cameraUrl('cam1'))"
+                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
+              📋 Copy RTMP
+            </button>
+            <button onclick="showCameraQR('cam1')"
+                    class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
+              📱 Tally &amp; QR
+            </button>
+          </div>
         </div>
         <!-- Cam 2 -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
@@ -349,10 +452,16 @@
             <span id="cam-badge-cam2" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
           <code id="url-cam2" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam2</code>
-          <button onclick="copyRtmp(cameraUrl('cam2'))"
-                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
-            📋 Copy RTMP URL
-          </button>
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick="copyRtmp(cameraUrl('cam2'))"
+                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
+              📋 Copy RTMP
+            </button>
+            <button onclick="showCameraQR('cam2')"
+                    class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
+              📱 Tally &amp; QR
+            </button>
+          </div>
         </div>
         <!-- Cam 3 -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
@@ -361,10 +470,16 @@
             <span id="cam-badge-cam3" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
           <code id="url-cam3" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam3</code>
-          <button onclick="copyRtmp(cameraUrl('cam3'))"
-                  class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2.5 rounded-lg transition-colors text-sm">
-            📋 Copy RTMP URL
-          </button>
+          <div class="grid grid-cols-2 gap-2">
+            <button onclick="copyRtmp(cameraUrl('cam3'))"
+                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
+              📋 Copy RTMP
+            </button>
+            <button onclick="showCameraQR('cam3')"
+                    class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
+              📱 Tally &amp; QR
+            </button>
+          </div>
         </div>
       </div>
     </section>
@@ -714,6 +829,63 @@
     </form>
   </dialog>
 
+  <dialog id="qr-dialog" aria-labelledby="qr-modal-title">
+    <div class="space-y-3">
+      <div class="flex items-center justify-between border-b border-slate-700 pb-2">
+        <h2 id="qr-modal-title" class="text-base font-bold flex items-center gap-2">📱 Camera Setup &amp; Tally</h2>
+        <button type="button" onclick="document.getElementById('qr-dialog').close()"
+                class="text-slate-400 hover:text-white text-lg font-bold px-2 py-1">✕</button>
+      </div>
+
+      <!-- Quick camera tab switcher -->
+      <div class="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg text-xs font-semibold">
+        <button type="button" id="qr-tab-cam1" onclick="showCameraQR('cam1')" class="py-1.5 rounded text-center">Cam 1</button>
+        <button type="button" id="qr-tab-cam2" onclick="showCameraQR('cam2')" class="py-1.5 rounded text-center">Cam 2</button>
+        <button type="button" id="qr-tab-cam3" onclick="showCameraQR('cam3')" class="py-1.5 rounded text-center">Cam 3</button>
+      </div>
+
+      <!-- Network guidance for the phone -->
+      <div id="qr-network-guide" class="text-xs text-slate-300 bg-slate-900 p-2.5 rounded-lg border border-slate-700">
+        <!-- populated dynamically -->
+      </div>
+
+      <!-- QR code SVG container -->
+      <div class="bg-white p-3 rounded-xl flex flex-col items-center justify-center my-2 mx-auto w-fit shadow-md">
+        <div id="qr-svg-container" class="flex items-center justify-center"></div>
+        <span class="text-[11px] font-bold text-slate-800 mt-1">Scan to Open Tally Screen</span>
+      </div>
+
+      <!-- URLs and copy buttons -->
+      <div class="space-y-2 text-xs">
+        <div>
+          <span class="text-slate-400 block mb-1">Tally Light Web URL:</span>
+          <div class="flex items-center gap-1.5">
+            <code id="qr-tally-url" class="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 font-mono text-brand-cyan truncate select-all"></code>
+            <button type="button" onclick="copyToClipboard(document.getElementById('qr-tally-url').textContent); showToast('📋 Tally URL copied', 'info')"
+                    class="bg-slate-700 hover:bg-slate-600 px-2.5 py-1 rounded text-white font-medium">Copy</button>
+            <a id="qr-tally-link" href="#" target="_blank"
+               class="bg-brand-blue hover:bg-blue-600 px-2.5 py-1 rounded text-white font-medium">Open ↗</a>
+          </div>
+        </div>
+        <div>
+          <span class="text-slate-400 block mb-1">RTMP Stream URL (for Larix Broadcaster):</span>
+          <div class="flex items-center gap-1.5">
+            <code id="qr-rtmp-url" class="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 font-mono text-brand-cyan truncate select-all"></code>
+            <button type="button" onclick="copyToClipboard(document.getElementById('qr-rtmp-url').textContent); showToast('📋 RTMP URL copied', 'info')"
+                    class="bg-slate-700 hover:bg-slate-600 px-2.5 py-1 rounded text-white font-medium">Copy</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="pt-2 border-t border-slate-700">
+        <button type="button" onclick="document.getElementById('qr-dialog').close()"
+                class="w-full bg-slate-700 hover:bg-slate-600 rounded-lg py-2 text-sm font-semibold text-white">
+          Done
+        </button>
+      </div>
+    </div>
+  </dialog>
+
   <!-- ═══════════════════════════════════════════════════════════════════
        FOOTER
        ═══════════════════════════════════════════════════════════════════ -->
@@ -747,6 +919,9 @@
       streamKeyVisible: false,
       matchMode: false,
       matchPreview: true,
+      lastOverlayUpdate: 0,
+      outdoorMode: storeGet('mcc-outdoor-mode') === 'true',
+      network: {},
     };
 
     // localStorage can be unavailable (private mode, blocked storage); never let that break the page.
@@ -786,8 +961,61 @@
 
     let cameraHost = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
     function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam; }
+    function tallyUrl(cam) {
+      const port = location.port ? ':' + location.port : '';
+      return location.protocol + '//' + cameraHost + port + '/tally/' + cam;
+    }
     function copyRtmp(url) {
       return copyWithFeedback(url);
+    }
+
+    function showCameraQR(cam) {
+      const dialog = document.getElementById('qr-dialog');
+      if (!dialog) return;
+
+      for (const c of ['cam1', 'cam2', 'cam3']) {
+        const tab = document.getElementById('qr-tab-' + c);
+        if (tab) {
+          if (c === cam) {
+            tab.className = 'py-1.5 rounded text-center bg-brand-blue text-white font-bold';
+          } else {
+            tab.className = 'py-1.5 rounded text-center bg-transparent text-slate-400 hover:text-white';
+          }
+        }
+      }
+
+      const qrUrl = tallyUrl(cam);
+      const rtmp = cameraUrl(cam);
+      document.getElementById('qr-modal-title').textContent = `📱 Camera Setup · ${cam.toUpperCase()}`;
+      document.getElementById('qr-tally-url').textContent = qrUrl;
+      document.getElementById('qr-tally-link').href = qrUrl;
+      document.getElementById('qr-rtmp-url').textContent = rtmp;
+
+      const guide = document.getElementById('qr-network-guide');
+      if (hotspot.active) {
+        const ssid = document.getElementById('hotspot-ssid').value || 'MatchdayLive';
+        guide.innerHTML = `📡 <strong>Fallback Hotspot Active</strong>: Phone must connect to Wi-Fi <strong>“${ssid}”</strong>.`;
+      } else {
+        const netName = (state.network && (state.network.lan_name || state.network.lan_iface)) || 'Field Router';
+        guide.innerHTML = `📶 <strong>Field Router Setup</strong>: Connect phone to pitch Wi-Fi <strong>“${netName}”</strong>. Standard router setup connects all cameras.`;
+      }
+
+      const container = document.getElementById('qr-svg-container');
+      container.innerHTML = '';
+      if (typeof qrcode !== 'undefined') {
+        try {
+          const qr = qrcode(0, 'M');
+          qr.addData(qrUrl);
+          qr.make();
+          container.innerHTML = qr.createSvgTag(4, 2);
+        } catch (err) {
+          container.innerHTML = `<span class="text-xs text-red-500 font-sans">QR error: ${err.message}</span>`;
+        }
+      } else {
+        container.innerHTML = `<span class="text-xs text-slate-600 font-sans">Loading QR…</span>`;
+      }
+
+      dialog.showModal();
     }
 
     // ──────────────────────── Toast Notifications ────────────────────────
@@ -937,6 +1165,25 @@
       state.matchPreview = !state.matchPreview;
       storeSet('mcc-match-preview', state.matchPreview ? 'on' : 'off');
       applyMode();
+    }
+
+    // ──────────────────────── Outdoor Sunlight Mode ────────────────────────
+    function applyOutdoorMode() {
+      const isOutdoor = Boolean(state.outdoorMode);
+      document.documentElement.classList.toggle('outdoor-mode', isOutdoor);
+      document.body.classList.toggle('outdoor-mode', isOutdoor);
+      const toggle = document.getElementById('outdoor-toggle');
+      if (toggle) {
+        toggle.textContent = isOutdoor ? '🌙 Dark mode' : '☀️ Outdoor';
+        toggle.setAttribute('aria-pressed', String(isOutdoor));
+        toggle.title = isOutdoor ? 'Switch to Dark Mode' : 'Switch to High-Contrast Outdoor Sunlight Mode';
+      }
+    }
+
+    function toggleOutdoorMode() {
+      state.outdoorMode = !state.outdoorMode;
+      storeSet('mcc-outdoor-mode', state.outdoorMode ? 'true' : 'false');
+      applyOutdoorMode();
     }
 
     // Only previews that are visible play: a hidden WebRTC iframe still costs network and decoding.
@@ -1363,7 +1610,13 @@
       });
       const preview = document.getElementById('score67-preview');
       preview.hidden = !external || !scoreboardVisible || !['ready', 'stale'].includes(status.state);
-      if (!preview.hidden && !state.matchMode) preview.src = '/api/scoreboard/preview?t=' + Date.now();
+      if (!preview.hidden && !state.matchMode) {
+        const updateTs = status.updated_at || 1;
+        if (updateTs !== state.lastOverlayUpdate) {
+          state.lastOverlayUpdate = updateTs;
+          preview.src = '/api/scoreboard/preview?t=' + updateTs;
+        }
+      }
       state.homeScore = sb.home_score;
       state.awayScore = sb.away_score;
       bind('home_score', state.homeScore);
@@ -1572,8 +1825,8 @@
       const now = Date.now();
       const m = meterDisplay[id] || (meterDisplay[id] = {level: -60, peak: -60, peakAt: 0});
       const db = value && typeof value === 'object' ? value.peak : null;
-      // Rise instantly, fall at ~20 dB/s so speech reads as a steady bar.
-      m.level = db === null ? -60 : Math.max(db, m.level - 4);
+      // Rise instantly, fall at ~24 dB/s so speech reads as a steady bar.
+      m.level = db === null ? -60 : Math.max(db, m.level - 6);
       if (db !== null && (db >= m.peak || now - m.peakAt > 1500)) { m.peak = db; m.peakAt = now; }
       const pct = v => Math.max(0, Math.min(100, (v + 60) / 60 * 100));
       row.querySelector('.meter-label').textContent = label;
@@ -1619,7 +1872,7 @@
         meterBusy = false;
       }
     }
-    setInterval(pollMeters, 150);
+    setInterval(pollMeters, 250);
 
     // ──────────────────────── Status banner ────────────────────────
     const bannerStyles = {
@@ -1651,13 +1904,13 @@
       } else if (network.camera_mode === 'lan') {
         const name = network.lan_name || network.lan_iface;
         if (network.lan_type === 'wifi') {
-          title.textContent = `📶 Cameras join the same Wi-Fi “${name}” — server ${network.camera_ip}`;
-          hint.textContent = 'No hotspot or tethering needed. Guest networks often block devices from reaching each other; if cameras cannot connect, use the hotspot instead.';
+          title.textContent = `📶 Cameras join the same Wi-Fi “${name}” (Field Router) — server ${network.camera_ip}`;
+          hint.textContent = 'Primary field router active. No laptop hotspot needed. Phone cameras join this Wi-Fi to stream and view tallies.';
           hotspotNote.textContent = `Not needed on Wi-Fi “${name}”. Starting the hotspot can replace this Wi-Fi connection on a laptop with one Wi-Fi adapter.`;
           hotspotNote.classList.remove('hidden');
         } else {
-          title.textContent = `🔌 Laptop is on wired network “${name}” — server ${network.camera_ip}`;
-          hint.textContent = 'Camera phones must join a Wi-Fi of this same network, or start the hotspot.';
+          title.textContent = `🔌 Laptop is on wired network “${name}” (Field Router) — server ${network.camera_ip}`;
+          hint.textContent = 'Primary field router active. Camera phones join the router Wi-Fi network to stream and view tallies.';
         }
         linksNote.textContent = `Phones must join Wi-Fi “${name}”`;
       } else {
@@ -1684,6 +1937,7 @@
         return;
       }
       const network = data.network || {};
+      state.network = network;
       const stream = data.stream || {};
       if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
       else if (stream.layout_warning) setBanner(stream.layout_warning, 'warning');
@@ -1880,6 +2134,7 @@
     state.matchMode = storeGet('mcc-mode') === 'match';
     state.matchPreview = storeGet('mcc-match-preview') !== 'off';
     applyMode();
+    applyOutdoorMode();
     updateTallyButtons();
     updateAudioToggle();
     loadHotspotConfig();

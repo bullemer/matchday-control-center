@@ -40,7 +40,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow,
-                          SUPERSEDED, set_layout)
+                          SUPERSEDED, set_layout, CAMERA_IDS)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -73,6 +73,12 @@ app.config["OPERATOR_USER"] = os.environ.get("MCC_OPERATOR_USER", "operator")
 
 @app.before_request
 def protect_controls():
+    if (
+        request.path.startswith("/static/")
+        or request.path.startswith("/tally/")
+        or request.path.startswith("/api/tally/")
+    ):
+        return None
     password = app.config.get("OPERATOR_PASSWORD")
     auth = request.authorization
     if not password:
@@ -221,6 +227,43 @@ def index():
     return render_template("index.html", media_host=host)
 
 
+@app.route("/tally/<cam_id>")
+def tally_page(cam_id):
+    """Mobile operator tally screen."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    host = urlsplit(request.host_url).hostname or "localhost"
+    if ":" in host:
+        host = f"[{host}]"
+    return render_template("tally.html", cam_id=cam_id, media_host=host)
+
+
+@app.route("/api/tally/<cam_id>")
+@api_endpoint
+def api_tally_status(cam_id):
+    """Lightweight tally status for camera operators (no basic auth required)."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    cameras = get_camera_status()
+    stream = get_stream_status()
+    publishing = bool(cameras.get(cam_id))
+    active_cam = stream.get("active_camera") or stream.get("selected_camera")
+    secondary_cam = stream.get("secondary_camera")
+    on_air = bool(publishing and active_cam == cam_id)
+    secondary = bool(publishing and secondary_cam == cam_id)
+    stream_active = bool(stream.get("active") or stream.get("state") == "live")
+    return jsonify({
+        "ok": True,
+        "cam_id": cam_id,
+        "name": f"Camera {cam_id[3:]}" if cam_id.startswith("cam") else cam_id,
+        "publishing": publishing,
+        "on_air": on_air,
+        "secondary": secondary,
+        "stream_active": stream_active,
+        "stream_state": stream.get("state", "stopped"),
+    })
+
+
 # --- Combined status (polled by UI every ~2 s) ------------------------
 
 @app.route("/api/status")
@@ -256,7 +299,7 @@ def api_usb_connect():
     """Connect the USB tethering interface."""
     log.info("USB connect requested")
     # Auto-detect USB interface from network status
-    net = get_network_status()
+    net = get_network_status(check_internet=False)
     iface = net.get("usb_iface")
     if not iface:
         return jsonify({"ok": False, "message": "No USB tethering interface detected"}), 404
@@ -297,7 +340,7 @@ def _refresh_network():
     """Update cached network diagnostics now, so the dashboard shows the result of a
     hotspot change on its next poll instead of after the next 5 s probe."""
     try:
-        network = get_network_status()
+        network = get_network_status(check_internet=False)
         _diagnostics.update(network=network, firewall=get_firewall_status(network))
     except Exception:
         log.exception("Network refresh failed")

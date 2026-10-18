@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>Tally · {{ cam_id|upper }}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+  <style>
+    body {
+      background-color: #0f172a;
+      color: #e2e8f0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      touch-action: manipulation;
+    }
+    .tally-screen {
+      transition: background-color 0.2s ease, border-color 0.2s ease;
+    }
+    .tally-on-air {
+      background-color: #dc2626 !important;
+      color: #ffffff !important;
+    }
+    .tally-secondary {
+      background-color: #2563eb !important;
+      color: #ffffff !important;
+    }
+    .tally-standby {
+      background-color: #15803d !important;
+      color: #ffffff !important;
+    }
+    .tally-offline {
+      background-color: #0f172a !important;
+      color: #94a3b8 !important;
+    }
+    @keyframes pulse-slow {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.85; }
+    }
+    .tally-pulse {
+      animation: pulse-slow 1s ease-in-out infinite;
+    }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col justify-between p-4 select-none">
+  <!-- Header -->
+  <header class="flex items-center justify-between text-xs">
+    <div class="flex items-center gap-2">
+      <span id="live-dot" class="w-3 h-3 rounded-full bg-slate-600"></span>
+      <span id="live-text" class="font-bold tracking-wider uppercase text-slate-400">CONNECTING…</span>
+    </div>
+    <div class="flex items-center gap-3">
+      <label class="flex items-center gap-1.5 cursor-pointer">
+        <input type="checkbox" id="vibrate-toggle" checked class="w-4 h-4 rounded accent-red-500">
+        <span class="text-slate-300">Vibrate</span>
+      </label>
+      <label class="flex items-center gap-1.5 cursor-pointer">
+        <input type="checkbox" id="beep-toggle" class="w-4 h-4 rounded accent-red-500">
+        <span class="text-slate-300">Beep</span>
+      </label>
+      <a href="/" class="text-brand-cyan hover:underline ml-2">Dashboard</a>
+    </div>
+  </header>
+
+  <!-- Giant Tally Center -->
+  <main id="tally-box" class="tally-screen tally-offline my-auto py-12 px-6 rounded-3xl border-4 border-slate-700 text-center flex flex-col items-center justify-center gap-4 shadow-2xl">
+    <div class="text-7xl sm:text-9xl font-black tracking-tight" id="cam-title">
+      {{ cam_id|upper }}
+    </div>
+    <div id="tally-status" class="text-2xl sm:text-4xl font-extrabold uppercase tracking-wide">
+      SIGNAL OFFLINE
+    </div>
+    <div id="tally-hint" class="text-sm sm:text-base max-w-md opacity-90">
+      Open camera app and stream to the RTMP URL below
+    </div>
+  </main>
+
+  <!-- RTMP Copy & Info Footer -->
+  <footer class="space-y-3 max-w-lg mx-auto w-full pt-4">
+    <div class="bg-slate-800/90 rounded-xl p-3 border border-slate-700 text-center">
+      <p class="text-xs text-slate-400 mb-1 font-medium">RTMP Publishing URL for {{ cam_id|upper }}</p>
+      <code id="rtmp-url" class="block text-xs font-mono text-brand-cyan bg-slate-900 rounded p-2 mb-2 break-all select-all">
+        rtmp://{{ media_host }}:1935/{{ cam_id }}
+      </code>
+      <button onclick="copyRtmpUrl()" class="w-full bg-brand-blue hover:bg-blue-600 active:scale-98 text-white font-bold py-2.5 rounded-lg text-sm transition-all">
+        📋 Copy RTMP URL
+      </button>
+    </div>
+    <p id="wake-status" class="text-center text-xs text-slate-500">Screen lock active</p>
+  </footer>
+
+  <script>
+    const camId = "{{ cam_id }}";
+    let lastOnAir = false;
+    let audioCtx = null;
+
+    // HTTP-safe clipboard copy fallback
+    async function copyToClipboard(text) {
+      try {
+        if (navigator.clipboard && window.isSecureContext) {
+          await navigator.clipboard.writeText(text);
+          return true;
+        }
+      } catch {}
+      const textArea = document.createElement('textarea');
+      textArea.value = text;
+      textArea.style.position = 'fixed';
+      textArea.style.left = '-9999px';
+      document.body.appendChild(textArea);
+      try {
+        textArea.focus();
+        textArea.select();
+        return document.execCommand('copy');
+      } catch { return false; }
+      finally { textArea.remove(); }
+    }
+
+    async function copyRtmpUrl() {
+      const url = document.getElementById('rtmp-url').textContent.trim();
+      const ok = await copyToClipboard(url);
+      const btn = event.target;
+      const old = btn.textContent;
+      btn.textContent = ok ? '✓ Copied to Clipboard!' : 'Copy manually';
+      setTimeout(() => btn.textContent = old, 2000);
+    }
+
+    // Keep screen awake using Screen Wake Lock API
+    async function requestWakeLock() {
+      if ('wakeLock' in navigator) {
+        try {
+          await navigator.wakeLock.request('screen');
+          document.getElementById('wake-status').textContent = 'Screen kept awake during broadcast';
+        } catch {
+          document.getElementById('wake-status').textContent = '';
+        }
+      }
+    }
+    requestWakeLock();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') requestWakeLock();
+    });
+
+    // Audio beep on cut
+    function playBeep() {
+      if (!document.getElementById('beep-toggle').checked) return;
+      try {
+        if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(880, audioCtx.currentTime); // A5
+        gain.gain.setValueAtTime(0.3, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.25);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.25);
+      } catch {}
+    }
+
+    // Poll tally state
+    async function pollTally() {
+      try {
+        const res = await fetch('/api/tally/' + camId, {cache: 'no-store'});
+        if (!res.ok) throw new Error('Status error');
+        const data = await res.json();
+        updateTallyDisplay(data);
+      } catch {
+        renderState('offline', 'OFFLINE', 'Connecting to laptop server…');
+      } finally {
+        setTimeout(pollTally, 500);
+      }
+    }
+
+    function updateTallyDisplay(data) {
+      const dot = document.getElementById('live-dot');
+      const liveText = document.getElementById('live-text');
+      if (data.stream_active) {
+        dot.className = 'w-3 h-3 rounded-full bg-red-500 animate-ping';
+        liveText.className = 'font-bold tracking-wider uppercase text-red-400';
+        liveText.textContent = 'BROADCAST LIVE';
+      } else {
+        dot.className = 'w-3 h-3 rounded-full bg-slate-500';
+        liveText.className = 'font-bold tracking-wider uppercase text-slate-400';
+        liveText.textContent = 'OFFLINE';
+      }
+
+      if (data.on_air) {
+        renderState('on-air', '🔴 LIVE ON AIR', 'Your camera is broadcast live right now!');
+        if (!lastOnAir) {
+          if (document.getElementById('vibrate-toggle').checked && 'vibrate' in navigator) {
+            navigator.vibrate([200, 100, 200, 100, 300]);
+          }
+          playBeep();
+        }
+        lastOnAir = true;
+      } else if (data.secondary) {
+        renderState('secondary', '🔵 ON AIR (PiP / 2nd)', 'Showing as inset / split screen');
+        lastOnAir = false;
+      } else if (data.publishing) {
+        renderState('standby', '🟢 READY / STANDBY', 'Signal connected. Ready for director cut.');
+        lastOnAir = false;
+      } else {
+        renderState('offline', '⚪ SIGNAL OFFLINE', 'Start streaming from camera app');
+        lastOnAir = false;
+      }
+    }
+
+    function renderState(state, title, hint) {
+      const box = document.getElementById('tally-box');
+      box.className = 'tally-screen my-auto py-12 px-6 rounded-3xl border-4 text-center flex flex-col items-center justify-center gap-4 shadow-2xl ';
+      if (state === 'on-air') {
+        box.className += 'tally-on-air border-red-300 tally-pulse';
+      } else if (state === 'secondary') {
+        box.className += 'tally-secondary border-blue-300';
+      } else if (state === 'standby') {
+        box.className += 'tally-standby border-green-300';
+      } else {
+        box.className += 'tally-offline border-slate-700';
+      }
+      document.getElementById('tally-status').textContent = title;
+      document.getElementById('tally-hint').textContent = hint;
+    }
+
+    pollTally();
+  </script>
+</body>
+</html>

@@ -381,3 +381,57 @@ test('Score67 source keeps edits, preserves private keys and uses the master swi
     await page.request.post('/api/scoreboard/update',{data:{source:'builtin',visible:true,overlay_url:''}});
   }
 });
+
+test('outdoor sunlight high contrast mode toggles and persists across page reloads', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await expect(page.locator('body')).not.toHaveClass(/outdoor-mode/);
+  await expect(page.locator('#outdoor-toggle')).toHaveText('☀️ Outdoor');
+
+  await page.locator('#outdoor-toggle').click();
+  await expect(page.locator('body')).toHaveClass(/outdoor-mode/);
+  await expect(page.locator('#outdoor-toggle')).toHaveText('🌙 Dark mode');
+
+  await page.reload();
+  await expect(page.locator('body')).toHaveClass(/outdoor-mode/);
+  await expect(page.locator('#outdoor-toggle')).toHaveText('🌙 Dark mode');
+
+  await page.locator('#outdoor-toggle').click();
+  await expect(page.locator('body')).not.toHaveClass(/outdoor-mode/);
+  await expect(page.locator('#outdoor-toggle')).toHaveText('☀️ Outdoor');
+});
+
+test('camera cards show Tally and QR modal with vector SVG and field router instructions', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+
+  const cam1QRBtn = page.getByRole('button', {name: '📱 Tally & QR'}).first();
+  await cam1QRBtn.click();
+
+  const qrDialog = page.locator('#qr-dialog');
+  await expect(qrDialog).toBeVisible();
+  await expect(page.locator('#qr-modal-title')).toContainText('CAM1');
+  await expect(page.locator('#qr-svg-container svg')).toBeVisible();
+  await expect(page.locator('#qr-tally-url')).toContainText('/tally/cam1');
+  await expect(page.locator('#qr-rtmp-url')).toContainText('/cam1');
+  await expect(page.locator('#qr-network-guide')).toBeVisible();
+
+  await page.locator('#qr-tab-cam2').click();
+  await expect(page.locator('#qr-modal-title')).toContainText('CAM2');
+  await expect(page.locator('#qr-tally-url')).toContainText('/tally/cam2');
+
+  await qrDialog.getByRole('button', {name: 'Done'}).click();
+  await expect(qrDialog).toBeHidden();
+});
+
+test('operator mobile tally screen loads without basic auth and displays camera state', async ({browser}) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  await page.goto('/tally/cam1');
+  await expect(page.locator('#cam-title')).toHaveText('CAM1');
+  await expect(page.locator('#rtmp-url')).toContainText('rtmp://');
+  await expect(page.locator('#tally-box')).toBeVisible();
+  await context.close();
+});
+

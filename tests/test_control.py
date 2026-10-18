@@ -90,6 +90,34 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(r.status_code,403)
         self.assertNotIn('Access-Control-Allow-Origin',r.headers)
 
+    def test_tally_accessible_without_auth(self):
+        r = self.client.get('/tally/cam1')
+        self.assertEqual(r.status_code, 200)
+        self.assertIn(b'CAM1', r.data)
+        self.assertIn(b'RTMP Publishing URL', r.data)
+
+        self.assertEqual(self.client.get('/tally/cam99').status_code, 404)
+        self.assertEqual(self.client.get('/api/tally/cam99').status_code, 404)
+
+        with patch.object(a, 'get_camera_status', return_value={'cam1': True, 'cam2': False}), \
+             patch.object(a, 'get_stream_status', return_value={'active_camera': 'cam1', 'secondary_camera': None, 'active': True, 'state': 'live'}):
+            r = self.client.get('/api/tally/cam1')
+            self.assertEqual(r.status_code, 200)
+            data = r.json
+            self.assertTrue(data['ok'])
+            self.assertEqual(data['cam_id'], 'cam1')
+            self.assertTrue(data['publishing'])
+            self.assertTrue(data['on_air'])
+            self.assertFalse(data['secondary'])
+            self.assertTrue(data['stream_active'])
+
+            r2 = self.client.get('/api/tally/cam2')
+            self.assertEqual(r2.status_code, 200)
+            data2 = r2.json
+            self.assertFalse(data2['publishing'])
+            self.assertFalse(data2['on_air'])
+            self.assertFalse(data2['secondary'])
+
     def test_json_validation(self):
         for body in [[],None,'bad',1]:
             self.assertEqual(self.post('/api/scoreboard/update',body).status_code,400)
@@ -300,6 +328,42 @@ class NetworkTests(unittest.TestCase):
     def test_pulse_mapping_by_properties(self):
         with patch.object(n,'_parse_arecord_devices',return_value=[dict(card_num=2,device_num=0,card_name='USB Mic',alsa_device='hw:2,0',is_usb=True)]),patch.object(n,'_parse_pulse_sources',return_value=[{'name':'alsa_input.USB-Microphone','properties':{'alsa.card':'2','alsa.device':'0'}}]):
             self.assertEqual(n.get_usb_audio_devices()[0]['id'],'alsa_input.USB-Microphone')
+
+    def test_get_network_status_non_blocking_skips_internet_probes(self):
+        devices = 'docker0:bridge:connected:docker0\nwlan0:wifi:connected:ClubWiFi'
+        with patch.object(n, 'run_cmd', side_effect=self.fake_nmcli(devices)), \
+             patch.object(n, '_owned_uuid', return_value=None), \
+             patch.object(n, '_is_usb_device', return_value=False), \
+             patch.object(n, '_internet_available', side_effect=AssertionError("Should not probe internet")) as probe:
+            status = n.get_network_status(check_internet=False)
+            probe.assert_not_called()
+            self.assertEqual(status['camera_mode'], 'lan')
+
+    def test_failed_hotspot_activation_cleans_up_profile(self):
+        deleted = []
+        def fake_run(cmd, timeout=10):
+            if cmd[:2] == ['nmcli', '-t']:
+                return True, 'wlan0:wifi'
+            if cmd[:3] == ['nmcli', '-g', 'WIFI-PROPERTIES.AP']:
+                return True, 'yes'
+            if cmd[:3] == ['nmcli', 'connection', 'add']:
+                return True, ''
+            if cmd[:3] == ['nmcli', 'connection', 'up']:
+                return False, 'Error: activation failed'
+            if cmd[:3] == ['nmcli', 'connection', 'delete']:
+                deleted.append(cmd)
+                return True, ''
+            return True, ''
+        with tempfile.TemporaryDirectory() as tmp:
+            test_profile = Path(tmp) / 'hotspot-uuid'
+            with patch.object(n, '_owned_uuid', return_value=None), \
+                 patch.object(n, 'run_cmd', side_effect=fake_run), \
+                 patch.object(n, 'PROFILE_FILE', test_profile):
+                ok, msg = n.start_hotspot('TestNet', 'password123')
+                self.assertFalse(ok)
+                self.assertIn('Hotspot activation failed', msg)
+                self.assertTrue(len(deleted) > 0)
+                self.assertFalse(test_profile.exists())
 
 
 class MediaTests(unittest.TestCase):

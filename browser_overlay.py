@@ -9,7 +9,14 @@ import zlib
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
-FRAME_PATH = Path(__file__).resolve().parent / 'data' / 'score67-overlay.png'
+def _default_frame_path():
+    shm = Path("/dev/shm")
+    if shm.is_dir() and os.access(shm, os.W_OK):
+        return shm / "mcc-score67-overlay.png"
+    return Path(__file__).resolve().parent / "data" / "score67-overlay.png"
+
+
+FRAME_PATH = _default_frame_path()
 WIDTH, HEIGHT = 1920, 1080
 
 
@@ -67,7 +74,7 @@ class BrowserOverlay:
         self._stop = threading.Event()
         self._url = ''
         self._generation = 0
-        self._state = {'state': 'off', 'message': ''}
+        self._state = {'state': 'off', 'message': '', 'updated_at': 0.0}
         self._thread = None
 
     def configure(self, source, visible, url):
@@ -79,7 +86,7 @@ class BrowserOverlay:
             self._generation += 1
             # Clear immediately; an old in-flight screenshot may never restore this frame.
             write_frame(self.path, BLANK)
-            self._state = {'state': 'loading' if desired else 'off', 'message': ''}
+            self._state = {'state': 'loading' if desired else 'off', 'message': '', 'updated_at': time.time()}
             self._wake.set()
 
     def status(self):
@@ -103,7 +110,7 @@ class BrowserOverlay:
             if generation != self._generation or self._stop.is_set():
                 return False
             write_frame(self.path, frame)
-            self._state = {'state': state, 'message': message}
+            self._state = {'state': state, 'message': message, 'updated_at': time.time()}
             return True
 
     def _run(self):

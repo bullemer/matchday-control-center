@@ -19,6 +19,8 @@ DEFAULT_HOTSPOT_IP = "10.42.0.1"
 PROFILE = "Matchday-Control-Hotspot"
 PROFILE_FILE = Path(__file__).resolve().parent / "data/hotspot-uuid"
 _network_lock = threading.Lock()
+_last_internet_status = False
+_last_internet_check_ts = 0.0
 # Left blank, NetworkManager may advertise mixed WPA1/TKIP, which current phones reject or
 # hide. Pin plain WPA2-AES on 2.4 GHz (5 GHz AP channels are often not allowed on laptops).
 HOTSPOT_RADIO = ["802-11-wireless.band", "bg", "wifi-sec.key-mgmt", "wpa-psk",
@@ -88,11 +90,13 @@ def _internet_available():
     return False
 
 
-def get_network_status():
+def get_network_status(check_internet=True):
     """Report the internet uplink and the network camera phones should join.
 
     Cameras use the app's hotspot when it is active; otherwise they join the same
-    Wi-Fi/LAN the laptop is connected to (a USB tether is never a camera network)."""
+    Wi-Fi/LAN the laptop is connected to (a USB tether is never a camera network).
+    Pass check_internet=False to avoid blocking when inspecting local interfaces."""
+    global _last_internet_status, _last_internet_check_ts
     info = dict(wifi_ip="N/A", usb_iface=None, usb_status="Disconnected", usb_state=None,
                 hotspot_active=False, hotspot_ssid=None, hotspot_iface=None, internet_ok=False,
                 lan_iface=None, lan_type=None, lan_name=None, lan_ip=None,
@@ -147,8 +151,10 @@ def get_network_status():
             info["uplink"] = info["lan_name"] or dev
         else:
             info["uplink"] = dev
-    # General internet connectivity is independent of which uplink is selected.
-    info["internet_ok"] = _internet_available()
+    if check_internet:
+        _last_internet_status = _internet_available()
+        _last_internet_check_ts = time.monotonic()
+    info["internet_ok"] = _last_internet_status
     return info
 
 
@@ -227,7 +233,14 @@ def start_hotspot(ssid, password=""):
         PROFILE_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         PROFILE_FILE.write_text(uuid)
         ok, out = run_cmd(["nmcli", "connection", "up", "uuid", uuid], timeout=30)
-        return ok, "Hotspot started" if ok else "Hotspot activation failed; inspect NetworkManager logs"
+        if not ok:
+            run_cmd(["nmcli", "connection", "delete", "uuid", uuid], timeout=5)
+            try:
+                PROFILE_FILE.unlink()
+            except OSError:
+                pass
+            return False, "Hotspot activation failed; inspect NetworkManager logs"
+        return True, "Hotspot started"
 
 
 def stop_hotspot():
