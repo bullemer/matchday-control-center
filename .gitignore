@@ -28,3 +28,5 @@ playwright-report/
 test-results/
 # Local match recordings
 recordings/
+# Live overlay text, rewritten by the running app
+static/scoreboard.txt
