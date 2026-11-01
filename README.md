@@ -52,6 +52,12 @@ workers: the hardware process manager and live match state are process-local.
    source (Cam 1 or the USB mic) is missing or drops out, the picture stays on the
    selected camera with that camera's own audio (or silence) and the dashboard shows an
    audio warning; the chosen source is restored automatically when it returns.
+   **Mute** (Main tab audio panel, Match mode, or key M in Match mode) silences every
+   source on the broadcast at once — for a stoppage, an injury or a private word on the
+   bench. Picture, scoreboard and the YouTube connection keep running; unmuting restores
+   the previous mix. Audio-source and level changes made while muted take effect on
+   unmute. Mute lasts until it is switched off, including across camera cuts, and resets
+   to off when the app restarts.
 5. Enter the YouTube stream key, choose 1080p, 720p or 480p, and click GO LIVE.
    1080p needs about 7 Mbps of reliable upload; use 720p on a weak mobile connection. The app
    validates a camera relay before launching the output encoder. “Starting” is not
@@ -184,6 +190,7 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/stream/stop` | Stop streaming |
 | POST | `/api/switch/<cam_id>` | Select cam1/cam2/cam3 |
 | POST | `/api/layout` | `mode`: single/pip/split, `main`, `secondary`, `position`: top-left/top-right/bottom-left/bottom-right |
+| POST | `/api/audio/mute` | `muted`: true/false — master mute of every source, mixer kept |
 | POST | `/api/audio-source` | `mode`: `cam1`, `active`, or `usb:<device id>` |
 | GET | `/api/audio/devices` | Audio devices |
 | POST | `/api/scoreboard/update` | Names/scores, atomic `team` + `delta`, `visible`, `source` (builtin/score67), `overlay_url` |

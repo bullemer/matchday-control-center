@@ -106,6 +106,27 @@
     .match-btn { min-height: 48px; white-space: nowrap; }
     .cut-btn:disabled { cursor: not-allowed; }
 
+    /* Setup tabs: only the selected tab's sections are shown */
+    .tab-bar { display: flex; gap: .25rem; padding: .25rem; overflow-x: auto; background: #1e293b; border: 1px solid #334155; border-radius: .75rem; }
+    .tab-btn { flex: 1 1 0; min-width: max-content; padding: .6rem 1rem; border-radius: .5rem; font-weight: 600; font-size: .875rem; color: #cbd5e1; white-space: nowrap; }
+    .tab-btn:hover { background: #334155; }
+    .tab-btn[aria-selected="true"] { background: #2563eb; color: #fff; }
+    /* Master mute: red and unmistakable while the broadcast is silent */
+    .mute-btn { width: 100%; min-height: 48px; padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; font-size: .95rem; background: #334155; color: #e2e8f0; border: 1px solid #475569; }
+    .mute-btn:hover { background: #475569; }
+    .mute-btn[aria-pressed="true"] { background: #dc2626; color: #fff; border-color: #fca5a5; animation: mute-pulse 1.6s ease-in-out infinite; }
+    .mute-btn:disabled { opacity: .6; cursor: wait; }
+    .mute-btn.mute-compact { width: auto; min-height: 0; flex-shrink: 0; padding: .5rem .6rem; font-size: .875rem; }
+    @keyframes mute-pulse { 50% { background: #991b1b; } }
+    .outdoor-mode .mute-btn { background: #e2e8f0; color: #0f172a; border: 2px solid #0f172a; }
+    .outdoor-mode .mute-btn[aria-pressed="true"] { background: #dc2626; color: #fff; }
+    @media (max-width: 480px) { .tab-btn { padding: .55rem .4rem; font-size: .8rem; } }
+    body:not(.match-mode) [data-tab][hidden] { display: none; }
+    .outdoor-mode .tab-bar { background: #fff; border: 2px solid #0f172a; }
+    .outdoor-mode .tab-btn { color: #0f172a; }
+    .outdoor-mode .tab-btn:hover { background: #e2e8f0; }
+    .outdoor-mode .tab-btn[aria-selected="true"] { background: #0f172a; color: #fff; }
+
     /* Audio level meters: -60..0 dBFS; green to -18, amber to -6, red above */
     .meter-row { display: grid; grid-template-columns: minmax(0, 9rem) 1fr 4.5rem; align-items: center; gap: .5rem; }
     .meter-label { font-size: .75rem; color: #cbd5e1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -262,6 +283,13 @@
        ═══════════════════════════════════════════════════════════════════ -->
   <main class="max-w-6xl mx-auto px-4 py-6 space-y-6">
 
+    <nav data-setup class="tab-bar" role="tablist" aria-label="Setup sections">
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="main" onclick="selectTab('main')">📺 Main</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="cams" onclick="selectTab('cams')">🎥 Cams</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="network" onclick="selectTab('network')">🌐 Network</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="checklist" onclick="selectTab('checklist')">✅ Checklist</button>
+    </nav>
+
     <!-- ─────────────────────────────────────────────────────────────────
          MATCH MODE: everything needed during play on one phone screen
          ───────────────────────────────────────────────────────────────── -->
@@ -288,10 +316,13 @@
           {% endfor %}
         </div>
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 space-y-2">
-          <div class="grid grid-cols-3 rounded-lg overflow-hidden border border-slate-600">
-            <button data-audio="cam1" onclick="setAudioSource('cam1')" class="px-2 py-2.5 text-sm font-medium">🎙 Cam 1 mic</button>
-            <button data-audio="active" onclick="setAudioSource('active')" class="px-2 py-2.5 text-sm font-medium">🔄 Follow cam</button>
-            <button data-audio="usb" onclick="setAudioSource('usb')" class="px-2 py-2.5 text-sm font-medium">🎤 USB mic</button>
+          <div class="flex gap-2">
+            <button data-mute="compact" onclick="toggleMute()" aria-pressed="false" class="mute-btn mute-compact">🔊 Mute</button>
+            <div class="flex-1 grid grid-cols-3 rounded-lg overflow-hidden border border-slate-600">
+              <button data-audio="cam1" onclick="setAudioSource('cam1')" title="Cam 1 mic" class="px-2 py-2.5 text-sm font-medium">🎙 Cam 1</button>
+              <button data-audio="active" onclick="setAudioSource('active')" title="Follow camera" class="px-2 py-2.5 text-sm font-medium">🔄 Follow</button>
+              <button data-audio="usb" onclick="setAudioSource('usb')" title="USB mic" class="px-2 py-2.5 text-sm font-medium">🎤 USB</button>
+            </div>
           </div>
           <div data-usb-picker class="hidden">
             <select data-usb-select onchange="selectUsbAudioDevice(this.value)" aria-label="USB microphone"
@@ -353,7 +384,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          2. NETWORK CONTROLS PANEL
          ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup data-tab="network" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🌐 Network Controls
       </h2>
@@ -420,7 +451,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          3. CAMERA OPERATOR QUICK-COPY CARDS
          ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup data-tab="cams" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         🎥 Camera RTMP Links &amp; Tally
         <span class="text-xs text-slate-400 font-normal">(Tap to scan QR or copy on camera phones)</span>
@@ -487,7 +518,7 @@
     <!-- ─────────────────────────────────────────────────────────────────
          4. MULTIVIEW GRID + CAMERA SWITCHING
          ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup data-tab="main" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         📺 Multiview &amp; Camera Switching
         <button onclick="openLayoutEditor()" aria-label="Video layout" class="ml-auto text-sm px-3 py-2 rounded bg-brand-blue text-white">Layout</button>
@@ -561,6 +592,7 @@
 
       <!-- Audio Source Toggle -->
       <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-3">
+        <button data-mute onclick="toggleMute()" aria-pressed="false" class="mute-btn">🔊 Audio on — tap to mute</button>
         <div class="flex items-center gap-3 flex-wrap">
           <span class="text-sm text-slate-400">🔊 Audio Source:</span>
           <div class="flex rounded-lg overflow-hidden border border-slate-600">
@@ -601,52 +633,9 @@
     </section>
 
     <!-- ─────────────────────────────────────────────────────────────────
-         5. YOUTUBE STREAM CONTROLS
+         5. LIVE FOOTBALL SCOREBOARD CONTROLS
          ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
-      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        ▶️ YouTube Stream
-      </h2>
-      <div class="space-y-4">
-        <!-- Stream Key Input -->
-        <div>
-          <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
-          <div class="flex flex-col sm:flex-row gap-2">
-            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
-            <div class="relative flex-1">
-              <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
-                     class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
-              <button onclick="toggleStreamKeyVisibility()"
-                      class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm px-2 py-1">
-                👁
-              </button>
-            </div>
-          </div>
-        </div>
-        <!-- Go Live / Stop -->
-        <div class="flex gap-3">
-          <button onclick="goLive()"
-                  class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
-            🔴 GO LIVE
-          </button>
-          <button onclick="stopStream()"
-                  class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
-            ⏹ STOP STREAM
-          </button>
-        </div>
-        <!-- Duration Timer -->
-        <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
-          <span class="pulse-live text-red-500 text-lg">🔴</span>
-          <span class="text-sm text-slate-300">ON AIR</span>
-          <span id="yt-duration" data-bind="yt_duration" class="font-mono text-xl text-white font-bold ml-auto">00:00:00</span>
-        </div>
-      </div>
-    </section>
-
-    <!-- ─────────────────────────────────────────────────────────────────
-         6. LIVE FOOTBALL SCOREBOARD CONTROLS
-         ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup data-tab="main" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         ⚽ Scoreboard &amp; Match Clock
       </h2>
@@ -756,9 +745,52 @@
     </section>
 
     <!-- ─────────────────────────────────────────────────────────────────
+         6. YOUTUBE STREAM CONTROLS
+         ───────────────────────────────────────────────────────────────── -->
+    <section data-setup data-tab="main" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
+        ▶️ YouTube Stream
+      </h2>
+      <div class="space-y-4">
+        <!-- Stream Key Input -->
+        <div>
+          <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
+          <div class="flex flex-col sm:flex-row gap-2">
+            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
+            <div class="relative flex-1">
+              <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
+                     class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
+              <button onclick="toggleStreamKeyVisibility()"
+                      class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm px-2 py-1">
+                👁
+              </button>
+            </div>
+          </div>
+        </div>
+        <!-- Go Live / Stop -->
+        <div class="flex gap-3">
+          <button onclick="goLive()"
+                  class="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
+            🔴 GO LIVE
+          </button>
+          <button onclick="stopStream()"
+                  class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
+            ⏹ STOP STREAM
+          </button>
+        </div>
+        <!-- Duration Timer -->
+        <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
+          <span class="pulse-live text-red-500 text-lg">🔴</span>
+          <span class="text-sm text-slate-300">ON AIR</span>
+          <span id="yt-duration" data-bind="yt_duration" class="font-mono text-xl text-white font-bold ml-auto">00:00:00</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
          7. INTERACTIVE SIDELINE CHECKLIST
          ───────────────────────────────────────────────────────────────── -->
-    <section data-setup class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+    <section data-setup data-tab="checklist" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
         ✅ Sideline Checklist
       </h2>
@@ -918,6 +950,8 @@
       clockLastServerUpdate: null, // Date.now() of last server sync
       streamKeyVisible: false,
       matchMode: false,
+      tab: 'main',
+      muted: false,
       matchPreview: true,
       lastOverlayUpdate: 0,
       outdoorMode: storeGet('mcc-outdoor-mode') === 'true',
@@ -1161,6 +1195,18 @@
       window.scrollTo(0, 0);
     }
 
+    const TABS = ['main', 'cams', 'network', 'checklist'];
+
+    function selectTab(tab) {
+      state.tab = TABS.includes(tab) ? tab : 'main';
+      storeSet('mcc-tab', state.tab);
+      document.querySelectorAll('[data-tab]').forEach(el => { el.hidden = el.dataset.tab !== state.tab; });
+      document.querySelectorAll('[data-tab-btn]').forEach(btn => {
+        btn.setAttribute('aria-selected', String(btn.dataset.tabBtn === state.tab));
+      });
+      syncPreviews();
+    }
+
     function toggleMatchPreview() {
       state.matchPreview = !state.matchPreview;
       storeSet('mcc-match-preview', state.matchPreview ? 'on' : 'off');
@@ -1191,7 +1237,7 @@
       document.querySelectorAll('iframe[data-preview]').forEach(frame => {
         const visible = frame.dataset.preview === 'match'
           ? state.matchMode && state.matchPreview
-          : !state.matchMode;
+          : !state.matchMode && state.tab === 'main';
         const online = !frame.dataset.camera || !!state.cameras[frame.dataset.camera];
         const wanted = visible && online;
         frame.hidden = !wanted;
@@ -1208,15 +1254,17 @@
     function matchGoLive() {
       if (document.getElementById('stream-key').value.trim()) return goLive();
       showToast('Enter the stream key in Setup first', 'warning');
+      selectTab('main');
       toggleMode();
       document.getElementById('stream-key').focus();
     }
 
-    // Keys 1–3 cut cameras in match mode (laptop keyboard).
+    // Keys 1–3 cut cameras and M toggles mute in match mode (laptop keyboard).
     document.addEventListener('keydown', event => {
       if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
+      if (event.key === 'm' || event.key === 'M') toggleMute();
     });
 
     function openLayoutEditor() {
@@ -1315,6 +1363,32 @@
         if (!frame) return;
         frame.classList.toggle('border-red-500', c === state.activeCam);
         frame.classList.toggle('border-slate-700', c !== state.activeCam);
+      });
+    }
+
+    // ──────────────────────── Master mute ────────────────────────
+    let mutePending = false;
+    async function toggleMute() {
+      if (mutePending) return;
+      mutePending = true;
+      const muted = !state.muted;
+      renderMute();
+      try {
+        const result = await apiPost('/api/audio/mute', {muted});
+        if (result) state.muted = !!result.mixer.muted;
+      } finally {
+        mutePending = false;
+        renderMute();
+      }
+    }
+
+    function renderMute() {
+      document.querySelectorAll('[data-mute]').forEach(btn => {
+        btn.disabled = mutePending;
+        btn.setAttribute('aria-pressed', String(state.muted));
+        btn.textContent = btn.dataset.mute === 'compact'
+          ? (state.muted ? '🔇 MUTED' : '🔊 Mute')
+          : (state.muted ? '🔇 MUTED — tap to unmute' : '🔊 Audio on — tap to mute');
       });
     }
 
@@ -1841,6 +1915,10 @@
     }
 
     function renderMeters(info) {
+      if (info.mixer && !mutePending && state.muted !== !!info.mixer.muted) {
+        state.muted = !!info.mixer.muted;
+        renderMute();
+      }
       const levels = info.levels || {};
       const live = new Set(info.audio_on_air || []);
       const inputs = Object.keys(levels).filter(k => k !== 'program').sort();
@@ -2059,6 +2137,10 @@
       }
 
       // --- Audio Source ---
+      if (typeof stream.muted === 'boolean' && !mutePending) {
+        state.muted = stream.muted;
+        renderMute();
+      }
       if (stream.audio_source && !audioPending) {
         state.audioSource = stream.audio_source;
         if (stream.audio_source.startsWith('usb:')) {
@@ -2133,10 +2215,12 @@
 
     state.matchMode = storeGet('mcc-mode') === 'match';
     state.matchPreview = storeGet('mcc-match-preview') !== 'off';
+    selectTab(storeGet('mcc-tab'));
     applyMode();
     applyOutdoorMode();
     updateTallyButtons();
     updateAudioToggle();
+    renderMute();
     loadHotspotConfig();
     pollLoop();
   </script>

@@ -105,7 +105,9 @@ test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address'
     await route.fulfill({response, json: body});
   });
   await page.goto('/');
+  await page.getByRole('tab', {name: /Cams/}).click();
   await expect(page.locator('#url-cam1')).toHaveText('rtmp://192.168.1.50:1935/cam1');
+  await page.getByRole('tab', {name: /Network/}).click();
   await expect(page.locator('#camera-network-title')).toContainText('same Wi-Fi “Club WiFi”');
   await expect(page.locator('#status-hotspot-ip')).toHaveText('192.168.1.50');
   await expect(page.locator('#status-usb-label')).toHaveText('Club WiFi');
@@ -132,6 +134,7 @@ test('team names keep their own wording on the overlay and can be renamed in mat
 
 test('hotspot form keeps the saved password and buttons follow the hotspot state', async ({page}) => {
   await page.goto('/');
+  await page.getByRole('tab', {name: /Network/}).click();
   await expect(page.locator('#net-hotspot-status')).toHaveText('Active');
   await expect(page.locator('#hotspot-password')).toHaveValue('saved-secret');
   await expect(page.locator('#hotspot-ssid')).toHaveValue('MatchdayLive');
@@ -404,6 +407,7 @@ test('outdoor sunlight high contrast mode toggles and persists across page reloa
 test('camera cards show Tally and QR modal with vector SVG and field router instructions', async ({page}) => {
   await page.goto('/');
   await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.getByRole('tab', {name: /Cams/}).click();
 
   const cam1QRBtn = page.getByRole('button', {name: '📱 Tally & QR'}).first();
   await cam1QRBtn.click();
@@ -435,3 +439,44 @@ test('operator mobile tally screen loads without basic auth and displays camera 
   await context.close();
 });
 
+
+test('setup tabs group sections, persist the choice and play previews only on Main', async ({page}) => {
+  await page.goto('/');
+  await expect(page.getByRole('tab', {name: /Main/})).toHaveAttribute('aria-selected', 'true');
+  for (const title of ['Multiview', 'Scoreboard & Match Clock', 'YouTube Stream']) {
+    await expect(page.getByRole('heading', {name: title})).toBeVisible();
+  }
+  for (const title of ['Network Controls', 'Camera RTMP Links', 'Sideline Checklist']) {
+    await expect(page.getByRole('heading', {name: title})).toBeHidden();
+  }
+  await page.getByRole('tab', {name: /Cams/}).click();
+  await expect(page.getByRole('heading', {name: 'Camera RTMP Links'})).toBeVisible();
+  await expect(page.getByRole('heading', {name: 'Multiview'})).toBeHidden();
+  await expect(page.locator('iframe[data-preview="setup"][src]')).toHaveCount(0);
+  await page.getByRole('tab', {name: /Checklist/}).click();
+  await page.reload();
+  await expect(page.getByRole('tab', {name: /Checklist/})).toHaveAttribute('aria-selected', 'true');
+  await expect(page.getByRole('heading', {name: 'Sideline Checklist'})).toBeVisible();
+  await page.getByRole('tab', {name: /Main/}).click();
+});
+
+test('master mute silences the broadcast from Main and match mode and stays in sync', async ({page}) => {
+  await page.goto('/');
+  const setupMute = page.locator('section[data-tab="main"] [data-mute]');
+  const matchMute = page.locator('#match-panel [data-mute]');
+  await expect(setupMute).toHaveAttribute('aria-pressed', 'false');
+  await setupMute.click();
+  await expect(setupMute).toHaveText(/MUTED/);
+  await expect(setupMute).toHaveAttribute('aria-pressed', 'true');
+  await expect.poll(async () => (await page.request.get('/api/audio/levels')).json().then(x => x.mixer.muted)).toBe(true);
+  await page.waitForTimeout(2500);  // status polls keep the muted state
+  await expect(setupMute).toHaveAttribute('aria-pressed', 'true');
+  await page.locator('#mode-toggle').click();
+  await expect(matchMute).toHaveAttribute('aria-pressed', 'true');
+  await expect(matchMute).toHaveText('🔇 MUTED');
+  await page.keyboard.press('m');
+  await expect(matchMute).toHaveAttribute('aria-pressed', 'false');
+  await expect(matchMute).toHaveText('🔊 Mute');
+  await expect.poll(async () => (await page.request.get('/api/audio/levels')).json().then(x => x.mixer.muted)).toBe(false);
+  await page.locator('#mode-toggle').click();
+});

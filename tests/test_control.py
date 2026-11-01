@@ -32,6 +32,13 @@ class ApiTests(unittest.TestCase):
     def post(self,url,body):
         return self.client.post(url,json=body,headers=self.headers)
 
+    def test_mute_endpoint_validates(self):
+        self.assertEqual(self.post('/api/audio/mute',{'muted':'yes'}).status_code,400)
+        with patch.object(a,'set_mute',return_value=(True,'Audio muted')) as mute:
+            result=self.post('/api/audio/mute',{'muted':True})
+        self.assertEqual(result.status_code,200)
+        mute.assert_called_once_with(True)
+
     def test_external_source_validation_persistence_and_builtin_restoration(self):
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'score67'}).status_code, 400)
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'other'}).status_code, 400)
@@ -405,6 +412,39 @@ class MediaTests(unittest.TestCase):
             self.assertTrue(m.set_mix('usb:mic',on=False)[0])  # off = live mute, still no rebuild
             cut.assert_not_called()
             self.assertEqual(dict((c.args[0],c.args[1]) for c in send.call_args_list)['m1'],0.0)
+
+    def test_mute_silences_every_channel_live_and_restores_mix(self):
+        relay=MagicMock(); relay.poll.return_value=None
+        with self.mixer(**{'usb:mic':{'on':True,'gain':-6.0}}),patch.object(m,'_follow',False),patch.object(m,'_muted',False),patch.object(m,'_active_camera','cam2'),patch.object(m,'_relay_proc',relay),patch.object(m,'_relay_channels',{'cam1':'m0','usb:mic':'m1'}),patch.object(m,'_relay_missing',set()),patch.object(m,'_relay_muted',set()),patch.object(m,'_send_volume',return_value=True) as send,patch.object(m,'switch_camera') as cut:
+            self.assertEqual(m.set_mute(True),(True,'Audio muted'))
+            cut.assert_not_called()
+            self.assertEqual({c.args[0]:c.args[1] for c in send.call_args_list},{'m0':0.0,'m1':0.0})
+            self.assertTrue(m.get_mixer()['muted'])
+            self.assertEqual(m._relay_muted,{'cam1','usb:mic'})
+            self.assertEqual(m._mix['usb:mic'],{'on':True,'gain':-6.0})  # mixer untouched
+            # Mixer edits while muted are kept but stay silent, and never rebuild.
+            send.reset_mock()
+            self.assertTrue(m.set_mix('cam3',on=True)[0])
+            cut.assert_not_called()
+            self.assertTrue(all(c.args[1]==0.0 for c in send.call_args_list))
+            send.reset_mock()
+            m._mix['cam3']['on']=False
+            self.assertEqual(m.set_mute(False),(True,'Audio unmuted'))
+            volumes={c.args[0]:c.args[1] for c in send.call_args_list}
+            self.assertEqual(volumes['m0'],1.0); self.assertAlmostEqual(volumes['m1'],0.5012,places=3)
+            self.assertEqual(m._relay_muted,set())
+
+    def test_mute_failure_rolls_back(self):
+        relay=MagicMock(); relay.poll.return_value=None
+        with self.mixer(),patch.object(m,'_follow',False),patch.object(m,'_muted',False),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_proc',relay),patch.object(m,'_relay_channels',{'cam1':'m0'}),patch.object(m,'_relay_missing',set()),patch.object(m,'_send_volume',return_value=False),patch.object(m,'switch_camera',return_value=(False,'bad')):
+            self.assertFalse(m.set_mute(True)[0])
+            self.assertFalse(m._muted)
+
+    def test_relay_built_while_muted_starts_silent(self):
+        with patch.object(m,'_muted',True),patch.object(m,'_probe',return_value={'video','audio'}):
+            cmd, channels, _, _, _, _ = m._relay_command('cam2',{'cam2':0.0,'cam1':0.0})
+        graph=cmd[cmd.index('-filter_complex')+1]
+        self.assertIn('volume@m0=0.0000',graph); self.assertIn('volume@m1=0.0000',graph)
 
     def test_new_source_rebuilds_relay(self):
         relay=MagicMock(); relay.poll.return_value=None

@@ -39,7 +39,7 @@ from network_manager import (get_network_status, connect_usb, start_hotspot, get
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
-                          get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow,
+                          get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS)
 
 def init_mediamtx():
@@ -474,6 +474,18 @@ def api_audio_mix():
         if on is None and gain is None:
             raise ValueError("Provide on and/or gain")
         success, msg = set_mix(channel, on=on, gain=gain)
+    return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 502
+
+
+@app.route("/api/audio/mute", methods=["POST"])
+@api_endpoint
+def api_audio_mute():
+    """Master mute {"muted": bool}: silences every source live, keeping the mixer."""
+    data = request.get_json(force=True, silent=True) or {}
+    if type(data.get("muted")) is not bool:
+        raise ValueError("muted must be true or false")
+    log.info("Audio %s requested", "mute" if data["muted"] else "unmute")
+    success, msg = set_mute(data["muted"])
     return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 502
 
 

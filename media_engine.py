@@ -55,6 +55,7 @@ _layout_warning = ""
 # channel on that the running relay does not include rebuilds the relay.
 _mix = {c: {"on": c == "cam1", "gain": 0.0} for c in CAMERA_IDS}
 _follow = False
+_muted = False           # master mute: every channel at zero volume, mixer settings kept
 _mic_ids = set()         # detected microphone ids, set by the app
 _relay_channels = {}     # channel -> volume filter name in the running relay
 _relay_muted = set()     # installed channels successfully muted in the running relay
@@ -402,7 +403,7 @@ def get_audio_source():
 
 
 def get_mixer():
-    return {"follow": _follow, "preset": get_audio_source(),
+    return {"follow": _follow, "muted": _muted, "preset": get_audio_source(),
             "channels": {c: {**setting, "available": c in CAMERA_IDS or c[4:] in _mic_ids}
                          for c, setting in _mix.items()}}
 
@@ -432,7 +433,7 @@ def get_stream_status():
             "layout": dict(_layout),
             "secondary_camera": _relay_secondary if get_active_camera() else None,
             "layout_warning": _layout_warning if _relay_proc else "",
-            "audio_source": get_audio_source(),
+            "audio_source": get_audio_source(), "muted": _muted,
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
             "started_at": _started_at,
@@ -570,7 +571,7 @@ def _relay_command(cam, wanted):
     for index, (channel, pad, gain) in enumerate(sources):
         name = f"m{index}"
         parts.append(f"[{pad}]aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                     f"volume@{name}={_db_to_volume(gain):.4f}[{name}]")
+                     f"volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}[{name}]")
         labels.append(f"[{name}]")
         channels[channel] = name
     address = ZMQ_ADDRESS.replace(":", "\\\\:")  # escaped twice: filter option, then graph
@@ -671,7 +672,7 @@ def _replace_relay(cam_id, generation):
         if installed:
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
-            _relay_muted = set()
+            _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
             _layout = {**_layout, "main": cam_id}
             _error, _relay_failures = "", 0
@@ -734,12 +735,14 @@ def _apply_mix():
         stop_generation = _stop_generation
         camera, relay, channels, missing = _active_camera, _relay_proc, dict(_relay_channels), set(_relay_missing)
         wanted = _effective_mix(camera) if camera else {}
+        muted = _muted
     if not camera:
         return True, "Mixer updated"
-    if relay is not None and relay.poll() is None and set(wanted) - missing <= set(channels):
+    # Muting never rebuilds: silencing the channels the relay has is enough.
+    if relay is not None and relay.poll() is None and (muted or set(wanted) - missing <= set(channels)):
         applied = True
         for channel, name in channels.items():
-            volume = _db_to_volume(wanted[channel]) if channel in wanted else 0.0
+            volume = _db_to_volume(wanted[channel]) if channel in wanted and not muted else 0.0
             if not _send_volume(name, volume):
                 applied = False
                 break
@@ -761,7 +764,7 @@ def _apply_mix():
 
 def _set_mixer(change):
     """Apply change() to the mixer state; roll it back if the relay cannot follow."""
-    global _mix, _follow
+    global _mix, _follow, _muted
     stop_generation = _stop_generation
     # Serialize mixer mutations with relay replacement, including live ZMQ commands.
     # STOP remains independent and can cancel work waiting for this lock.
@@ -769,12 +772,12 @@ def _set_mixer(change):
         with _lock:
             if stop_generation != _stop_generation:
                 return False, SUPERSEDED
-            previous = ({c: dict(v) for c, v in _mix.items()}, _follow)
+            previous = ({c: dict(v) for c, v in _mix.items()}, _follow, _muted)
             change()
         ok, message = _apply_mix()
         if not ok:
             with _lock:
-                _mix, _follow = previous
+                _mix, _follow, _muted = previous
         return ok, message
 
 
@@ -818,6 +821,16 @@ def set_follow(follow):
         global _follow
         _follow = bool(follow)
     return _set_mixer(change)
+
+
+def set_mute(muted):
+    """Master mute: silence every audio source on air without touching the mixer,
+    the picture or the YouTube connection; unmuting restores the previous mix."""
+    def change():
+        global _muted
+        _muted = bool(muted)
+    ok, message = _set_mixer(change)
+    return ok, message.replace("Mixer updated", "Audio muted" if muted else "Audio unmuted")
 
 
 def _launch_encoder():
