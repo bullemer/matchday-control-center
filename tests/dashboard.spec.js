@@ -509,7 +509,7 @@ test('recording controls, highlight marking and the Recordings tab', async ({pag
   const live = cards.nth(0), done = cards.nth(1);
   await expect(live).toContainText('Polonia vs Altona');
   await expect(live.locator('.rec-badge')).toHaveText('⏺ REC');
-  await expect(live.locator('[data-marker]')).toHaveCount(2);  // ⭐ button and H key
+  await expect(live.locator('[data-marker]')).toHaveCount(3);  // fixture's Chance, ⭐ button and H key
   await expect(live.getByRole('button', {name: /Delete/})).toHaveCount(0);  // cannot delete while recording
   await expect(done.locator('.chip')).toHaveText('Ready');
   await expect(done.getByRole('link', {name: /Download MP4/})).toHaveAttribute('href', /20261101_Polonia-vs-HEBC\.mp4\?download=1$/);
@@ -628,4 +628,45 @@ test('stream to several platforms at once, each with its own key, status and sto
   expect(calls.stops).toEqual(['facebook']);
   await page.request.post('/api/stream/stop', {data: {}});
   for (const name of ['facebook', 'twitch', 'custom']) await row(name).locator('[data-dest-enabled]').uncheck();
+});
+
+test('CAM REPLAY: scrub the recording, play from a moment and stay on air until a cut', async ({page}) => {
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Main/}).click();
+  const panel = page.locator('#replay-panel');
+  const cut = page.locator('#btn-cut-replay');
+  await expect(cut).toBeDisabled();
+  await expect(cut.locator('[data-cut-state]')).toHaveText('Needs recording');
+  await page.locator('[data-rec-start]').click();
+  await expect(cut).toBeEnabled();
+  const slider = page.locator('#replay-cue');
+  await expect.poll(async () => Number(await slider.getAttribute('max'))).toBeGreaterThan(115);  // ~118.5 s replayable
+  await expect(panel.locator('[data-bind="replay_cue_behind"]')).toHaveText('(10 s before live)');
+  await panel.getByRole('button', {name: '◀ 10 s'}).click();
+  await expect(panel.locator('[data-bind="replay_cue_behind"]')).toHaveText(/\((19|20|21) s before live\)/);
+  await panel.locator('.replay-tick[title^="Chance"]').click();  // the fixture's highlight, ~60 s in
+  const cue = Number(await slider.inputValue());
+  expect(cue).toBeGreaterThan(53); expect(cue).toBeLessThan(57);  // 5 s before the mark
+  await expect(page.locator('#replay-still-msg')).toHaveText('No picture at that moment yet');  // fixture has no video
+  await panel.getByRole('button', {name: '🐢 Play slow'}).click();
+  await expect(page.locator('#status-replay-badge')).toBeVisible();
+  await expect(cut.locator('[data-cut-state]')).toHaveText('On air · slow');
+  await expect(page.locator('[data-cut="cam1"] [data-cut-state]').first()).toHaveText('Ready');  // no automatic return
+  await expect(panel.locator('[data-bind="replay_status"]')).toContainText('cut to a camera to end it');
+  let calls = await (await page.request.get('/test/replay-calls')).json();
+  expect(calls[calls.length - 1].slice(1, 3)).toEqual([0.5, null]);
+  expect(calls[calls.length - 1][3]).toBeCloseTo(cue, 0);
+  expect(calls[calls.length - 1][4]).toBe(true);
+  await panel.getByRole('button', {name: '⏹ Back to live'}).click();
+  await expect(cut.locator('[data-cut-state]')).toHaveText(/^Ready · 0:5\d$/);  // keeps the chosen moment
+  // Match mode: REPLAY cut button and key 4 use the same moment and the last speed.
+  await page.locator('#mode-toggle').click();
+  await page.keyboard.press('4');
+  await expect(page.locator('#match-panel [data-cut-replay] [data-cut-state]')).toHaveText('On air · slow');
+  calls = await (await page.request.get('/test/replay-calls')).json();
+  expect(calls[calls.length - 1][3]).toBeCloseTo(cue, 0);
+  await page.locator('#match-panel').getByRole('button', {name: '⏹ Live'}).click();
+  await page.locator('#mode-toggle').click();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
 });

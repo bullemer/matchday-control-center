@@ -193,23 +193,39 @@ still being recorded. **Build highlight reel** joins all clips in match order in
 description of the uploaded recording (it matches this file, not YouTube's own
 live-stream archive).
 
-## Instant replay
+## Instant replay and CAM REPLAY
+
+**CAM REPLAY** is a fourth source next to the cameras (🎬 CAM REPLAY cut button; REPLAY
+and key 4 in Match mode). In the Multiview panel, choose the moment on its timeline: drag
+the slider over the running recording, step with ◀ 10 s · ◀ 1 s · 1 s ▶ · 10 s ▶, jump
+with ⏭ Near live, or tap a ⭐ highlight mark (5 s before it). A still preview shows the
+chosen moment. **▶ Play** or **🐢 Play slow** puts CAM REPLAY on air from there; it
+plays on (holding its last frame once it reaches what has been recorded) until you cut
+to a camera. The quick **⏪ Replay / 🐢 Slow-mo** buttons (keys R / S) play the last
+6–20 s and return to live by themselves.
 
 A replay plays part of the running recording into the program: the picture as it was
 on air (layout and the scoreboard of that moment included) with a red **REPLAY** label,
 while the live commentary mix (and mute) continues over it. The live scoreboard is
 hidden during the replay so the two never overlap. The replay starts 1.5 s behind the
 live recording edge; a highlight replay runs from 8 s before to 4 s after the mark.
-When the clip ends, the program returns to the live camera by itself: the live relay
-starts shortly before the end and takes over as soon as it is ready, holding the
-replay's last frame meanwhile. **⏹ Back to live**, any camera cut, a layout change or
+When a quick replay's clip ends, the program returns to the live camera by itself: the
+live relay starts as long before the end as a cut takes on this laptop (measured), and
+holds the replay's last frame if it is not ready yet. **⏹ Back to live**, any camera cut, a layout change or
 STOP ends a replay at once. Camera tallies do not show ON AIR during a replay.
 Replays show the angle that was on air; other angles would need per-camera recording.
 
-Switching is seamless for camera cuts as well: a new relay starts while the current one
-stays on air, and MediaMTX hands the program over the moment the new picture is ready,
-so viewers do not see the fallback picture during a cut. A cut that fails leaves the
-current picture on air.
+For cuts and replays a new relay starts while the current one stays on air, and
+MediaMTX hands the program over the moment the new relay publishes. A cut that fails
+leaves the current picture on air. At the handover itself MediaMTX shows its offline
+picture for 1–2 frames (33–66 ms); the app replaces MediaMTX's "STREAM IS OFFLINE"
+picture with a plain dark "Back in a moment" card, which is also what viewers see while
+no camera at all is available. (A switcher inside the encoder that would avoid even
+those frames was tried; it was not reliable under load and is not used.)
+
+Highlight marks, replays and the CAM REPLAY timeline use what has actually been
+written to the recording, not the wall clock, so they stay exact even if the stream
+falls behind real time (for example while no camera is available).
 
 ## Video layouts
 
@@ -273,7 +289,9 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/stream/stop` | Stop all platforms, or one with `destination` (a recording continues) |
 | POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
 | POST | `/api/recording/stop` | Stop recording and save the MP4 (streaming continues) |
-| POST | `/api/replay` | Instant replay: `seconds` (3–30) and `speed` (1 or 0.5), or `marker` (highlight id) |
+| POST | `/api/replay` | Instant replay: `seconds` (3–30) and `speed` (1 or 0.5), or `marker` (highlight id); CAM REPLAY: `start` (timeline seconds), `speed`, `hold: true` |
+| GET | `/api/replay/timeline` | CAM REPLAY timeline: replayable length (`edge`) and highlight marks |
+| GET | `/api/replay/frame?t=` | JPEG still of the recording at a timeline position |
 | POST | `/api/replay/stop` | Back to live now |
 | POST | `/api/markers` | Mark a highlight now on the running recording, optional `label` |
 | GET | `/api/recordings` | Recordings with highlights, chapters and free disk space |

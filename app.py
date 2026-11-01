@@ -31,6 +31,7 @@ browser_overlay = BrowserOverlay()
 import atexit
 import json
 import secrets
+import subprocess
 import signal
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -43,7 +44,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
                           get_recording_status, play_replay, stop_replay, get_replay_status,
-                          add_replay_listener)
+                          add_replay_listener, REPLAY_MARGIN)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -534,18 +535,53 @@ def recording_file(sid, name):
 @api_endpoint
 def api_replay():
     """Instant replay from the running recording: {"seconds": 3-30, "speed": 1|0.5}
-    for the last seconds, or {"marker": "<id>"} around a highlight."""
+    for the last seconds, or {"marker": "<id>"} around a highlight (both return to live
+    by themselves), or CAM REPLAY {"start": timeline seconds, "speed", "hold": true},
+    on air until a cut to a camera."""
     data = request.get_json(force=True, silent=True) or {}
     seconds, speed, marker = data.get("seconds", 10), data.get("speed", 1), data.get("marker")
+    start, hold = data.get("start"), data.get("hold", False)
     if type(seconds) not in (int, float) or type(speed) not in (int, float):
         raise ValueError("seconds and speed must be numbers")
+    if start is not None and (type(start) not in (int, float) or not math.isfinite(start) or start < 0):
+        raise ValueError("start must be a position in seconds")
     if marker is not None and type(marker) is not str:
         raise ValueError("marker must be a highlight id")
-    log.info("Replay requested (seconds=%s, speed=%s, marker=%s)", seconds, speed, marker)
-    success, msg = play_replay(float(seconds), float(speed), marker=marker)
+    if type(hold) is not bool:
+        raise ValueError("hold must be true or false")
+    log.info("Replay requested (seconds=%s, speed=%s, marker=%s, start=%s, hold=%s)", seconds, speed, marker, start, hold)
+    success, msg = play_replay(float(seconds), float(speed), marker=marker,
+                               start=None if start is None else float(start), hold=hold)
     if not success and msg == SUPERSEDED:
         return jsonify({"ok": True, "message": "Replaced by a newer action"})
     return jsonify({"ok": success, "message": msg}), 200 if success else 409
+
+
+@app.route("/api/replay/timeline", methods=["GET"])
+@api_endpoint
+def api_replay_timeline():
+    """CAM REPLAY timeline: how much of the running recording can be replayed, and its highlights."""
+    session = get_recording_status()
+    if not session["active"]:
+        return jsonify({"ok": True, "available": False})
+    info = recordings.get(session["session"])
+    edge = max(0.0, recordings.written_duration(session["session"]) - REPLAY_MARGIN)
+    return jsonify({"ok": True, "available": True, "session": session["session"], "edge": round(edge, 1),
+                    "markers": [{k: m[k] for k in ("id", "label", "offset", "time", "clock")} for m in info["markers"]]})
+
+
+@app.route("/api/replay/frame", methods=["GET"])
+def api_replay_frame():
+    """JPEG still of the running recording at ?t=<timeline seconds> (CAM REPLAY preview)."""
+    session = get_recording_status()
+    try:
+        offset = float(request.args.get("t", ""))
+        if not session["active"] or not math.isfinite(offset):
+            raise ValueError
+        image = recordings.frame_at(session["session"], offset)
+    except (ValueError, OSError, subprocess.SubprocessError):
+        return jsonify({"ok": False, "error": "No picture at that moment yet"}), 404
+    return app.response_class(image, mimetype="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.route("/api/replay/stop", methods=["POST"])

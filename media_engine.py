@@ -74,8 +74,14 @@ _relay_channels = {}     # channel -> volume filter name in the running relay
 _relay_muted = set()     # installed channels successfully muted in the running relay
 _relay_missing = set()   # channels wanted by the running relay but unavailable at build
 _audio_warning = ""
-ZMQ_ADDRESS = "tcp://127.0.0.1:28765"
+ZMQ_ADDRESS = "tcp://127.0.0.1:28765"   # relays alternate between this port and port + 1
 _relay_zmq = None        # live-volume control address of the running relay
+# A cut starts the new relay while the current one stays on air, and MediaMTX hands
+# program over when the new one publishes; the two relays need different control ports.
+_relay_slot = 0
+# Shown by MediaMTX while program has no publisher (and for a frame or two at a handover)
+# instead of its "STREAM IS OFFLINE" segment.
+OFFLINE_CARD = str(BASE / "data/offline.mp4")
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
 _relay_retry_at = 0.0
@@ -97,7 +103,8 @@ _replay = None
 _replay_listeners = []    # called with True/False when a replay goes on/off air
 REPLAY_MARGIN = 1.5       # seconds behind the recording's write position
 REPLAY_SPEEDS = (1.0, 0.5)
-REPLAY_LEAD = 1.5         # start the return-to-live relay this long before the clip ends
+REPLAY_LEAD = 1.5         # start the return-to-live relay at least this long before the clip ends
+_cut_seconds = 3.0        # how long a cut takes here (moving average); the return starts that early
 _state = "stopped"
 _error = ""
 _started_at = None
@@ -255,7 +262,7 @@ def _meter_command(key):
         cmd += ["-f", "pulse", "-i", key[4:]]
     else:
         cmd += ["-rtsp_transport", "tcp", "-allowed_media_types", "audio",
-                "-timeout", "5000000", "-i", f"{RTSP_BASE}/{key}"]
+                "-timeout", "5000000", "-i", f"{RTSP_BASE}/{program_path() if key == 'program' else key}"]
     return cmd + ["-vn", "-af", METER_FILTER, "-f", "null", "-"]
 
 
@@ -265,7 +272,8 @@ def _supervise_meters(now):
     _meter_no_audio.intersection_update(wanted)
     for key, meter in list(_meters.items()):
         exited = meter.poll() is not None
-        if key in wanted and not exited:
+        moved = key == "program" and getattr(meter, "path", None) != program_path()
+        if key in wanted and not exited and not moved:
             continue
         if exited and key in wanted:
             # Exiting before any reading means the source has no audio track.
@@ -278,6 +286,7 @@ def _supervise_meters(now):
         if key not in _meters and now >= _meter_retry_at.get(key, 0):
             try:
                 _meters[key] = Meter(_meter_command(key))
+                _meters[key].path = program_path() if key == "program" else key
             except OSError:
                 _meter_retry_at[key] = now + 30
 
@@ -358,6 +367,39 @@ def ensure_mediamtx():
         return False
 
 
+def _ensure_offline_card():
+    """A 0.5 s "back in a moment" card MediaMTX loops on a feed without a publisher."""
+    if Path(OFFLINE_CARD).is_file():
+        return True
+    try:
+        Path(OFFLINE_CARD).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x101418:s=1280x720:r=30:d=0.5",
+                        "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-vf",
+                        "drawtext=text='Back in a moment':fontcolor=white:fontsize=48:x=(w-tw)/2:y=(h-th)/2",
+                        "-t", "0.5", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "15",
+                        "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", OFFLINE_CARD + ".tmp.mp4"],
+                       check=True, capture_output=True, timeout=30)
+        os.replace(OFFLINE_CARD + ".tmp.mp4", OFFLINE_CARD)
+        return True
+    except (OSError, subprocess.SubprocessError):
+        logger.warning("Cannot create the offline card; MediaMTX's default is used")
+        return False
+
+
+def _spare_slot():
+    return 1 - _relay_slot
+
+
+def _slot_zmq(slot):
+    host, port = ZMQ_ADDRESS.rsplit(":", 1)
+    return f"{host}:{int(port) + slot}"
+
+
+def program_path():
+    """The path the dashboard's program preview and meter read."""
+    return "program"
+
+
 def generate_mediamtx_config():
     # A continuous program path supplies video + silence during cuts/source loss.
     # Program publishing is loopback-only; phones may publish only camera paths.
@@ -374,8 +416,13 @@ def generate_mediamtx_config():
         ],
         "paths": {c: {"overridePublisher": False} for c in CAMERA_IDS},
     }
-    config["paths"]["program"] = {"alwaysAvailable": True, "alwaysAvailableTracks": [
-        {"codec": "H264"}, {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]}
+    program = {"alwaysAvailable": True}
+    if _ensure_offline_card():
+        program["alwaysAvailableFile"] = OFFLINE_CARD
+    else:
+        program["alwaysAvailableTracks"] = [
+            {"codec": "H264"}, {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]
+    config["paths"]["program"] = program
     config["paths"]["final"] = {"overridePublisher": True}  # the encoder's finished picture
     Path(MEDIAMTX_CONFIG).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     Path(MEDIAMTX_CONFIG).write_text(json.dumps(config, indent=2))  # JSON is valid YAML
@@ -490,7 +537,7 @@ def get_stream_status():
             "audio_source": get_audio_source(), "muted": _muted,
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
-            "started_at": _started_at, "destinations": get_destinations(),
+            "started_at": _started_at, "destinations": get_destinations(), "program_path": program_path(),
             "error": _error, "profile": _profile, "fallback": get_active_camera() is None and not _replay,
             "recording": get_recording_status(), "replay": get_replay_status()}
 
@@ -500,7 +547,10 @@ def get_replay_status():
     status = {"active": bool(replay), "available": bool(_want_stream and _want_record and _recording)}
     if replay:
         status.update(label=replay["label"], speed=replay["speed"], ends_at=replay["ends_at"],
-                      camera=replay["camera"])
+                      camera=replay["camera"], hold=replay.get("hold", False))
+        if "position" in replay:  # where the playhead is on the recording timeline (CAM REPLAY bar)
+            status["position"] = round(min(replay["position"] + replay["length"],
+                                           replay["position"] + (time.time() - replay["on_air_at"]) * replay["speed"]), 1)
     return status
 
 
@@ -538,7 +588,30 @@ def _input(path):
     return ["-rtsp_transport", "tcp", "-timeout", "5000000", "-i", f"{RTSP_BASE}/{path}"]
 
 
+VIDEO_CODECS = {"H264", "H265", "AV1", "VP8", "VP9", "MPEG-4 Video", "MPEG-1/2 Video", "M-JPEG"}
+AUDIO_CODECS = {"MPEG-4 Audio", "MPEG-4 Audio LATM", "Opus", "G711", "G722", "MPEG-1/2 Audio", "AC-3", "LPCM", "Speex"}
+
+
 def _probe(cam):
+    """Track kinds of a published path, from MediaMTX in milliseconds (ffprobe took 1-2 s
+    per camera and slowed every cut); ffprobe only if the API cannot be reached."""
+    try:
+        response = requests.get(f"{MEDIAMTX_API}/v3/paths/get/{cam}", timeout=2)
+        if response.status_code == 404:
+            raise ValueError(f"Cannot read {cam}")
+        response.raise_for_status()
+        info = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        if isinstance(exc, ValueError) and str(exc) == f"Cannot read {cam}":
+            raise
+        return _ffprobe(cam)
+    if not info.get("ready"):
+        raise ValueError(f"Cannot read {cam}")
+    tracks = info.get("tracks") or []
+    return {"video" for t in tracks if t in VIDEO_CODECS} | {"audio" for t in tracks if t in AUDIO_CODECS}
+
+
+def _ffprobe(cam):
     try:
         result = subprocess.run(["ffprobe", "-v", "error", "-rtsp_transport", "tcp",
                                  "-timeout", "3000000", "-show_streams", "-of", "json",
@@ -594,8 +667,9 @@ def _replay_filter(width, height, replay):
     label = "SLOW-MO REPLAY" if replay["speed"] < 1 else "REPLAY"
     return (f"[0:v:0]setpts=(PTS-STARTPTS)/{replay['speed']:g},scale={width}:{height}:force_original_aspect_ratio=decrease,"
             f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
-            # Hold the last frame until the live relay takes over: never a black gap.
-            f"tpad=stop=-1:stop_mode=clone,"
+            # Hold the last frame until the live relay takes over: never a black gap. Paced to
+            # real time: unpaced held frames ran ahead and cost the recording time at handover.
+            f"tpad=stop=-1:stop_mode=clone,realtime,"
             f"drawtext=text='{label}':expansion=none:fontcolor=white:fontsize={font}:box=1:"
             f"boxcolor=0xdc2626@0.95:boxborderw={font // 3}:x={font}:y={font}[vout]")
 
@@ -687,7 +761,7 @@ def _relay_command(cam, wanted, replay=None):
                      f"volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}[{name}]")
         labels.append(f"[{name}]")
         channels[channel] = name
-    address = _spare_zmq().replace(":", "\\\\:")  # escaped twice: filter option, then graph
+    address = _slot_zmq(_spare_slot()).replace(":", "\\\\:")  # escaped twice: filter option, then graph
     parts.append(f"[{inputs}:a:0]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:"
                  f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0,"
                  f"azmq=bind_address={address}[aout]")
@@ -700,28 +774,40 @@ def _relay_command(cam, wanted, replay=None):
         "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"], channels, missing, warning, secondary, video_warning
 
 
-def _spare_zmq():
-    """Relays alternate between two control ports, so the next relay can start while
-    the current one is still on air (a seamless switch)."""
-    host, port = ZMQ_ADDRESS.rsplit(":", 1)
-    alternate = f"{host}:{int(port) + 1}"
-    return alternate if _relay_zmq == ZMQ_ADDRESS else ZMQ_ADDRESS
-
-
 def _send_volume(name, volume):
     """Set one channel's volume in the running relay without restarting it."""
+    return _send_command(_relay_zmq or ZMQ_ADDRESS, f"volume@{name} volume {volume:.4f}")
+
+
+def _send_command(address, command):
+    """One filter command over ZMQ (a relay's volumes, the encoder's feed switch)."""
     import zmq
     sock = zmq.Context.instance().socket(zmq.REQ)
     for option, value in ((zmq.LINGER, 0), (zmq.RCVTIMEO, 1000), (zmq.SNDTIMEO, 1000)):
         sock.setsockopt(option, value)
     try:
-        sock.connect(_relay_zmq or ZMQ_ADDRESS)
-        sock.send_string(f"volume@{name} volume {volume:.4f}")
+        sock.connect(address)
+        sock.send_string(command)
         return sock.recv_string().startswith("0 ")
     except zmq.ZMQError:
         return False
     finally:
         sock.close()
+
+
+def _take_over(cmd, current):
+    """Start a relay while the current one stays on air; MediaMTX hands program over to it
+    when it publishes. Returns (process, None) or (None, error message)."""
+    try:
+        candidate = Process(cmd)
+    except OSError as exc:
+        return None, f"Cannot start relay: {exc}"
+    ok = _wait_progress(candidate, aborted=lambda: not current())
+    if ok and current():
+        return candidate, None
+    message = SUPERSEDED if not current() else candidate.error or "Relay did not produce frames"
+    _kill_process(candidate)
+    return None, message
 
 
 def _wait_progress(proc, timeout=12, aborted=lambda: False):
@@ -766,10 +852,12 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
     global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout, _replay
-    global _relay_zmq
+    global _relay_zmq, _relay_slot
+    global _cut_seconds
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
+    began = time.monotonic()
     wanted, profile = _effective_mix(cam_id), _profile
     try:
         # Probe and validate before disturbing the current publisher.
@@ -781,20 +869,18 @@ def _replace_relay(cam_id, generation):
     with _lock:
         if not current():
             return False, SUPERSEDED
-        old, zmq = _relay_proc, _spare_zmq()
-    # The current relay stays on air while the new one starts; when the new one
-    # publishes, MediaMTX hands program over to it at once (no fallback gap).
-    try:
-        candidate = Process(cmd)
-    except OSError as exc:
-        _error = f"Cannot start camera relay: {exc}"
-        return False, _error
-    ok = _wait_progress(candidate, aborted=lambda: not current())
+        old, slot = _relay_proc, _spare_slot()
+    # The current relay stays on air while the new one starts.
+    candidate, problem = _take_over(cmd, current)
+    if candidate is None:
+        if problem != SUPERSEDED:
+            _error = problem
+        return False, problem
     with _lock:
-        installed = ok and current()
-        ended_replay = installed and _replay is not None
+        installed = True
+        ended_replay = _replay is not None
         if installed:
-            _replay, _relay_zmq = None, zmq
+            _replay, _relay_slot, _relay_zmq = None, slot, _slot_zmq(slot)
             if _relay_proc is old:
                 _relay_proc = None
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
@@ -805,29 +891,24 @@ def _replace_relay(cam_id, generation):
             _error, _relay_failures = "", 0
     if installed:
         _kill_process(old)
+        _cut_seconds = round(0.5 * _cut_seconds + 0.5 * (time.monotonic() - began), 2)
     if ended_replay:
         _notify_replay(False)
     if installed:
         if warning:
             logger.warning("Relay %s: %s", cam_id, warning)
         return True, f"Camera {cam_id} selected" + (f" ({warning})" if warning else "")
-    message = candidate.error or "Camera relay did not produce frames"
-    _kill_process(candidate)
-    if not current():
-        return False, SUPERSEDED
-    # _active_camera keeps the prior selection: the supervisor restores it when its
-    # camera is publishing, and program shows fallback meanwhile.
-    _error = message
-    return False, message
 
 
-def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0):
-    """Put a replay on air: the last `seconds`, or around a highlight marker of the
-    running recording. Returns to the live camera when it ends."""
+def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0, start=None, hold=False):
+    """Put a replay on air: the last `seconds`, around a highlight marker, or (CAM REPLAY)
+    from `start` on the recording timeline. Returns to the live camera when it ends,
+    unless `hold`: then it plays on (holding its last frame at the end of what is
+    recorded) until the operator cuts to a camera."""
     global _generation, _pending_camera
     if speed not in REPLAY_SPEEDS:
         return False, "Choose normal speed or slow motion"
-    if marker is None and not 3 <= seconds <= 30:
+    if marker is None and start is None and not 3 <= seconds <= 30:
         return False, "Replay length must be 3 to 30 seconds"
     with _lock:
         if not _want_stream or not get_mediamtx_running():
@@ -836,9 +917,12 @@ def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0):
             return False, "Instant replay needs the recording on"
         session = _recording
         camera = _replay["camera"] if _replay else _active_camera
-    info = recordings.get(session, live_wall=time.time())
-    recorded = info["duration"] - REPLAY_MARGIN
-    if marker is not None:
+    info = recordings.get(session)
+    recorded = recordings.written_duration(session) - REPLAY_MARGIN
+    if start is not None:
+        start = min(float(start), recorded - 2)
+        length, label = recorded - max(0.0, start), "Replay"
+    elif marker is not None:
         found = next((m for m in info["markers"] if m["id"] == marker), None)
         if found is None:
             return False, "Unknown highlight"
@@ -860,12 +944,13 @@ def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0):
         generation = _generation
     with _switch_lock:
         return _install_replay(generation, camera, {"source": str(source), "start": offset, "length": length,
-                                                    "speed": speed, "label": label})
+                                                    "speed": speed, "label": label, "hold": bool(hold),
+                                                    "position": start})
 
 
 def _install_replay(generation, camera, replay):
     global _relay_proc, _relay_channels, _relay_missing, _relay_muted, _audio_warning
-    global _relay_secondary, _error, _replay, _relay_zmq
+    global _relay_secondary, _error, _replay, _relay_zmq, _relay_slot
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
@@ -877,40 +962,41 @@ def _install_replay(generation, camera, replay):
     with _lock:
         if not current():
             return False, SUPERSEDED
-        old, zmq = _relay_proc, _spare_zmq()
-    try:
-        candidate = Process(cmd)  # live stays on air until the replay publishes
-    except OSError as exc:
-        return False, f"Cannot start replay: {exc}"
-    ok = _wait_progress(candidate, timeout=8, aborted=lambda: not current())
+        old, slot = _relay_proc, _spare_slot()
+    candidate, problem = _take_over(cmd, current)  # live stays on air until the replay is ready
+    if candidate is None:
+        return False, problem
     airtime = replay["length"] / replay["speed"]
     with _lock:
-        installed = ok and current()
+        installed = True
         if installed:
-            _relay_proc, _relay_channels, _relay_missing, _relay_zmq = candidate, channels, missing, zmq
+            _relay_proc, _relay_channels, _relay_missing = candidate, channels, missing
+            _relay_slot, _relay_zmq = slot, _slot_zmq(slot)
             _relay_muted = set(channels) if _muted else set()
             _audio_warning, _relay_secondary = warning, None
-            _replay = {**replay, "camera": camera, "generation": generation, "ends_at": time.time() + airtime}
-    if not installed:
-        message = candidate.error or "Replay did not start"
-        _kill_process(candidate)  # live (if still publishing) simply stays on air
-        return False, SUPERSEDED if not current() else message
+            _replay = {**replay, "camera": camera, "generation": generation, "ends_at": time.time() + airtime,
+                       "on_air_at": time.time()}
     _kill_process(old)
     _notify_replay(True)
-    threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime),
+    threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime, replay["hold"]),
                      daemon=True, name="replay-watcher").start()
     kind = "Slow-motion replay" if replay["speed"] < 1 else "Replay"
+    if replay["hold"]:
+        return True, f"CAM REPLAY on air ({kind.lower()}) until you cut to a camera"
     return True, f"{kind} on air ({airtime:.0f} s)"
 
 
-def _watch_replay(proc, generation, camera, airtime):
+def _watch_replay(proc, generation, camera, airtime, hold=False):
     """Shortly before the clip ends, start the live relay; it takes over from the replay's
-    held last frame as soon as it is ready. An operator cut or STOP ends this early."""
+    held last frame as soon as it is ready. An operator cut or STOP ends this early.
+    CAM REPLAY (hold) stays on air until a cut; this only cleans up if it crashes."""
     global _replay, _relay_proc
-    returning = time.monotonic() + max(0.0, airtime - REPLAY_LEAD)
+    # The live relay takes over as soon as it is ready: start it as long before the end
+    # as a cut takes here, so the replay's last frame is held as briefly as possible.
+    returning = float("inf") if hold else time.monotonic() + max(0.0, airtime - max(REPLAY_LEAD, _cut_seconds + 0.5))
     while proc.poll() is None and generation == _generation and time.monotonic() < returning:
         time.sleep(.1)
-    while camera and proc.poll() is None and generation == _generation:
+    while camera and not hold and proc.poll() is None and generation == _generation:
         ok, message = switch_camera(camera, automatic=True)  # never overrides an operator cut
         if ok or message == SUPERSEDED:
             return
@@ -1104,7 +1190,8 @@ def _launch_encoder():
     # Keep composition in the encoder's YUV420 format and bound worker counts:
     # auto-threading added substantial CPU overhead in real-time 1080p/PiP tests.
     vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420[vout]"
-    cmd = _ffmpeg() + ["-filter_complex_threads", "2"] + _input("program") + [
+    # A deep input queue: the reader must keep draining while the graph is busy.
+    cmd = _ffmpeg() + ["-filter_complex_threads", "2", "-thread_queue_size", "1024"] + _input("program") + [
         "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
         "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0",
         "-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency",
@@ -1158,7 +1245,10 @@ def _launch_recorder():
     """Write the finished picture to a new crash-safe MPEG-TS part, without re-encoding."""
     global _recorder_proc
     path = recordings.new_part(_recording)
-    cmd = _ffmpeg() + _input("final") + ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", path]
+    # Every packet goes to disk at once: marks and replays read up to the live edge, and a
+    # crash loses nothing buffered (a quiet scene would otherwise sit in 256 KB chunks).
+    cmd = _ffmpeg() + _input("final") + ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+                                         "-flush_packets", "1", "-f", "mpegts", path]
     _recorder_proc = Process(cmd, copy=True)
 
 
@@ -1429,7 +1519,8 @@ def _supervise_once():
     global _camera_status, _state, _error, _started_at, _retry_at, _retries, _mediamtx_retry_at
     try:
         paths = _paths()
-        _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS + ["program"]}
+        _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS}
+        _camera_status["program"] = paths.get(program_path(), False)
     except (requests.RequestException, ValueError, KeyError):
         _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
     now = time.monotonic()

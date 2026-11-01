@@ -1,4 +1,6 @@
 """Isolated HTTP fixture: no hardware, runtime state, or real media processes."""
+import glob
+import shutil
 import sys
 import tempfile
 from pathlib import Path
@@ -13,9 +15,14 @@ recording={'active':False,'session':None}
 a.get_recording_status=lambda: {'active':recording['active'],'session':recording['session'] if recording['active'] else None,
                                 'writing':True,'warning':'','duration':65.0,'bytes':150*1024**2,'markers':1}
 replay={'active':False,'calls':[]}
-a.get_replay_status=lambda: ({'active':True,'available':True,'label':'Replay','speed':replay['speed'],'ends_at':__import__('time').time()+8,'camera':'cam1'}
+a.get_replay_status=lambda: ({'active':True,'available':True,'label':'Replay','speed':replay['speed'],'ends_at':__import__('time').time()+8,'camera':'cam1',
+                              'hold':replay.get('hold',False),'position':replay.get('position',0)}
                              if replay['active'] else {'active':False,'available':recording['active']})
-a.play_replay=lambda seconds=10,speed=1.0,marker=None: (replay['calls'].append([seconds,speed,marker]) or replay.update(active=True,speed=speed) or True,'Replay on air (10 s)')
+def fake_replay(seconds=10, speed=1.0, marker=None, start=None, hold=False):
+    replay['calls'].append([seconds,speed,marker] + ([start,hold] if hold else []))
+    replay.update(active=True,speed=speed,hold=hold,position=start or 0)
+    return True,'Replay on air (10 s)'
+a.play_replay=fake_replay
 a.stop_replay=lambda: (replay.update(active=False) or True,'Back to live')
 # Streaming destinations: Facebook "reconnects", everything else goes live at once.
 streams={'calls':[],'stops':[],'live':{}}
@@ -37,6 +44,7 @@ def stream_calls():
     return a.jsonify(streams)
 a.get_stream_status=lambda: {'active':bool(streams['live']),'state':'live' if streams['live'] else 'stopped','active_camera':None,
                              'selected_camera':'cam1' if replay['active'] else None,'destinations':dict(streams['live']),
+                             'program_path':'program',
                              'audio_source':'active','audio_on_air':['cam1'],'error':'','fallback':not replay['active'],
                              'recording':a.get_recording_status(),'replay':a.get_replay_status()}
 @a.app.route('/test/replay-calls')
@@ -54,7 +62,11 @@ a.stop_hotspot=lambda: (hotspot_calls.append(('stop',)) or True,'Hotspot stopped
 a._refresh_network=lambda: None
 a.get_audio_levels=lambda: {'cam1':{'peak':-12.0,'rms':-20.0},'cam2':'no audio',
     'usb:alsa_input.usb-test':{'peak':-30.0,'rms':-38.0},'program':{'peak':-0.5,'rms':-9.0}}
-with tempfile.TemporaryDirectory() as tmp:
+# Playwright kills this server without letting it clean up: remove earlier runs' folders.
+for old in glob.glob(tempfile.gettempdir() + '/mcc-browser-*'):
+    shutil.rmtree(old, ignore_errors=True)
+if True:
+    tmp = tempfile.mkdtemp(prefix='mcc-browser-')
     # Recordings never touch the real library: one finished match, one being recorded.
     r=a.recordings
     r.RECORDINGS_DIR=Path(tmp)/'recordings'
@@ -70,6 +82,9 @@ with tempfile.TemporaryDirectory() as tmp:
     r._save(session)
     import time as _time; _time.sleep(1.1)  # distinct session id
     recording['session']=r.create_session('720p','Polonia vs Altona')
+    # Two minutes "recorded" so far with one highlight, for the CAM REPLAY timeline.
+    r.new_part(recording['session']); r.part_started(recording['session'],_time.time()-120)
+    r.add_marker(recording['session'],'Chance','58:10','Polonia 0-0 Altona',wall=_time.time()-60)
     a.browser_overlay=a.BrowserOverlay(Path(tmp)/'overlay.png')
     a.SCOREBOARD_DIR=tmp
     a.SCOREBOARD_PATH=tmp+'/scoreboard.txt'

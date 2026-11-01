@@ -131,6 +131,24 @@
     .outdoor-mode .dest-row { background: #fff; border: 2px solid #0f172a; }
     .outdoor-mode .dest-input { background: #f1f5f9; color: #020617; border: 2px solid #0f172a; }
     .replay-badge { background: #7c3aed; }
+    .cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; }
+    @media (max-width: 640px) { .cut-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+    .match-cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; }
+    .match-cut-grid .text-2xl { font-size: 1.2rem; line-height: 1.6rem; }
+    .replay-cut-idle { background: #4c1d95; color: #ede9fe; }
+    .replay-cut-air { background: #7c3aed; color: #fff; box-shadow: 0 0 0 3px #c4b5fd; }
+    .replay-grid { display: grid; gap: .75rem; }
+    @media (min-width: 768px) { .replay-grid { grid-template-columns: minmax(0, 2fr) minmax(0, 3fr); } }
+    .replay-still { position: relative; aspect-ratio: 16 / 9; background: #000; border-radius: .5rem; overflow: hidden; }
+    .replay-still img { width: 100%; height: 100%; object-fit: contain; }
+    .replay-still span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #94a3b8; font-size: .8rem; text-align: center; padding: .5rem; }
+    .replay-timeline { position: relative; padding-top: 14px; }
+    .replay-timeline input[type=range] { width: 100%; accent-color: #7c3aed; height: 28px; }
+    .replay-tick { position: absolute; top: 0; transform: translateX(-50%); font-size: 12px; line-height: 12px; cursor: pointer; background: none; border: 0; padding: 0; }
+    .replay-playhead { position: absolute; top: 14px; bottom: 0; width: 2px; background: #f87171; pointer-events: none; }
+    .step-btn { padding: .35rem .6rem; border-radius: .4rem; font-size: .8rem; font-weight: 600; background: #334155; color: #e2e8f0; }
+    .step-btn:hover { background: #475569; }
+    .outdoor-mode .step-btn { background: #e2e8f0; color: #0f172a; border: 1px solid #0f172a; }
     .replay-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #7c3aed; color: #fff; white-space: nowrap; }
     .replay-btn:hover { background: #8b5cf6; }
     .replay-btn:disabled { opacity: .6; cursor: wait; }
@@ -339,16 +357,16 @@
       <div class="space-y-3">
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700">
           <div class="flex items-center justify-between mb-2">
-            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program · before scoreboard</span>
+            <span data-bind="program_label" class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
             <button onclick="openLayoutEditor()" aria-label="Video layout" class="text-xs px-2 py-1 rounded bg-brand-blue text-white">Layout</button>
             <button id="match-preview-toggle" onclick="toggleMatchPreview()"
                     class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
           </div>
           <div id="match-preview" class="webrtc-frame border-2 border-red-900">
-            <iframe data-preview="match" data-src="http://{{ media_host }}:8889/program" allow="autoplay"></iframe>
+            <iframe data-preview="match" data-program data-src="http://{{ media_host }}:8889/program" allow="autoplay"></iframe>
           </div>
         </div>
-        <div class="grid grid-cols-3 gap-2">
+        <div class="match-cut-grid">
           {% for n in [1, 2, 3] %}
           <button data-cut="cam{{ n }}" onclick="switchCam('cam{{ n }}')"
                   data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
@@ -356,6 +374,11 @@
             <span data-cut-state class="text-xs font-semibold uppercase tracking-wider">—</span>
           </button>
           {% endfor %}
+          <button data-cut-replay onclick="cutToReplay()" title="CAM REPLAY (4)"
+                  data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
+            <span class="text-2xl font-extrabold">REPLAY</span>
+            <span data-cut-state class="text-xs font-semibold uppercase tracking-wider">—</span>
+          </button>
         </div>
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 space-y-2">
           <div class="flex gap-2">
@@ -616,17 +639,17 @@
         <!-- Program Output -->
         <div>
           <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program · before scoreboard</span>
+            <span data-bind="program_label" class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
             <span id="mv-badge-program" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
           </div>
           <div class="webrtc-frame border-2 border-red-900" id="frame-program">
-            <iframe data-preview="setup" data-src="http://{{ media_host }}:8889/program" allow="autoplay" loading="lazy"></iframe>
+            <iframe data-preview="setup" data-program data-src="http://{{ media_host }}:8889/program" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
       </div>
 
       <!-- Tally / Cut Buttons -->
-      <div class="grid grid-cols-3 gap-3 mb-4">
+      <div class="cut-grid mb-4">
         <button id="btn-cut-cam1" data-cut="cam1" onclick="switchCam('cam1')"
                 data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
           <span>🎥 CUT TO CAM 1</span>
@@ -642,12 +665,53 @@
           <span>🎥 CUT TO CAM 3</span>
           <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
+        <button id="btn-cut-replay" data-cut-replay onclick="cutToReplay()"
+                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
+          <span>🎬 CAM REPLAY</span>
+          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
+        </button>
       </div>
 
-      <!-- Instant replay -->
-      <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 mb-4 space-y-2">
+      <!-- CAM REPLAY: pick any moment of the running recording -->
+      <div id="replay-panel" class="bg-slate-900 rounded-lg p-3 border border-slate-700 mb-4 space-y-3">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="text-sm text-slate-400">⏪ Instant replay:</span>
+          <span class="text-sm font-semibold text-white">🎬 CAM REPLAY</span>
+          <span data-bind="replay_status" class="text-sm text-slate-300"></span>
+          <button data-when-replay-on onclick="backToLive()" class="live-btn hidden ml-auto">⏹ Back to live</button>
+        </div>
+        <div data-when-replay-ready class="replay-grid hidden">
+          <div class="replay-still">
+            <img id="replay-still" alt="Replay picture at the chosen moment" hidden>
+            <span id="replay-still-msg">Choose a moment on the timeline</span>
+          </div>
+          <div class="space-y-2">
+            <div class="replay-timeline">
+              <div id="replay-ticks"></div>
+              <div id="replay-playhead" class="replay-playhead" hidden></div>
+              <input id="replay-cue" type="range" min="0" max="0" step="0.1" value="0" aria-label="Replay position"
+                     oninput="cueChanged(this.value)">
+            </div>
+            <div class="flex justify-between text-xs text-slate-400">
+              <span>Start</span>
+              <span><b data-bind="replay_cue_time" class="text-white font-mono">0:00</b> <span data-bind="replay_cue_behind"></span></span>
+              <span>Live</span>
+            </div>
+            <div class="flex flex-wrap gap-1">
+              <button class="step-btn" onclick="nudgeCue(-10)">◀ 10 s</button>
+              <button class="step-btn" onclick="nudgeCue(-1)">◀ 1 s</button>
+              <button class="step-btn" onclick="nudgeCue(1)">1 s ▶</button>
+              <button class="step-btn" onclick="nudgeCue(10)">10 s ▶</button>
+              <button class="step-btn" onclick="followLive()" title="10 s before live">⏭ Near live</button>
+            </div>
+            <div class="flex flex-wrap gap-2">
+              <button onclick="playFromCue(1)" class="replay-btn">▶ Play</button>
+              <button onclick="playFromCue(0.5)" class="replay-btn">🐢 Play slow</button>
+            </div>
+            <p class="text-xs text-slate-500">Play puts CAM REPLAY on air from the chosen moment; it stays on air until you cut to a camera. ⭐ marks are your highlights — tap one to jump there.</p>
+          </div>
+        </div>
+        <div class="flex flex-wrap items-center gap-2 border-t border-slate-700 pt-2">
+          <span class="text-sm text-slate-400">⏪ Quick replay (returns to live by itself):</span>
           <button data-when-replay-ready onclick="playReplay(1)" class="replay-btn hidden">⏪ Replay</button>
           <button data-when-replay-ready onclick="playReplay(0.5)" class="replay-btn hidden">🐢 Slow-mo</button>
           <select id="replay-seconds" data-when-replay-ready aria-label="Replay length" class="replay-select hidden"
@@ -655,10 +719,8 @@
             <option value="6">last 6 s</option><option value="10" selected>last 10 s</option>
             <option value="15">last 15 s</option><option value="20">last 20 s</option>
           </select>
-          <button data-when-replay-on onclick="backToLive()" class="live-btn hidden">⏹ Back to live</button>
-          <span data-bind="replay_status" class="text-sm text-slate-300"></span>
         </div>
-        <p data-when-replay-off class="text-xs text-slate-500">Replays need the recording on (⏺ in the YouTube Stream &amp; Recording panel). Keys in Match mode: R replay, S slow-mo.</p>
+        <p data-when-replay-off class="text-xs text-slate-500">Replays need the recording on (⏺ in the Live Stream &amp; Recording panel). Keys in Match mode: 4 CAM REPLAY, R replay, S slow-mo.</p>
       </div>
 
       <!-- Audio Source Toggle -->
@@ -1399,11 +1461,12 @@
       (firstEmpty || destRow('youtube')).querySelector('[data-dest-key]').focus();
     }
 
-    // Match-mode keys (laptop keyboard): 1–3 cut, M mute, H highlight, R replay, S slow-motion replay.
+    // Match-mode keys (laptop keyboard): 1–3 cut, 4 CAM REPLAY, M mute, H highlight, R replay, S slow-motion replay.
     document.addEventListener('keydown', event => {
       if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
+      if (event.key === '4') cutToReplay();
       if ((event.key === 'h' || event.key === 'H') && state.recording && state.recording.active) markHighlight();
       if ((event.key === 'r' || event.key === 'R') && state.replay.available) playReplay(1);
       if ((event.key === 's' || event.key === 'S') && state.replay.available) playReplay(0.5);
@@ -1488,9 +1551,9 @@
           look = 'bg-brand-amber text-white pulse-live'; label = 'Switching…';
         } else if (cam === state.activeCam) {
           look = 'bg-brand-red text-white ring-2 ring-red-300'; label = 'On air';
-        } else if (cam === state.selectedCam && state.replay.active) {
+        } else if (cam === state.selectedCam && state.replay.active && !state.replay.hold) {
           look = 'bg-brand-amber text-white'; label = 'Back after replay';
-        } else if (cam === state.selectedCam) {
+        } else if (cam === state.selectedCam && !(state.replay.active && state.replay.hold)) {
           look = 'bg-red-950 text-red-200 ring-2 ring-red-500'; label = publishing ? 'Fallback — retrying' : 'Fallback — no signal';
         } else if (secondary && cam === state.secondaryCam) {
           look = 'bg-brand-blue text-white'; label = state.videoLayout.mode === 'pip' ? 'PiP' : 'Right half';
@@ -1501,6 +1564,17 @@
         }
         btn.className = btn.dataset.base + ' ' + look;
         btn.disabled = secondary || (!publishing && cam !== state.selectedCam);
+        btn.querySelector('[data-cut-state]').textContent = label;
+      });
+      document.querySelectorAll('[data-cut-replay]').forEach(btn => {
+        const r = state.replay || {};
+        let look, label;
+        if (r.active && r.hold) { look = 'replay-cut-air'; label = r.speed < 1 ? 'On air · slow' : 'On air'; }
+        else if (r.active) { look = 'replay-cut-air'; label = 'Quick replay'; }
+        else if (r.available) { look = 'replay-cut-idle'; label = 'Ready · ' + fmtClock(cuePosition()); }
+        else { look = 'bg-slate-700 text-slate-400'; label = 'Needs recording'; }
+        btn.className = btn.dataset.base + ' ' + look;
+        btn.disabled = !r.available;
         btn.querySelector('[data-cut-state]').textContent = label;
       });
       ['cam1', 'cam2', 'cam3'].forEach(c => {
@@ -1568,7 +1642,11 @@
       document.querySelectorAll('[data-when-replay-off]').forEach(el => el.classList.toggle('hidden', r.available));
       document.querySelectorAll('[data-marker-replay]').forEach(el => { el.hidden = !r.available; });
       const left = r.active ? Math.max(0, Math.ceil(r.ends_at - Date.now() / 1000)) : 0;
-      bind('replay_status', r.active ? `${r.speed < 1 ? 'Slow-mo replay' : 'Replay'} on air · ${left} s` : '');
+      bind('replay_status', !r.active ? '' : r.hold
+        ? `on air ${r.speed < 1 ? 'in slow motion ' : ''}at ${fmtClock(r.position || 0)} — cut to a camera to end it`
+        : `${r.speed < 1 ? 'Slow-mo replay' : 'Replay'} on air · ${left} s`);
+      if (r.available && !timeline.edge) loadTimeline();
+      renderTimeline();
       updateTallyButtons();
     }
 
@@ -1585,6 +1663,78 @@
     function replayMarker(marker) {
       return replayRequest({marker});
     }
+    // ──────────────────────── CAM REPLAY timeline ────────────────────────
+    // The cue is a position on the recording timeline; null follows "10 s before live".
+    const timeline = {edge: 0, markers: [], cue: null, speed: 1, stillTimer: null, busy: false};
+    const fmtClock = seconds => { const s = Math.max(0, Math.floor(seconds)); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`; };
+    const cuePosition = () => Math.max(0, Math.min(timeline.cue ?? timeline.edge - 10, timeline.edge));
+
+    async function loadTimeline() {
+      if (timeline.busy || !state.replay.available || document.visibilityState !== 'visible') return;
+      timeline.busy = true;
+      try {
+        const info = await apiGet('/api/replay/timeline');
+        if (info && info.ok && info.available) {
+          const followed = timeline.cue === null;
+          timeline.edge = info.edge;
+          timeline.markers = info.markers;
+          renderTimeline();
+          if (followed && !state.matchMode && state.tab === 'main') scheduleStill(0);
+        }
+      } finally {
+        timeline.busy = false;
+      }
+    }
+    setInterval(loadTimeline, 2000);
+
+    function renderTimeline() {
+      const slider = document.getElementById('replay-cue');
+      slider.max = timeline.edge.toFixed(1);
+      if (document.activeElement !== slider) slider.value = cuePosition().toFixed(1);
+      const cue = cuePosition();
+      bind('replay_cue_time', fmtClock(cue));
+      bind('replay_cue_behind', timeline.edge ? `(${Math.round(timeline.edge - cue)} s before live)` : '');
+      const pct = offset => timeline.edge ? (100 * offset / timeline.edge).toFixed(2) + '%' : '0%';
+      document.getElementById('replay-ticks').innerHTML = timeline.markers.map(m =>
+        `<button class="replay-tick" style="left:${pct(m.offset)}" title="${esc(m.label)} ${esc(m.time)}${m.clock ? ' (' + esc(m.clock) + ')' : ''}"
+                 onclick="setCue(${Math.max(0, m.offset - 5).toFixed(1)})">⭐</button>`).join('');
+      const head = document.getElementById('replay-playhead');
+      head.hidden = !(state.replay.active && state.replay.position !== undefined);
+      if (!head.hidden) head.style.left = pct(state.replay.position);
+    }
+
+    function setCue(seconds) {
+      timeline.cue = Math.max(0, Math.min(Number(seconds), timeline.edge));
+      renderTimeline();
+      scheduleStill(150);
+    }
+    function cueChanged(value) { setCue(value); }
+    function nudgeCue(delta) { setCue(cuePosition() + delta); }
+    function followLive() { timeline.cue = null; renderTimeline(); scheduleStill(0); }
+
+    function scheduleStill(delay) {
+      clearTimeout(timeline.stillTimer);
+      timeline.stillTimer = setTimeout(() => {
+        const img = document.getElementById('replay-still'), msg = document.getElementById('replay-still-msg');
+        const at = cuePosition();
+        img.onload = () => { img.hidden = false; msg.hidden = true; };
+        img.onerror = () => { img.hidden = true; msg.hidden = false; msg.textContent = 'No picture at that moment yet'; };
+        img.src = `/api/replay/frame?t=${at.toFixed(1)}&_=${Date.now()}`;
+      }, delay);
+    }
+
+    async function playFromCue(speed) {
+      if (replayPending) return;
+      timeline.speed = speed;
+      if (timeline.cue === null) timeline.cue = cuePosition();  // freeze the chosen moment
+      await replayRequest({start: Number(cuePosition().toFixed(1)), speed, hold: true});
+      renderTimeline();
+    }
+    function cutToReplay() {
+      if (!state.replay.available) { showToast('CAM REPLAY needs the recording on', 'warning'); return; }
+      return playFromCue(timeline.speed);
+    }
+
     async function backToLive() {
       await apiPost('/api/replay/stop');
       await pollStatus();
@@ -2600,6 +2750,15 @@
       renderReplay(stream.replay);
       state.destinations = stream.destinations || {};
       renderDestinations();
+      // The program preview shows the finished output while live/recording, otherwise the
+      // feed on air; it follows the switch (the iframe reloads when the source changes).
+      if (stream.program_path) {
+        document.querySelectorAll('iframe[data-program]').forEach(frame => {
+          frame.dataset.src = frame.dataset.src.replace(/[^/]+$/, stream.program_path);
+        });
+        bind('program_label', stream.program_path === 'final' ? '🔴 Program · as broadcast' : '🔴 Program · before scoreboard');
+        syncPreviews();
+      }
       if (typeof stream.muted === 'boolean' && !mutePending) {
         state.muted = stream.muted;
         renderMute();

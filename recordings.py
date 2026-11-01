@@ -59,8 +59,10 @@ def _save(session):
 
 
 def free_bytes():
-    RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
-    return shutil.disk_usage(RECORDINGS_DIR).free
+    folder = RECORDINGS_DIR  # measure without creating it (a background check must not)
+    while not folder.exists() and folder != folder.parent:
+        folder = folder.parent
+    return shutil.disk_usage(folder).free
 
 
 def _slug(text):
@@ -149,6 +151,40 @@ def _position(session, wall):
     return offset
 
 
+_written_cache = {}
+
+
+def written_duration(sid):
+    """Seconds actually in the recording files: closed parts plus what the open part holds
+    now. Marks and replays use this, not the wall clock: the stream can fall behind real
+    time (e.g. while no camera is publishing), and the files are what gets replayed."""
+    with _lock:
+        session = _load(sid)
+    total = 0.0
+    for part in session["parts"]:
+        if part["duration"] is not None:
+            total += part["duration"]
+            continue
+        path = _dir(sid) / part["file"]
+        try:
+            size = path.stat().st_size
+        except OSError:  # not created yet: the clock is the best estimate
+            total += max(0.0, _now() - part["start"]) if part["start"] else 0.0
+            break
+        key = (sid, part["file"])
+        cached = _written_cache.get(key)
+        if cached and (cached[0] == size or _now() - cached[2] < 0.5):
+            total += cached[1]
+            break
+        length = _probe_duration(path) if size else 0.0
+        if length is None:  # unreadable for a moment: fall back to the clock
+            length = max(0.0, _now() - part["start"]) if part["start"] else 0.0
+        _written_cache[key] = (size, length, _now())
+        total += length
+        break
+    return total
+
+
 def add_marker(sid, label="Highlight", clock="", score="", wall=None, auto=None):
     """auto names the team for a goal marked by the scoreboard, so a quick correction
     (the -1 button) can withdraw it again."""
@@ -158,9 +194,14 @@ def add_marker(sid, label="Highlight", clock="", score="", wall=None, auto=None)
         session = _load(sid)
         if session["state"] != "recording":
             raise ValueError("Recording has ended")
-        wall = _now() if wall is None else wall
+        live = wall is None
+        wall = _now() if live else wall
+    # "Now" is the end of what has been written; an explicit wall time uses the timeline.
+    offset = written_duration(sid) if live else _position(session, wall)
+    with _lock:
+        session = _load(sid)
         marker = {"id": f"m{len(session['markers']) + 1}-{int(wall * 1000) % 100000}",
-                  "label": label, "offset": round(_position(session, wall), 2),
+                  "label": label, "offset": round(offset, 2),
                   "clock": clock, "score": score, "clip": None, "auto": auto, "wall": wall}
         session["markers"].append(marker)
         _save(session)
@@ -226,6 +267,17 @@ def source_at(sid, offset):
     """(file path, offset within it) for a timeline offset of a session."""
     with _lock:
         return _source(_load(sid), offset)
+
+
+def frame_at(sid, offset, width=640):
+    """A JPEG still of the recording at a timeline offset (CAM REPLAY preview while scrubbing)."""
+    source, inner = source_at(sid, max(0.0, offset))
+    result = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-ss", f"{inner:.2f}",
+                             "-i", str(source), "-frames:v", "1", "-vf", f"scale={width}:-2", "-q:v", "5",
+                             "-f", "image2", "-c:v", "mjpeg", "pipe:1"], capture_output=True, timeout=15)
+    if result.returncode or not result.stdout:
+        raise ValueError("No picture at that moment yet")
+    return result.stdout
 
 
 def _run(cmd, timeout=120):

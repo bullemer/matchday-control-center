@@ -74,7 +74,7 @@ class ApiTests(unittest.TestCase):
         self.assertIn('HOME',Path(a.SCOREBOARD_PATH).read_text())
         with patch.object(a,'play_replay',return_value=(True,'Replay on air (10 s)')) as replay:
             self.assertEqual(self.post('/api/replay',{'seconds':10,'speed':0.5}).status_code,200)
-            replay.assert_called_once_with(10.0,0.5,marker=None)
+            replay.assert_called_once_with(10.0,0.5,marker=None,start=None,hold=False)
         self.assertEqual(self.post('/api/replay',{'seconds':'ten'}).status_code,400)
 
     def test_external_source_validation_persistence_and_builtin_restoration(self):
@@ -495,13 +495,17 @@ class MediaTests(unittest.TestCase):
             self.assertFalse(m.start_youtube_stream('test')[0])
             launch.assert_not_called()
 
-    def test_config_has_fallback_and_protected_program(self):
-        with tempfile.TemporaryDirectory() as tmp,patch.object(m,'MEDIAMTX_CONFIG',tmp+'/config'):
+    def test_config_has_fallback_card_and_protected_program(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(m,'MEDIAMTX_CONFIG',tmp+'/config'),patch.object(m,'OFFLINE_CARD',tmp+'/offline.mp4'):
             m.generate_mediamtx_config()
             config=json.loads(Path(m.MEDIAMTX_CONFIG).read_text())
             self.assertTrue(config['paths']['program']['alwaysAvailable'])
+            self.assertEqual(config['paths']['program']['alwaysAvailableFile'],tmp+'/offline.mp4')  # our card, not "STREAM IS OFFLINE"
+            self.assertTrue(Path(tmp,'offline.mp4').stat().st_size>0)
             public=config['authInternalUsers'][0]['permissions']
-            self.assertNotIn({'action':'publish','path':'program'},public)
+            self.assertEqual([p for p in public if p['action']=='publish'],[{'action':'publish','path':'~^cam[123]$'}])
+            local=config['authInternalUsers'][1]['permissions']
+            self.assertIn({'action':'publish','path':'~^(program|final)$'},local)
 
     def test_process_requires_progress(self):
         proc=object.__new__(m.Process)
@@ -798,6 +802,7 @@ class EngineStateCase(unittest.TestCase):
         self.stack = self.enterContext(ExitStack())
         self.tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.stack.enter_context(patch.object(m.recordings, 'RECORDINGS_DIR', Path(self.tmp)))
+        self.stack.enter_context(patch.object(m.recordings, '_written_cache', {}))
         values = dict(_want_stream=False, _state='stopped', _active_camera=None, _relay_proc=None,
                       _targets={}, _encoder_proc=None, _recorder_proc=None, _want_record=False,
                       _recording=None, _started_at=None, _generation=0,
@@ -938,6 +943,17 @@ class RecordingTests(EngineStateCase):
         with self.assertRaises(ValueError):
             r.file_path('../etc', 'passwd.mp4')
 
+    def test_marks_use_what_is_written_not_the_clock(self):
+        r = m.recordings
+        sid = r.create_session('720p', 'A vs B')
+        r.new_part(sid); r.part_started(sid, 1000.0)
+        Path(self.tmp, sid, 'part-001.ts').write_bytes(b'x')
+        # 100 s on the clock, but only 92 s are in the file (the stream fell behind real time).
+        with patch.object(r, '_now', return_value=1100.0), patch.object(r, '_probe_duration', return_value=92.0):
+            self.assertEqual(r.written_duration(sid), 92.0)
+            self.assertEqual(r.add_marker(sid, 'Goal')['offset'], 92.0)
+        self.assertEqual(r.add_marker(sid, 'Save', wall=1050.0)['offset'], 50.0)  # explicit time: timeline
+
     def test_crashed_session_is_recovered_as_unfinished(self):
         r = m.recordings
         sid = r.create_session('720p', 'A vs B')
@@ -1042,6 +1058,38 @@ class DestinationTests(EngineStateCase):
         stop.assert_called_once_with('twitch')
 
 
+class RelayOverlapTests(EngineStateCase):
+    """A cut starts the new relay while the current one stays on air."""
+    def setUp(self):
+        super().setUp()
+        for key, value in dict(_relay_slot=0, _relay_zmq=None,
+                               _mix={c: {'on': c == 'cam1', 'gain': 0.0} for c in m.CAMERA_IDS}).items():
+            self.stack.enter_context(patch.object(m, key, value))
+        self.stack.enter_context(patch.object(m, 'get_mediamtx_running', return_value=True))
+        self.running(record=False)
+        m._active_camera = 'cam1'
+
+    def cut(self, progress=True):
+        old = m._relay_proc
+        with patch.object(m, '_relay_command', return_value=(['ffmpeg', 'relay'], {}, set(), '', None, '')), \
+                patch.object(m, 'Process') as proc, patch.object(m, '_wait_progress', return_value=progress):
+            result = m.switch_camera('cam2')
+        return result, old, proc.return_value
+
+    def test_old_relay_goes_only_after_the_new_one_is_on_air(self):
+        (ok, _), old, candidate = self.cut()
+        self.assertTrue(ok)
+        self.assertIs(m._relay_proc, candidate)
+        self.kill.assert_called_with(old)
+        self.assertEqual((m._relay_slot, m._relay_zmq), (1, m._slot_zmq(1)))  # the other control port
+
+    def test_failed_relay_leaves_the_current_picture(self):
+        (ok, _), old, candidate = self.cut(progress=False)
+        self.assertFalse(ok)
+        self.assertEqual((m._relay_proc, m._active_camera, m._relay_slot), (old, 'cam1', 0))
+        self.kill.assert_called_once_with(candidate)
+
+
 class ReplayTests(EngineStateCase):
     """Instant replay: where it reads from, how it is built, and how it ends."""
     def setUp(self):
@@ -1076,11 +1124,54 @@ class ReplayTests(EngineStateCase):
         _, replay = self.replay_args()
         self.assertEqual((replay['start'], replay['length'], replay['label'], replay['speed']), (32.0, 12.0, 'Goal', 0.5))
 
+    def test_cam_replay_plays_from_the_chosen_moment_and_holds(self):
+        self.assertTrue(m.play_replay(start=20.0, speed=0.5, hold=True)[0])
+        camera, replay = self.replay_args()
+        self.assertEqual(camera, 'cam2')
+        self.assertEqual((replay['start'], replay['hold'], replay['position']), (20.0, True, 20.0))
+        self.assertAlmostEqual(replay['length'], 60 - m.REPLAY_MARGIN - 20, places=2)  # up to the recorded edge
+        self.assertTrue(m.play_replay(start=500.0, hold=True)[0])  # beyond the edge: just before it
+        self.assertAlmostEqual(self.replay_args()[1]['start'], 60 - m.REPLAY_MARGIN - 2, places=2)
+
+    def test_held_replay_never_returns_by_itself(self):
+        proc = MagicMock(); proc.poll.side_effect = [None, None, 1]
+        m._replay = {'generation': 0, 'hold': True}
+        with patch.object(m, 'switch_camera') as cut, patch.object(m.time, 'sleep'):
+            m._watch_replay(proc, 0, 'cam2', 5.0, hold=True)
+        cut.assert_not_called()   # only an operator cut ends CAM REPLAY
+        self.assertIsNone(m._replay)  # ...but a crashed replay is cleaned up for the supervisor
+
+    def test_return_to_live_starts_as_early_as_a_cut_takes(self):
+        proc = MagicMock(); proc.poll.return_value = None
+        m._replay = {'generation': 0}
+        started = []
+        with patch.object(m, '_cut_seconds', 6.0), patch.object(m.time, 'sleep'), \
+                patch.object(m, 'switch_camera', side_effect=lambda *a, **k: started.append(m.time.monotonic()) or (True, 'ok')):
+            began = m.time.monotonic()
+            m._watch_replay(proc, 0, 'cam2', 6.0)  # a 6 s clip and 6 s cuts: start at once
+        self.assertLess(started[0] - began, 0.5)
+
+    def test_camera_tracks_come_from_mediamtx(self):
+        response = MagicMock(status_code=200)
+        response.json.return_value = {'ready': True, 'tracks': ['H264', 'MPEG-4 Audio', 'KLV']}
+        with patch.object(m.requests, 'get', return_value=response), patch.object(m, '_ffprobe') as ffprobe:
+            self.assertEqual(m._probe('cam1'), {'video', 'audio'})
+            response.json.return_value = {'ready': True, 'tracks': ['H264']}
+            self.assertEqual(m._probe('cam1'), {'video'})
+            response.json.return_value = {'ready': False, 'tracks': []}
+            with self.assertRaises(ValueError):
+                m._probe('cam1')
+            ffprobe.assert_not_called()
+        with patch.object(m.requests, 'get', side_effect=m.requests.ConnectionError()), \
+                patch.object(m, '_ffprobe', return_value={'video'}) as ffprobe:
+            self.assertEqual(m._probe('cam3'), {'video'})  # API unreachable: ffprobe
+        ffprobe.assert_called_once_with('cam3')
+
     def test_replay_guards(self):
         self.assertIn('slow motion', m.play_replay(10, 2.0)[1])
         self.assertIn('3 to 30', m.play_replay(60)[1])
         self.assertEqual(m.play_replay(marker='nope'), (False, 'Unknown highlight'))
-        with patch.object(m.time, 'time', return_value=1002.0):
+        with patch.object(m.time, 'time', return_value=1002.0), patch.object(m.recordings, '_written_cache', {}):
             self.assertEqual(m.play_replay(10), (False, 'Not enough has been recorded yet'))
         m._want_record = False
         self.assertEqual(m.play_replay(10), (False, 'Instant replay needs the recording on'))
@@ -1099,14 +1190,14 @@ class ReplayTests(EngineStateCase):
         graph = cmd[cmd.index('-filter_complex') + 1]
         self.assertIn("setpts=(PTS-STARTPTS)/0.5", graph)
         self.assertIn("text='SLOW-MO REPLAY'", graph)
-        self.assertIn('tpad=stop=-1:stop_mode=clone', graph)  # held until live takes over
+        self.assertIn('tpad=stop=-1:stop_mode=clone,realtime', graph)  # held, at real-time pace, until live takes over
 
-    def test_relays_alternate_control_ports_for_seamless_switching(self):
-        first = m._spare_zmq()
-        m._relay_zmq = first
-        self.assertNotEqual(m._spare_zmq(), first)
-        m._relay_zmq = m._spare_zmq()
-        self.assertEqual(m._spare_zmq(), first)
+    def test_relays_alternate_control_ports(self):
+        with patch.object(m, '_relay_slot', 0):
+            self.assertEqual(m._spare_slot(), 1)
+            self.assertNotEqual(m._slot_zmq(0), m._slot_zmq(1))
+            m._relay_slot = 1
+            self.assertEqual(m._spare_slot(), 0)
 
     def test_cut_ends_replay_and_tally_follows(self):
         m._replay = {'camera': 'cam2', 'generation': 0, 'label': 'Replay', 'speed': 1.0, 'ends_at': 0}
