@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from browser_overlay import FRAME_PATH, ensure_frame
+import recordings
 
 import hashlib
 import json
@@ -44,7 +45,10 @@ _pending_camera = None
 _stop = threading.Event()
 _thread = None
 _encoder_thread = None
-_mediamtx_proc = _youtube_proc = _relay_proc = None
+# Output stage: the encoder burns in the scoreboard and publishes the finished picture
+# to the local "final" path; the YouTube pusher and the recorder only copy it. A YouTube
+# outage therefore restarts just the pusher and never interrupts the recording.
+_mediamtx_proc = _encoder_proc = _youtube_proc = _recorder_proc = _relay_proc = None
 _active_camera = None
 _layout = {"mode": "single", "main": "cam1", "secondary": "cam2", "position": "top-right"}
 _relay_secondary = None
@@ -68,7 +72,12 @@ _relay_retry_at = 0.0
 _restore_check_at = 0.0
 _mediamtx_retry_at = 0.0
 _youtube_stream_key = None
-_want_stream = False
+_want_stream = False      # output stage (relay + encoder) wanted: streaming and/or recording
+_want_record = False
+_recording = None         # active recording session id
+_push_retry_at = _rec_retry_at = _disk_check_at = 0.0
+_push_failures = _rec_failures = 0
+_record_warning = ""
 _state = "stopped"
 _error = ""
 _started_at = None
@@ -109,7 +118,7 @@ sys.exit(child.wait())
 
 class Process:
     """Drain both pipes continuously; retain only a bounded, redacted error tail."""
-    def __init__(self, cmd, secret=None, cwd=None):
+    def __init__(self, cmd, secret=None, cwd=None, copy=False):
         if not shutil.which(cmd[0]):
             raise FileNotFoundError(cmd[0])
         self.proc = subprocess.Popen([sys.executable, "-I", "-c", _WATCHDOG, *cmd],
@@ -117,7 +126,12 @@ class Process:
                                      stderr=subprocess.PIPE, text=True,
                                      start_new_session=True, bufsize=1, cwd=cwd)
         self.last_progress = 0.0
+        self.first_progress = None  # (time.time(), media seconds) of the first progress report
         self.frame = 0
+        self.out_time = 0
+        # Stream copy reports frame=0, so its progress is advancing output time. Encoders
+        # keep frame counting: a relay can emit generated silence with no picture.
+        self.copy = copy
         self.error = ""
         self.launched = time.monotonic()
         self.secret = secret
@@ -133,7 +147,20 @@ class Process:
                         frame = int(line.split("=", 1)[1])
                         if frame > self.frame:
                             self.last_progress = time.monotonic()
+                            if self.first_progress is None:
+                                self.first_progress = (time.time(), frame / 30)
                         self.frame = frame
+                    except ValueError:
+                        pass
+                elif progress and self.copy and line.startswith("out_time_us="):
+                    # Stream copy (YouTube pusher, recorder) reports frame=0: output time advances.
+                    try:
+                        out_time = int(line.split("=", 1)[1])
+                        if out_time > self.out_time:
+                            self.last_progress = time.monotonic()
+                            if self.first_progress is None:
+                                self.first_progress = (time.time(), out_time / 1e6)
+                        self.out_time = out_time
                     except ValueError:
                         pass
                 elif not progress and line:
@@ -323,12 +350,13 @@ def generate_mediamtx_config():
             {"user": "any", "ips": [], "permissions": [
                 {"action": "publish", "path": "~^cam[123]$"}, {"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
-                {"action": "api"}, {"action": "publish", "path": "program"}]},
+                {"action": "api"}, {"action": "publish", "path": "~^(program|final)$"}]},
         ],
         "paths": {c: {"overridePublisher": False} for c in CAMERA_IDS},
     }
     config["paths"]["program"] = {"alwaysAvailable": True, "alwaysAvailableTracks": [
         {"codec": "H264"}, {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]}
+    config["paths"]["final"] = {"overridePublisher": True}  # the encoder's finished picture
     Path(MEDIAMTX_CONFIG).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     Path(MEDIAMTX_CONFIG).write_text(json.dumps(config, indent=2))  # JSON is valid YAML
     return MEDIAMTX_CONFIG
@@ -437,7 +465,21 @@ def get_stream_status():
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
             "started_at": _started_at,
-            "error": _error, "profile": _profile, "fallback": get_active_camera() is None}
+            "error": _error, "profile": _profile, "fallback": get_active_camera() is None,
+            "recording": get_recording_status()}
+
+
+def get_recording_status():
+    session, recorder = _recording, _recorder_proc
+    status = {"active": bool(_want_record and session), "session": session,
+              "writing": bool(recorder and recorder.healthy()), "warning": _record_warning}
+    if session:
+        try:
+            info = recordings.get(session, live_wall=time.time())
+            status.update(duration=info["duration"], bytes=info["bytes"], markers=len(info["markers"]))
+        except (ValueError, OSError):
+            pass
+    return status
 
 
 def _ffmpeg():
@@ -834,7 +876,7 @@ def set_mute(muted):
 
 
 def _launch_encoder():
-    global _youtube_proc
+    global _encoder_proc
     width, height, bitrate, _ = PROFILES[_profile]
     font = round(height / 26)  # same on-screen size at every resolution
     # Disable drawtext expansion: team names are literal text, including percent signs.
@@ -853,13 +895,82 @@ def _launch_encoder():
         "-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency",
         "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
         "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
-        "-ar", "48000", "-ac", "2", "-rw_timeout", "10000000", "-f", "flv",
-        f"{YOUTUBE_RTMP_BASE}/{_youtube_stream_key}"]
-    _youtube_proc = Process(cmd, secret=_youtube_stream_key)
+        "-ar", "48000", "-ac", "2", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/final"]
+    _encoder_proc = Process(cmd)
 
 
-def start_youtube_stream(stream_key, profile="720p"):
+def _launch_pusher():
+    """Forward the finished picture to YouTube without re-encoding."""
+    global _youtube_proc
+    cmd = _ffmpeg() + _input("final") + [
+        "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
+        "-rw_timeout", "10000000", "-f", "flv", f"{YOUTUBE_RTMP_BASE}/{_youtube_stream_key}"]
+    _youtube_proc = Process(cmd, secret=_youtube_stream_key, copy=True)
+
+
+def _launch_recorder():
+    """Write the finished picture to a new crash-safe MPEG-TS part, without re-encoding."""
+    global _recorder_proc
+    path = recordings.new_part(_recording)
+    cmd = _ffmpeg() + _input("final") + ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-f", "mpegts", path]
+    _recorder_proc = Process(cmd, copy=True)
+
+
+def start_youtube_stream(stream_key, profile="720p", record=False, title=""):
+    """GO LIVE; with record, also record to this laptop. While a recording is already
+    running, this only adds the YouTube connection."""
+    return _start(stream_key, profile, record, title)
+
+
+def start_recording(profile="720p", title=""):
+    """Record to this laptop; starts the output stage without YouTube if needed."""
+    return _start(None, profile, True, title)
+
+
+def _check_disk():
+    free = recordings.free_bytes()
+    if free < recordings.MIN_FREE_START:
+        return f"Only {free / recordings.GB:.1f} GB free on this laptop; free up at least {recordings.MIN_FREE_START // recordings.GB} GB to record"
+    return ""
+
+
+def _begin_recording(title):
+    """Under _lock: open a new session; the supervisor launches the recorder."""
+    global _want_record, _recording, _rec_failures, _rec_retry_at, _record_warning
+    _recording = recordings.create_session(_profile, title)
+    _want_record, _rec_failures, _rec_retry_at, _record_warning = True, 0, 0.0, ""
+
+
+def _attach(stream_key, record, title):
+    """Under _lock, output already running: add YouTube and/or recording."""
+    global _youtube_stream_key, _state, _error, _push_failures, _push_retry_at, _started_at
+    if stream_key is not None and _youtube_stream_key:
+        return False, "Stream is already starting or running; stop before changing settings"
+    if stream_key is None and _want_record:
+        return False, "Already recording"
+    messages = []
+    if record and not _want_record:
+        problem = _check_disk()
+        if problem:
+            return False, problem
+        _begin_recording(title)
+        messages.append("Recording started")
+    if stream_key is not None:
+        _youtube_stream_key, _state, _error, _started_at = stream_key, "starting", "", None
+        _push_failures, _push_retry_at = 0, 0.0
+        messages.append("Connecting to YouTube; watch the live status for confirmation")
+    return True, "; ".join(messages)
+
+
+def _start(stream_key, profile, record, title):
     global _state, _profile
+    if stream_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
+        return False, "Invalid stream key"
+    if profile not in PROFILES:
+        return False, "Invalid quality profile"
+    with _lock:
+        if _want_stream:
+            return _attach(stream_key, record, title)
     if not _start_lock.acquire(blocking=False):
         return False, "Stream is already starting"
     try:
@@ -867,11 +978,11 @@ def start_youtube_stream(stream_key, profile="720p"):
             token = _stop_generation
             if _want_stream:
                 return False, "Stream is already starting or running; stop before changing settings"
-            if profile not in PROFILES:
-                return False, "Invalid quality profile"
-            _profile, _state = profile, "starting"
+            _profile = profile
+            if stream_key is not None:
+                _state = "starting"
         try:
-            return _start_youtube_stream(stream_key, profile, token)
+            return _start_youtube_stream(stream_key, profile, token, record, title)
         finally:
             with _lock:
                 if token == _stop_generation and not _want_stream:
@@ -880,9 +991,10 @@ def start_youtube_stream(stream_key, profile="720p"):
         _start_lock.release()
 
 
-def _start_youtube_stream(stream_key, profile, token):
+def _start_youtube_stream(stream_key, profile, token, record=False, title=""):
     global _want_stream, _youtube_stream_key, _state, _error, _profile, _retry_at, _retries
-    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
+    global _push_failures, _push_retry_at
+    if stream_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
         return False, "Invalid stream key"
     if profile not in PROFILES:
         return False, "Invalid quality profile"
@@ -894,6 +1006,10 @@ def _start_youtube_stream(stream_key, profile, token):
         return False, "MediaMTX is not ready"
     if not Path(SCOREBOARD_PATH).is_file():
         return False, "Scoreboard is not initialized"
+    if record:
+        problem = _check_disk()
+        if problem:
+            return False, problem
     if get_active_camera() and _relay_profile != profile:
         # Rebuild the program relay at the stream resolution before going live.
         ok, message = switch_camera(_active_camera, expected_stop=token)
@@ -928,27 +1044,76 @@ def _start_youtube_stream(stream_key, profile, token):
         except OSError:
             _youtube_stream_key = None
             return False, "Unable to launch encoder"
-        _want_stream, _state, _error = True, "starting", ""
+        _want_stream, _error = True, ""
+        _state = "starting" if stream_key else "stopped"
         _retry_at, _retries = 0, 0
-        return True, "Encoder starting; watch the live status for confirmation"
+        _push_failures, _push_retry_at = 0, 0.0
+        if record:
+            _begin_recording(title)
+        if stream_key is None:
+            return True, "Recording starting"
+        return True, "Encoder starting" + (" and recording" if record else "") + "; watch the live status for confirmation"
 
 
 def stop_youtube_stream():
+    """STOP STREAM: end the YouTube broadcast. A running recording keeps going."""
+    global _youtube_proc, _youtube_stream_key, _state, _error, _started_at
+    with _lock:
+        if _want_stream and _want_record:
+            pusher, _youtube_proc = _youtube_proc, None
+            _youtube_stream_key = _started_at = None
+            _state, _error = "stopped", ""
+        else:
+            pusher = False
+    if pusher is not False:
+        _kill_process(pusher)
+        return True, "YouTube stream stopped; recording continues"
+    return _stop_all()
+
+
+def stop_recording():
+    """Stop recording and save the file. A YouTube broadcast keeps going."""
+    global _recorder_proc, _want_record, _recording, _record_warning
+    with _lock:
+        if not (_want_record and _recording):
+            return False, "Not recording"
+        if _want_stream and _youtube_stream_key:
+            recorder, session = _recorder_proc, _recording
+            _recorder_proc, _recording, _want_record, _record_warning = None, None, False, ""
+        else:
+            recorder = False
+    if recorder is False:
+        _stop_all()
+        return True, "Recording stopped; saving the file"
+    _kill_process(recorder)
+    recordings.close_part(session)
+    recordings.finalize_async(session)
+    return True, "Recording stopped; saving the file"
+
+
+def _stop_all(finalize=True):
     global _want_stream, _youtube_proc, _relay_proc, _active_camera, _generation
-    global _youtube_stream_key, _state, _error, _started_at, _pending_camera
+    global _youtube_stream_key, _state, _error, _started_at, _pending_camera, _encoder_proc
     global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
+    global _recorder_proc, _want_record, _recording, _record_warning
     with _lock:
         _want_stream = False
         _stop_generation += 1
         _generation += 1  # abort any cut in flight
-        encoder, relay = _youtube_proc, _relay_proc
-        _youtube_proc = _relay_proc = None
+        processes = (_youtube_proc, _recorder_proc, _encoder_proc, _relay_proc)
+        _youtube_proc = _recorder_proc = _encoder_proc = _relay_proc = None
         _active_camera = _youtube_stream_key = _started_at = _pending_camera = None
         _relay_channels, _relay_missing, _relay_muted = {}, set(), set()
         _state, _error = "stopped", ""
         _relay_secondary, _layout_warning = None, ""
-    _kill_process(encoder)
-    _kill_process(relay)
+        session, _recording, _want_record, _record_warning = _recording, None, False, ""
+    for proc in processes:
+        _kill_process(proc)
+    if session:
+        recordings.close_part(session)
+        if finalize:
+            recordings.finalize_async(session)
+        return True, "Streaming stopped; saving the recording"
     return True, "Streaming stopped"
 
 
@@ -1011,25 +1176,30 @@ def _supervise_once():
 
 
 def _supervise_encoder():
-    global _youtube_proc, _state, _error, _started_at, _retry_at, _retries
+    global _encoder_proc, _state, _error, _retry_at, _retries
     now = time.monotonic()
     with _lock:
         if not _want_stream:
             return
-        if _youtube_proc and _youtube_proc.healthy():
-            _state = "live"
-            _error = ""
+        encoder = _encoder_proc
+        if encoder and encoder.healthy():
             _retries = 0
-            if _started_at is None:
-                _started_at = datetime.now(timezone.utc).isoformat()
+            healthy = True
+        elif encoder and encoder.poll() is None and now - encoder.launched < 20:
             return
-        if _youtube_proc and _youtube_proc.poll() is None and now - _youtube_proc.launched < 20:
-            return
-        _state = "reconnecting"
-        _error = (_youtube_proc.error if _youtube_proc else "") or "Encoder stopped producing frames"
-        token = _stop_generation
-        old, _youtube_proc = _youtube_proc, None
-    _kill_process(old)
+        else:
+            healthy = False
+            if _youtube_stream_key:
+                _state = "reconnecting"
+            _error = (encoder.error if encoder else "") or "Encoder stopped producing frames"
+            token = _stop_generation
+            _encoder_proc = None
+    if healthy:
+        # The pusher and recorder read the encoder's output, so they start once it flows.
+        _supervise_pusher(now)
+        _supervise_recorder(now)
+        return
+    _kill_process(encoder)
     with _lock:
         if not _want_stream or token != _stop_generation:
             return
@@ -1040,6 +1210,82 @@ def _supervise_encoder():
                 _launch_encoder()
             except OSError:
                 _state, _error = "failed", "Cannot restart encoder"
+
+
+def _supervise_pusher(now):
+    """Keep the YouTube connection up; reconnect with backoff without touching the encoder."""
+    global _youtube_proc, _state, _error, _started_at, _push_failures, _push_retry_at
+    with _lock:
+        if not (_want_stream and _youtube_stream_key):
+            return
+        pusher = _youtube_proc
+        if pusher and pusher.healthy():
+            _state, _error, _push_failures = "live", "", 0
+            if _started_at is None:
+                _started_at = datetime.now(timezone.utc).isoformat()
+            return
+        if pusher and pusher.poll() is None and now - pusher.launched < 20:
+            return
+        if pusher:
+            _state = "reconnecting"
+            _error = pusher.error or "YouTube connection lost"
+        _youtube_proc, token = None, _stop_generation
+    _kill_process(pusher)
+    with _lock:
+        if not (_want_stream and _youtube_stream_key) or token != _stop_generation or _youtube_proc:
+            return
+        if now >= _push_retry_at:
+            if pusher:
+                _push_failures += 1
+                _push_retry_at = now + min(30, 2 ** min(_push_failures, 5))
+            try:
+                _launch_pusher()
+            except OSError:
+                _state, _error = "failed", "Cannot start the YouTube connection"
+
+
+def _supervise_recorder(now):
+    """Keep the recorder writing; a restart continues in a new part of the same recording."""
+    global _recorder_proc, _rec_failures, _rec_retry_at, _record_warning, _disk_check_at
+    with _lock:
+        if not (_want_record and _recording):
+            return
+        session, recorder = _recording, _recorder_proc
+        alive = recorder and recorder.poll() is None and (recorder.healthy() or now - recorder.launched < 20)
+        if not alive:
+            _recorder_proc = None
+    if alive:
+        if recorder.first_progress and not getattr(recorder, "start_noted", False):
+            wall, seconds = recorder.first_progress
+            recordings.part_started(session, wall - seconds)
+            recorder.start_noted = True
+        if recorder.healthy():
+            with _lock:
+                if _rec_failures and _recording == session:
+                    _rec_failures, _record_warning = 0, ""
+        if now >= _disk_check_at:
+            _disk_check_at = now + 10
+            if recordings.free_bytes() < recordings.MIN_FREE_KEEP:
+                logger.error("Disk almost full; stopping the recording")
+                stop_recording()
+                _record_warning = "Disk almost full — recording stopped and saved"
+        return
+    if recorder:
+        _kill_process(recorder)
+        recordings.close_part(session)
+    with _lock:
+        if not (_want_record and _recording == session) or _recorder_proc:
+            return
+        if now >= _rec_retry_at:
+            if recorder:
+                _rec_failures += 1
+                _rec_retry_at = now + min(10, 2 ** min(_rec_failures, 3))
+                _record_warning = "Recording was interrupted and resumed"
+                logger.warning("Recorder for %s restarted: %s", session, recorder.error)
+            try:
+                _launch_recorder()
+            except (OSError, ValueError) as exc:
+                _record_warning = f"Cannot record: {exc}"
 
 
 def _watch_encoder():
@@ -1065,7 +1311,7 @@ def shutdown_all():
         if worker and worker is not threading.current_thread():
             worker.join(timeout=20)
     with _lock:
-        stop_youtube_stream()
+        _stop_all(finalize=False)  # an open recording is joined at the next start
         for key in list(_meters):
             _kill_process(_meters.pop(key))
         _kill_process(_mediamtx_proc)

@@ -443,10 +443,10 @@ test('operator mobile tally screen loads without basic auth and displays camera 
 test('setup tabs group sections, persist the choice and play previews only on Main', async ({page}) => {
   await page.goto('/');
   await expect(page.getByRole('tab', {name: /Main/})).toHaveAttribute('aria-selected', 'true');
-  for (const title of ['Multiview', 'Scoreboard & Match Clock', 'YouTube Stream']) {
+  for (const title of ['Multiview', 'Scoreboard & Match Clock', 'YouTube Stream & Recording']) {
     await expect(page.getByRole('heading', {name: title})).toBeVisible();
   }
-  for (const title of ['Network Controls', 'Camera RTMP Links', 'Sideline Checklist']) {
+  for (const title of ['Network Controls', 'Camera RTMP Links', 'Sideline Checklist', 'Recordings & Highlights']) {
     await expect(page.getByRole('heading', {name: title})).toBeHidden();
   }
   await page.getByRole('tab', {name: /Cams/}).click();
@@ -479,4 +479,56 @@ test('master mute silences the broadcast from Main and match mode and stays in s
   await expect(matchMute).toHaveText('🔊 Mute');
   await expect.poll(async () => (await page.request.get('/api/audio/levels')).json().then(x => x.mixer.muted)).toBe(false);
   await page.locator('#mode-toggle').click();
+});
+
+test('recording controls, highlight marking and the Recordings tab', async ({page}) => {
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Main/}).click();
+  const start = page.locator('[data-rec-start]');
+  await expect(start).toHaveText('⏺ Record only (no YouTube)');
+  await expect(page.locator('#record-with-live')).toBeChecked();
+  await start.click();
+  await expect(page.locator('#status-rec-badge')).toBeVisible();
+  await expect(page.locator('section[data-tab="main"] [data-bind="rec_status"]')).toHaveText('00:01:05 · 150 MB · 1 highlight');
+  await page.locator('section[data-tab="main"] .mark-btn').click();
+  await expect(page.locator('#toast-container')).toContainText('Highlight marked at');
+  // Match mode: REC badge, ⭐ and the H key.
+  await page.locator('#mode-toggle').click();
+  await expect(page.locator('#match-panel [data-rec-badge]')).toBeVisible();
+  await page.keyboard.press('h');
+  await expect(page.locator('#match-panel [aria-label="Mark highlight"]')).toBeVisible();
+  await page.setViewportSize({width: 390, height: 844});  // REC row must not widen the phone layout
+  await expect.poll(() => page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.setViewportSize({width: 1280, height: 720});
+  await page.locator('#mode-toggle').click();
+
+  await page.getByRole('tab', {name: /Recordings/}).click();
+  await expect(page.locator('[data-bind="rec_free"]')).toContainText('40.0 GB free');
+  const cards = page.locator('#recordings-list [data-rec]');
+  await expect(cards).toHaveCount(2);
+  const live = cards.nth(0), done = cards.nth(1);
+  await expect(live).toContainText('Polonia vs Altona');
+  await expect(live.locator('.rec-badge')).toHaveText('⏺ REC');
+  await expect(live.locator('[data-marker]')).toHaveCount(2);  // ⭐ button and H key
+  await expect(live.getByRole('button', {name: /Delete/})).toHaveCount(0);  // cannot delete while recording
+  await expect(done.locator('.chip')).toHaveText('Ready');
+  await expect(done.getByRole('link', {name: /Download MP4/})).toHaveAttribute('href', /20261101_Polonia-vs-HEBC\.mp4\?download=1$/);
+  await expect(done.locator('[data-marker]').first()).toContainText("12:30' · Polonia 1-0 HEBC");
+  await done.locator('summary').click();
+  await expect(done.locator('textarea')).toHaveValue('0:00 Kick-off\n12:30 Goal – Polonia 1-0 HEBC (12:30)\n40:00 Highlight – Polonia 1-0 HEBC (40:02)');
+  // Relabel persists; the list refreshes without losing it.
+  await done.locator('[data-marker]').nth(1).locator('select').selectOption('Save');
+  await expect.poll(async () => (await page.request.get('/api/recordings')).json()
+    .then(x => x.recordings[1].markers[1].label)).toBe('Save');
+  await page.waitForTimeout(3500);
+  await expect(done.locator('[data-marker]').nth(1).locator('select')).toHaveValue('Save');
+  page.once('dialog', dialog => dialog.accept());
+  await done.locator('[data-marker]').nth(1).getByRole('button', {name: 'Remove highlight'}).click();
+  await expect(done.locator('[data-marker]')).toHaveCount(1);
+
+  await page.getByRole('tab', {name: /Main/}).click();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
+  await expect(page.locator('#status-rec-badge')).toBeHidden();
+  await expect(start).toBeVisible();
 });

@@ -22,6 +22,7 @@ import time
 from functools import wraps
 
 from flask import Flask, jsonify, render_template, request, send_file
+import recordings
 
 from browser_overlay import BrowserOverlay, normalize_url
 
@@ -40,7 +41,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           get_mediamtx_running, get_stream_status, start_youtube_stream,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
-                          SUPERSEDED, set_layout, CAMERA_IDS)
+                          SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
+                          get_recording_status)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -369,8 +371,12 @@ def api_stream_start():
     if not stream_key:
         return jsonify({"ok": False, "error": "stream_key is required"}), 400
 
-    log.info("Stream start requested")
-    success, msg = start_youtube_stream(stream_key, text_field(data, "profile", 10, "720p"))
+    record = data.get("record", False)
+    if type(record) is not bool:
+        raise ValueError("record must be true or false")
+    log.info("Stream start requested (record=%s)", record)
+    success, msg = start_youtube_stream(stream_key, text_field(data, "profile", 10, "720p"),
+                                        record=record, title=_match_title())
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
 
@@ -383,6 +389,129 @@ def api_stream_stop():
     success, msg = stop_youtube_stream()
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
+
+
+# --- Recording & highlights --------------------------------------------
+
+def _match_title():
+    with _scoreboard_lock:
+        return f"{_scoreboard['home_name']} vs {_scoreboard['away_name']}"
+
+
+def _match_moment():
+    """Match clock and score for a highlight, e.g. ("23:41", "HOME 1-0 AWAY")."""
+    with _scoreboard_lock:
+        sb = dict(_scoreboard)
+        clock = _format_clock(_clock_elapsed())
+    return clock, f"{sb['home_name']} {sb['home_score']}-{sb['away_score']} {sb['away_name']}"
+
+
+def _auto_goal_marker(team, delta):
+    session = get_recording_status()
+    if not session["active"]:
+        return
+    try:
+        if delta > 0:
+            clock, score = _match_moment()
+            recordings.add_marker(session["session"], "Goal", clock, score, auto=team)
+        else:
+            recordings.withdraw_auto_goal(session["session"], team)
+    except (ValueError, OSError):
+        log.exception("Cannot update the goal highlight")
+
+
+@app.route("/api/recording/start", methods=["POST"])
+@api_endpoint
+def api_recording_start():
+    """Record the finished program (with scoreboard) to this laptop; YouTube optional."""
+    data = request.get_json(force=True, silent=True) or {}
+    log.info("Recording start requested")
+    success, msg = start_recording(text_field(data, "profile", 10, "720p"), title=_match_title())
+    return jsonify({"ok": success, "message": msg}), 200 if success else 502
+
+
+@app.route("/api/recording/stop", methods=["POST"])
+@api_endpoint
+def api_recording_stop():
+    log.info("Recording stop requested")
+    success, msg = stop_recording()
+    return jsonify({"ok": success, "message": msg}), 200 if success else 409
+
+
+@app.route("/api/markers", methods=["POST"])
+@api_endpoint
+def api_marker_add():
+    """Mark a highlight now on the running recording: {"label": "Highlight"|"Goal"|...}."""
+    data = request.get_json(force=True, silent=True) or {}
+    session = get_recording_status()
+    if not session["active"]:
+        return jsonify({"ok": False, "error": "Start recording to mark highlights"}), 409
+    clock, score = _match_moment()
+    marker = recordings.add_marker(session["session"], text_field(data, "label", 20, "Highlight"), clock, score)
+    return jsonify({"ok": True, "message": f"⭐ {marker['label']} marked at {clock}", "marker": marker})
+
+
+@app.route("/api/recordings", methods=["GET"])
+@api_endpoint
+def api_recordings():
+    return jsonify({"ok": True, "recordings": recordings.list_sessions(live_wall=time.time()),
+                    "free_bytes": recordings.free_bytes(), "labels": list(recordings.LABELS),
+                    "recording": get_recording_status()})
+
+
+@app.route("/api/recordings/<sid>/markers/<mid>", methods=["POST"])
+@api_endpoint
+def api_marker_update(sid, mid):
+    data = request.get_json(force=True, silent=True) or {}
+    if data.get("delete") is True:
+        recordings.delete_marker(sid, mid)
+        return jsonify({"ok": True, "message": "Highlight removed"})
+    marker = recordings.update_marker(sid, mid, text_field(data, "label", 20))
+    return jsonify({"ok": True, "message": "Highlight updated", "marker": marker})
+
+
+@app.route("/api/recordings/<sid>/markers/<mid>/clip", methods=["POST"])
+@api_endpoint
+def api_marker_clip(sid, mid):
+    name = recordings.export_clip(sid, mid)
+    return jsonify({"ok": True, "message": "Clip ready", "clip": name})
+
+
+@app.route("/api/recordings/<sid>/reel", methods=["POST"])
+@api_endpoint
+def api_recording_reel(sid):
+    name = recordings.build_reel(sid)
+    return jsonify({"ok": True, "message": "Highlight reel ready", "file": name})
+
+
+@app.route("/api/recordings/<sid>/finalize", methods=["POST"])
+@api_endpoint
+def api_recording_finalize(sid):
+    if get_recording_status()["session"] == sid:
+        return jsonify({"ok": False, "error": "Stop the recording first"}), 409
+    recordings.finalize_async(sid)
+    return jsonify({"ok": True, "message": "Saving the recording…"})
+
+
+@app.route("/api/recordings/<sid>/delete", methods=["POST"])
+@api_endpoint
+def api_recording_delete(sid):
+    if get_recording_status()["session"] == sid:
+        return jsonify({"ok": False, "error": "Stop the recording first"}), 409
+    recordings.delete_session(sid)
+    return jsonify({"ok": True, "message": "Recording deleted"})
+
+
+@app.route("/recordings/<sid>/<path:name>", methods=["GET"])
+def recording_file(sid, name):
+    """Recorded files: played in the dashboard, or downloaded with ?download=1."""
+    try:
+        path = recordings.file_path(sid, name)
+    except ValueError:
+        return jsonify({"ok": False, "error": "Unknown file"}), 404
+    return send_file(path, mimetype="video/mp2t" if path.suffix == ".ts" else "video/mp4",
+                     as_attachment=request.args.get("download") == "1",
+                     download_name=path.name, conditional=True, max_age=0)
 
 
 # --- Camera switching --------------------------------------------------
@@ -540,6 +669,8 @@ def api_scoreboard_update():
 
     _write_scoreboard_file()
     _save_match()
+    if "delta" in data:
+        _auto_goal_marker(data["team"], data["delta"])
     log.info("Scoreboard updated (source=%s, visible=%s)", _scoreboard["source"], _scoreboard["visible"])
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
 
@@ -725,6 +856,16 @@ def _background_init():
         _initialization_error = str(exc)
         log.exception("MediaMTX initialization failed")
 
+def _recover_recordings():
+    """A recording interrupted by a crash or restart is joined into its MP4 now."""
+    try:
+        recordings.recover()
+        for item in recordings.list_sessions():
+            if item["state"] == "unfinished":
+                recordings.finalize(item["id"])
+    except Exception:
+        log.exception("Recording recovery failed")
+
 def initialize():
     RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     password_file = RUNTIME_DIR / "operator-password"
@@ -739,6 +880,7 @@ def initialize():
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     _restore_match()
+    threading.Thread(target=_recover_recordings, daemon=True).start()
     browser_overlay.start()
     browser_overlay.configure(_scoreboard["source"], _scoreboard["visible"], _scoreboard["overlay_url"])
     _write_scoreboard_file()

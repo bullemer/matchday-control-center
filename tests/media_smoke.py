@@ -35,6 +35,7 @@ def run():
         m.MEDIAMTX_API = 'http://127.0.0.1:29997'
         m.YOUTUBE_RTMP_BASE = m.RTMP_BASE  # cam3 is a local test sink
         m.ZMQ_ADDRESS = 'tcp://127.0.0.1:28799'
+        m.recordings.RECORDINGS_DIR = Path(tmp) / 'recordings'
         def config():
             original_config()
             p = Path(m.MEDIAMTX_CONFIG)
@@ -57,10 +58,22 @@ def run():
             sources += [source('cam1', 'red'), source('cam2', 'blue', 660)]
             wait(lambda: m.get_camera_status()['cam1'] and m.get_camera_status()['cam2'])
             assert m.set_audio_source('active')[0]
-            assert m.start_youtube_stream('cam3')[0], m.get_stream_status()
+            assert m.start_youtube_stream('cam3', record=True, title='Red vs Blue')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
-            encoder_pid = m._youtube_proc.proc.pid
+            encoder_pid = m._encoder_proc.proc.pid
             print('PASS: encoder is producing frames', flush=True)
+            wait(lambda: m.get_recording_status()['writing'])
+            session = m.get_recording_status()['session']
+            recorder_pid = m._recorder_proc.proc.pid
+            m._youtube_proc.proc.kill()  # YouTube connection drops
+            wait(lambda: m.get_stream_status()['state'] == 'reconnecting', seconds=10)
+            wait(lambda: m.get_stream_status()['state'] == 'live', seconds=30)
+            assert m._recorder_proc.proc.pid == recorder_pid and m._encoder_proc.proc.pid == encoder_pid
+            print('PASS: YouTube reconnect leaves encoder and recording untouched', flush=True)
+            time.sleep(3)
+            marker = m.recordings.add_marker(session, 'Goal', '12:00', 'Red 1-0 Blue')
+            assert marker['offset'] > 5, marker
+            print(f"PASS: highlight marked at {marker['offset']}s on the recording", flush=True)
             def picture():
                 result = subprocess.run(['ffmpeg','-v','error','-rtsp_transport','tcp','-timeout','5000000',
                     '-i',f'{m.RTSP_BASE}/program','-an','-frames:v','1','-vf','scale=160:90',
@@ -78,15 +91,15 @@ def run():
                 blue=pixel(frame,120,22 if mode=='pip' else 45)
                 assert red[0]>150 and red[2]<80,(mode,red)
                 assert blue[2]>150 and blue[0]<80,(mode,blue)
-                assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running()
+                assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running()
                 print(f'PASS: {mode} shows both cameras in the expected positions without restarting output',flush=True)
             sources[1].terminate(); sources[1].wait(timeout=5)
             wait(lambda: m.get_stream_status()['secondary_camera'] is None and bool(m.get_stream_status()['layout_warning']),seconds=40)
-            assert m.get_active_camera()=='cam1' and m._youtube_proc.proc.pid==encoder_pid
+            assert m.get_active_camera()=='cam1' and m._encoder_proc.proc.pid==encoder_pid
             print('PASS: missing second camera falls back to main-only output',flush=True)
             sources[1]=source('cam2','blue',660)
             wait(lambda:m.get_stream_status()['secondary_camera']=='cam2',seconds=40)
-            assert m._youtube_proc.proc.pid==encoder_pid
+            assert m._encoder_proc.proc.pid==encoder_pid
             print('PASS: returning second camera restores the selected layout',flush=True)
             assert m.set_layout('single','cam1','cam2')[0]
             def metered():
@@ -98,10 +111,10 @@ def run():
                 ok, message = m.switch_camera(camera)
                 assert ok, message
                 time.sleep(2)
-                assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
+                assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print('PASS: three cuts preserve encoder PID and frame progress', flush=True)
             assert m.set_audio_source('cam1')[0]
-            assert m._youtube_proc.proc.pid == encoder_pid
+            assert m._encoder_proc.proc.pid == encoder_pid
             print('PASS: locked commentary audio preserves output encoder', flush=True)
             assert m.get_stream_status()['audio_on_air'] == ['cam1'], m.get_stream_status()
             sources[0].terminate()
@@ -110,7 +123,7 @@ def run():
             wait(lambda: m.get_active_camera() == 'cam2' and m.get_stream_status()['audio_on_air'] == ['cam2']
                  and time.monotonic() - lost > 3, seconds=40)
             assert m.get_stream_status()['audio_warning'], m.get_stream_status()
-            assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
+            assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print(f'PASS: commentary loss keeps cam2 picture with its own audio ({time.monotonic() - lost:.1f}s)', flush=True)
             sources[0] = source('cam1', 'red')
             wait(lambda: m.get_stream_status()['audio_on_air'] == ['cam1'] and m.get_active_camera() == 'cam2', seconds=40)
@@ -124,22 +137,50 @@ def run():
             wait(lambda: program() < -60)
             assert m.set_mix('cam2', gain=0)[0]
             wait(lambda: program() > -30)
-            assert m._relay_proc.proc.pid == relay_pid and m._youtube_proc.proc.pid == encoder_pid
+            assert m._relay_proc.proc.pid == relay_pid and m._encoder_proc.proc.pid == encoder_pid
             print('PASS: live mixing: mute and faders change program level without restarting', flush=True)
             sources[1].terminate()
             sources[1].wait(timeout=5)
             wait(lambda: m.get_active_camera() is None)
             time.sleep(3)
-            assert m._youtube_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
+            assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print('PASS: source loss keeps output alive on fallback', flush=True)
             assert m.switch_camera('cam1')[0]
-            assert m._youtube_proc.proc.pid == encoder_pid
+            assert m._encoder_proc.proc.pid == encoder_pid
             print('PASS: recovery to available camera', flush=True)
-            m._youtube_proc.proc.kill()
-            m._youtube_proc.proc.wait(timeout=5)
-            wait(lambda: m._youtube_proc.proc.pid != encoder_pid and m.get_stream_status()['state'] == 'live',seconds=35)
+            m._encoder_proc.proc.kill()
+            m._encoder_proc.proc.wait(timeout=5)
+            wait(lambda: m._encoder_proc and m._encoder_proc.proc.pid != encoder_pid and m.get_stream_status()['state'] == 'live',seconds=35)
             print('PASS: failed encoder automatically restarts and resumes progress', flush=True)
+            wait(lambda: m.get_recording_status()['writing'] and m._recorder_proc.proc.pid != recorder_pid, seconds=35)
+            print('PASS: recording continues in a new part after the encoder restart', flush=True)
+            time.sleep(4)
+            assert m.stop_recording() == (True, 'Recording stopped; saving the file')
+            assert m.get_youtube_running() and m.get_stream_status()['state'] == 'live'
+            wait(lambda: m.recordings.get(session)['state'] == 'done', seconds=60)
+            info = m.recordings.get(session)
+            parts_total = info['duration']
+            assert info['file'].endswith('_Red-vs-Blue.mp4') and parts_total > 20, info
+            assert not list((m.recordings.RECORDINGS_DIR / session).glob('part-*.ts'))
+            clip = m.recordings.export_clip(session, marker['id'])
+            clip_len = m.recordings._probe_duration(m.recordings.RECORDINGS_DIR / session / clip)
+            expected = min(marker['offset'], m.recordings.CLIP_PRE) + m.recordings.CLIP_POST
+            assert abs(clip_len - expected) < 3, (clip_len, expected)  # copy cuts start on a keyframe
+            assert m.recordings.build_reel(session) == 'highlights.mp4'
+            print(f"PASS: stop recording keeps YouTube live; {info['file']} {parts_total:.0f}s, clip {clip_len:.1f}s, reel", flush=True)
             assert m.stop_youtube_stream()[0]
+            assert m.start_recording('480p', 'Record only')[0], m.get_stream_status()
+            wait(lambda: m.get_recording_status()['writing'])
+            assert m.get_stream_status()['state'] == 'stopped' and not m.get_youtube_running()
+            only = m.get_recording_status()['session']
+            time.sleep(4)
+            assert m.stop_recording()[0] and m._encoder_proc is None and m._relay_proc is None
+            wait(lambda: m.recordings.get(only)['state'] == 'done', seconds=60)
+            probe = subprocess.run(['ffprobe', '-v', 'error', '-select_streams', 'v:0', '-show_entries', 'stream=width,height',
+                                    '-of', 'csv=p=0', str(m.recordings.RECORDINGS_DIR / only / m.recordings.get(only)['file'])],
+                                   capture_output=True, text=True, timeout=10)
+            assert probe.stdout.strip() == '854,480', probe.stdout
+            print('PASS: record-only mode records without YouTube and stops the output when done', flush=True)
             assert m.start_youtube_stream('cam3', '1080p')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
             probe = subprocess.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',

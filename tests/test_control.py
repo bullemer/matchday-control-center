@@ -39,6 +39,29 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(result.status_code,200)
         mute.assert_called_once_with(True)
 
+    def test_marker_needs_a_running_recording(self):
+        with patch.object(a,'get_recording_status',return_value={'active':False,'session':None}):
+            self.assertEqual(self.post('/api/markers',{}).status_code,409)
+
+    def test_goal_button_marks_and_correction_withdraws_highlight(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m.recordings,'RECORDINGS_DIR',Path(tmp)):
+            sid=m.recordings.create_session('720p','HOME vs AWAY')
+            with patch.object(a,'get_recording_status',return_value={'active':True,'session':sid}):
+                self.assertEqual(self.post('/api/scoreboard/update',{'team':'home','delta':1}).status_code,200)
+                marker=m.recordings.get(sid)['markers'][0]
+                self.assertEqual((marker['label'],marker['auto']),('Goal','home'))
+                self.assertRegex(marker['score'],r' 1-0 ')
+                result=self.post('/api/markers',{'label':'Save'})
+                self.assertEqual(result.status_code,200)
+                self.assertIn('Save marked',result.get_json()['message'])
+                self.post('/api/scoreboard/update',{'team':'home','delta':-1})
+                self.assertEqual([x['label'] for x in m.recordings.get(sid)['markers']],['Save'])
+                self.assertEqual(self.post('/api/recordings/'+sid+'/delete',{}).status_code,409)  # still recording
+            listing=self.client.get('/api/recordings',headers=self.headers).get_json()
+            self.assertEqual(listing['recordings'][0]['id'],sid)
+            self.assertEqual(self.client.get('/recordings/'+sid+'/session.json',headers=self.headers).status_code,404)
+            self.assertEqual(self.client.get('/recordings/'+sid+'/x.mp4').status_code,401)
+
     def test_external_source_validation_persistence_and_builtin_restoration(self):
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'score67'}).status_code, 400)
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'other'}).status_code, 400)
@@ -529,13 +552,14 @@ class MediaTests(unittest.TestCase):
             cmd,_,_,_,_,_=m._relay_command('cam2',{'cam2':0.0})
             self.assertIn('scale=1920:1080',' '.join(cmd))
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
-            with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_youtube_stream_key','key'):
+            with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_encoder_proc',None):
                 m._launch_encoder()
             enc=proc.call_args.args[0]
             self.assertEqual(enc[enc.index('-f')+1], 'image2')
             vf=enc[enc.index('-filter_complex')+1]
             self.assertIn('scale=1920:1080',vf); self.assertIn('fontsize=42',vf)
             self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
+            self.assertEqual(enc[-1], m.RTSP_BASE+'/final')  # YouTube and the recorder copy this
 
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
@@ -646,7 +670,9 @@ class ConcurrencyRegressionTests(unittest.TestCase):
         from contextlib import ExitStack
         self.stack = self.enterContext(ExitStack())
         values = dict(_want_stream=False, _state='stopped', _active_camera=None,
-                      _relay_proc=None, _youtube_proc=None, _relay_channels={}, _relay_muted=set(),
+                      _relay_proc=None, _youtube_proc=None, _encoder_proc=None, _recorder_proc=None,
+                      _want_record=False, _recording=None, _youtube_stream_key=None,
+                      _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _audio_warning='', _generation=0, _stop_generation=0,
                       _pending_camera=None, _follow=False, _profile='720p', _relay_profile='720p',
                       _mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS})
@@ -748,6 +774,159 @@ class ConcurrencyRegressionTests(unittest.TestCase):
         with patch.object(m,'_relay_command',side_effect=AssertionError('slow probe')), patch.object(m,'_launch_encoder') as launch, patch.object(m,'_retry_at',0):
             m._supervise_encoder()
             launch.assert_called_once()
+
+
+class RecordingTests(unittest.TestCase):
+    """Recording lifecycle (engine state only, no processes) and the recordings store."""
+    def setUp(self):
+        from contextlib import ExitStack
+        self.stack = self.enterContext(ExitStack())
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+        self.stack.enter_context(patch.object(m.recordings, 'RECORDINGS_DIR', Path(self.tmp)))
+        values = dict(_want_stream=False, _state='stopped', _active_camera=None, _relay_proc=None,
+                      _youtube_proc=None, _encoder_proc=None, _recorder_proc=None, _want_record=False,
+                      _recording=None, _youtube_stream_key=None, _started_at=None, _generation=0,
+                      _stop_generation=0, _pending_camera=None, _relay_channels={}, _relay_muted=set(),
+                      _relay_missing=set(), _profile='720p', _relay_profile='720p', _record_warning='')
+        for key, value in values.items():
+            self.stack.enter_context(patch.object(m, key, value))
+        self.kill = self.stack.enter_context(patch.object(m, '_kill_process'))
+        self.stack.enter_context(patch.object(m.recordings, 'finalize_async'))
+        self.stack.enter_context(patch.object(m.recordings, 'free_bytes', return_value=50 * m.recordings.GB))
+
+    def running(self, key=None, record=True):
+        """Output stage up: recording and/or YouTube."""
+        m._want_stream = True
+        m._encoder_proc, m._relay_proc = MagicMock(name='encoder'), MagicMock(name='relay')
+        if key:
+            m._youtube_stream_key, m._youtube_proc = key, MagicMock(name='pusher')
+        if record:
+            m._recording = m.recordings.create_session('720p', 'A vs B')
+            m._want_record, m._recorder_proc = True, MagicMock(name='recorder')
+
+    def test_stop_stream_while_recording_keeps_recording(self):
+        self.running(key='key')
+        pusher, recorder = m._youtube_proc, m._recorder_proc
+        self.assertEqual(m.stop_youtube_stream(), (True, 'YouTube stream stopped; recording continues'))
+        self.kill.assert_called_once_with(pusher)
+        self.assertTrue(m._want_stream and m._want_record)
+        self.assertIs(m._recorder_proc, recorder)
+        self.assertIsNone(m._youtube_stream_key)
+        self.assertEqual(m._state, 'stopped')
+
+    def test_stop_recording_while_live_keeps_youtube(self):
+        self.running(key='key')
+        session, pusher = m._recording, m._youtube_proc
+        with patch.object(m.recordings, 'close_part') as close:
+            self.assertTrue(m.stop_recording()[0])
+        close.assert_called_once_with(session)
+        m.recordings.finalize_async.assert_called_once_with(session)
+        self.assertTrue(m._want_stream and m._youtube_proc is pusher)
+        self.assertFalse(m._want_record)
+        self.assertIsNone(m._recording)
+
+    def test_stop_recording_only_stops_whole_output(self):
+        self.running()
+        session = m._recording
+        with patch.object(m.recordings, 'close_part'):
+            self.assertTrue(m.stop_recording()[0])
+        self.assertFalse(m._want_stream)
+        self.assertIsNone(m._encoder_proc)
+        self.assertIsNone(m._relay_proc)
+        m.recordings.finalize_async.assert_called_once_with(session)
+
+    def test_go_live_during_recording_only_adds_youtube(self):
+        self.running()
+        ok, message = m.start_youtube_stream('key2')
+        self.assertTrue(ok, message)
+        self.assertEqual((m._youtube_stream_key, m._state), ('key2', 'starting'))
+        self.assertFalse(m.start_youtube_stream('key3')[0])  # already live
+        self.assertEqual(m.start_recording(), (False, 'Already recording'))
+
+    def test_record_while_live_opens_a_session(self):
+        self.running(key='key', record=False)
+        self.assertTrue(m.start_recording()[0])
+        self.assertTrue(m._want_record)
+        self.assertEqual(m.recordings.get(m._recording)['state'], 'recording')
+
+    def test_low_disk_refuses_to_record(self):
+        self.running(key='key', record=False)
+        with patch.object(m.recordings, 'free_bytes', return_value=2 * m.recordings.GB):
+            ok, message = m.start_recording()
+        self.assertFalse(ok)
+        self.assertIn('2.0 GB free', message)
+        self.assertFalse(m._want_record)
+
+    def test_full_disk_stops_recording(self):
+        self.running()
+        m._recorder_proc.poll.return_value = None
+        m._recorder_proc.healthy.return_value = True
+        m._recorder_proc.first_progress = None
+        with patch.object(m, '_disk_check_at', 0), patch.object(m.recordings, 'close_part'), \
+                patch.object(m.recordings, 'free_bytes', return_value=m.recordings.GB // 2):
+            m._supervise_recorder(m.time.monotonic())
+        self.assertFalse(m._want_record)
+        self.assertIn('Disk almost full', m._record_warning)
+
+    def test_dead_recorder_continues_in_a_new_part(self):
+        self.running()
+        old = m._recorder_proc
+        old.poll.return_value = 1
+        with patch.object(m.recordings, 'close_part') as close, patch.object(m, 'Process') as proc, patch.object(m, '_rec_retry_at', 0):
+            m._supervise_recorder(m.time.monotonic())
+        close.assert_called_once_with(m._recording)
+        self.assertIs(m._recorder_proc, proc.return_value)
+        cmd = proc.call_args.args[0]
+        self.assertTrue(cmd[-1].endswith('part-001.ts'))
+        self.assertIn('copy', cmd)
+        self.assertEqual(m._record_warning, 'Recording was interrupted and resumed')
+
+    def test_markers_follow_the_recording_timeline_across_parts(self):
+        r = m.recordings
+        sid = r.create_session('720p', 'Polonia vs HEBC')
+        r.new_part(sid); r.part_started(sid, 1000.0)
+        with patch.object(r, '_probe_duration', return_value=60.0):
+            Path(self.tmp, sid, 'part-001.ts').write_bytes(b'x')
+            r.close_part(sid)
+        r.new_part(sid); r.part_started(sid, 1100.0)  # 40 s gap: encoder restarted
+        self.assertEqual(r.add_marker(sid, 'Chance', wall=1030.0)['offset'], 30.0)
+        goal = r.add_marker(sid, 'Goal', '23:41', 'Polonia 1-0 HEBC', wall=1112.5)
+        self.assertEqual(goal['offset'], 72.5)
+        self.assertEqual(r._source(r._load(sid), 72.5)[1], 12.5)
+        self.assertEqual(r.chapters(r._load(sid)).splitlines(),
+                         ['0:00 Kick-off', '0:30 Chance', '1:12 Goal – Polonia 1-0 HEBC (23:41)'])
+        with self.assertRaises(ValueError):
+            r.add_marker(sid, 'Party')
+
+    def test_goal_correction_withdraws_the_automatic_marker(self):
+        r = m.recordings
+        sid = r.create_session('720p', 'A vs B')
+        r.add_marker(sid, 'Goal', auto='home')
+        r.add_marker(sid, 'Goal', auto='away')
+        self.assertTrue(r.withdraw_auto_goal(sid, 'home'))
+        self.assertEqual([x['auto'] for x in r.get(sid)['markers']], ['away'])
+        self.assertFalse(r.withdraw_auto_goal(sid, 'home'))
+
+    def test_downloads_stay_inside_the_session(self):
+        r = m.recordings
+        sid = r.create_session('720p', 'A vs B')
+        Path(self.tmp, sid, 'match.mp4').write_bytes(b'x')
+        self.assertEqual(r.file_path(sid, 'match.mp4').name, 'match.mp4')
+        for name in ('session.json', '../../app.py', 'clips/../../x.mp4'):
+            with self.assertRaises(ValueError):
+                r.file_path(sid, name)
+        with self.assertRaises(ValueError):
+            r.file_path('../etc', 'passwd.mp4')
+
+    def test_crashed_session_is_recovered_as_unfinished(self):
+        r = m.recordings
+        sid = r.create_session('720p', 'A vs B')
+        r.new_part(sid); r.part_started(sid, 1000.0)
+        Path(self.tmp, sid, 'part-001.ts').write_bytes(b'x')
+        with patch.object(r, '_probe_duration', return_value=42.0):
+            r.recover()
+        info = r.get(sid)
+        self.assertEqual((info['state'], info['duration']), ('unfinished', 42.0))
 
 
 if __name__=='__main__':

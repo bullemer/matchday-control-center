@@ -71,7 +71,14 @@ workers: the hardware process manager and live match state are process-local.
    while hidden, and the visibility setting is saved with the match.
    The overlay refreshes every half-second. Match state is
    saved after changes and every five seconds, and restored with the clock **paused**.
-7. STOP LIVE ends both encoder and camera relay. Ctrl+C / SIGTERM also cleans up the
+7. **Recording.** With "Also record to this laptop" on (the default), GO LIVE also
+   records; **Record only** records without YouTube (no internet needed), and **Start
+   recording** adds a recording to a running stream. Mark moments with **⭐ Mark
+   highlight** (Main tab, Match mode, or key H in Match mode); a goal (+1) is marked
+   automatically and withdrawn again by a −1 within two minutes. See *Recordings and
+   highlights* below.
+8. STOP STREAM ends the YouTube broadcast; a running recording continues until **Stop
+   recording**. Stopping whichever runs last also stops the encoder and camera relay. Ctrl+C / SIGTERM also cleans up the
    managed media processes. The hotspot remains under its explicit start/stop controls.
 
 ## Media pipeline and recovery
@@ -117,7 +124,7 @@ check YouTube Studio to confirm platform-side reception and audience availabilit
 
 MediaMTX's control API and RTSP transport are loopback-only. Program publishing is
 loopback-only; camera publishing and preview reading are available on the LAN.
-Camera paths reject replacement publishers. Ports: TCP 5000 (control), 1935 (camera
+Camera paths reject replacement publishers. Publishing to the output encoder's `final` path is loopback-only too. Ports: TCP 5000 (control), 1935 (camera
 RTMP), 8888 (HLS), 8889 (WebRTC signaling), and UDP 8189 (WebRTC media).
 Firewall diagnostics distinguish listening sockets from verified remote reachability;
 they do not claim that a matching rule or a listening socket guarantees access.
@@ -127,6 +134,32 @@ SHA-256 manifest, and extracted as a single regular executable. An incompatible
 existing binary is rejected; move it aside to provision the supported version.
 Generated configuration, certificates, credentials, and match state are under `data/`.
 Never commit this directory. MediaMTX is not automatically upgraded on launch.
+
+## Recordings and highlights
+
+The recording is the finished broadcast picture, scoreboard included, at the selected
+quality (about 2 GB per hour at 720p, 2.7 GB at 1080p). Files are under `recordings/`
+next to the app; set `MCC_RECORDINGS_DIR` to use another folder or drive.
+Recording refuses to start with less than 3 GB free and stops (and saves) by itself
+below 1 GB.
+
+Pipeline: the output encoder publishes its finished picture to the local `final` path.
+The YouTube connection and the recorder only copy that stream (no second encode), so a
+YouTube outage reconnects the YouTube side alone and never interrupts the recording.
+The recorder writes crash-safe MPEG-TS parts; if the encoder or recorder restarts, the
+recording continues in a new part and the gap is short. Stopping joins the parts into
+one MP4 (`<date>_<Home>-vs-<Away>.mp4`). If the app stops mid-recording, the parts are
+joined automatically at the next start, or with **Finish saving**.
+
+The **🎬 Recordings** tab lists every recording: download or watch the MP4, delete it,
+and work with its highlights. Each highlight shows its time in the recording, the match
+clock and the score; change its type (Goal, Chance, Save, Card, Foul, Other) or remove
+it. **🎬 Clip** cuts 20 s before to 10 s after the mark without re-encoding (the cut
+starts on the nearest keyframe, at most 2 s earlier); clips also work while the match is
+still being recorded. **Build highlight reel** joins all clips in match order into
+`highlights.mp4`. **YouTube chapters** gives a ready-to-paste chapter list for the
+description of the uploaded recording (it matches this file, not YouTube's own
+live-stream archive).
 
 ## Video layouts
 
@@ -186,8 +219,18 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/network/usb-connect` | Connect detected USB ethernet |
 | POST | `/api/network/hotspot-start` | Start/update owned hotspot with `ssid`, `password` |
 | POST | `/api/network/hotspot-stop` | Stop owned hotspot only |
-| POST | `/api/stream/start` | `stream_key`, optional `profile`: `1080p`, `720p` or `480p` |
-| POST | `/api/stream/stop` | Stop streaming |
+| POST | `/api/stream/start` | `stream_key`, optional `profile`: `1080p`, `720p` or `480p`, `record`: also record |
+| POST | `/api/stream/stop` | Stop the YouTube stream (a recording continues) |
+| POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
+| POST | `/api/recording/stop` | Stop recording and save the MP4 (a YouTube stream continues) |
+| POST | `/api/markers` | Mark a highlight now on the running recording, optional `label` |
+| GET | `/api/recordings` | Recordings with highlights, chapters and free disk space |
+| POST | `/api/recordings/<id>/markers/<marker>` | `label`, or `delete: true` |
+| POST | `/api/recordings/<id>/markers/<marker>/clip` | Cut the highlight clip |
+| POST | `/api/recordings/<id>/reel` | Join all highlight clips into `highlights.mp4` |
+| POST | `/api/recordings/<id>/finalize` | Join an unfinished recording's parts |
+| POST | `/api/recordings/<id>/delete` | Delete a recording with its clips |
+| GET | `/recordings/<id>/<file>` | Watch a recorded file; `?download=1` to download |
 | POST | `/api/switch/<cam_id>` | Select cam1/cam2/cam3 |
 | POST | `/api/layout` | `mode`: single/pip/split, `main`, `secondary`, `position`: top-left/top-right/bottom-left/bottom-right |
 | POST | `/api/audio/mute` | `muted`: true/false — master mute of every source, mixer kept |

@@ -26,3 +26,5 @@ data/
 node_modules/
 playwright-report/
 test-results/
+# Local match recordings
+recordings/

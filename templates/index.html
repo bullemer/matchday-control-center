@@ -120,6 +120,28 @@
     @keyframes mute-pulse { 50% { background: #991b1b; } }
     .outdoor-mode .mute-btn { background: #e2e8f0; color: #0f172a; border: 2px solid #0f172a; }
     .outdoor-mode .mute-btn[aria-pressed="true"] { background: #dc2626; color: #fff; }
+    /* Recording & highlights */
+    .rec-badge { display: inline-flex; align-items: center; gap: .25rem; background: #dc2626; color: #fff; font-weight: 700; font-size: .75rem; padding: .2rem .5rem; border-radius: .375rem; white-space: nowrap; animation: mute-pulse 1.6s ease-in-out infinite; }
+    .rec-badge.hidden { display: none; }
+    .chip { font-size: .75rem; font-weight: 700; padding: .15rem .5rem; border-radius: .375rem; white-space: nowrap; }
+    .chip-green { background: #166534; color: #dcfce7; }
+    .chip-amber { background: #92400e; color: #fef3c7; }
+    .chip-slate { background: #334155; color: #cbd5e1; }
+    .rec-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #334155; color: #fff; border: 1px solid #475569; }
+    .rec-btn:hover { background: #475569; }
+    .mark-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #f59e0b; color: #111827; white-space: nowrap; }
+    .mark-btn:hover { background: #fbbf24; }
+    .rec-btn:disabled, .mark-btn:disabled, .rec-action:disabled { opacity: .6; cursor: wait; }
+    .rec-action { display: inline-flex; align-items: center; gap: .25rem; padding: .4rem .7rem; border-radius: .5rem; font-size: .85rem; font-weight: 600; background: #334155; color: #e2e8f0; }
+    .rec-action:hover { background: #475569; }
+    .rec-danger { color: #fca5a5; }
+    .rec-card { background: #0f172a; border: 1px solid #334155; border-radius: .75rem; padding: .9rem; }
+    .marker-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .4rem .5rem; background: #1e293b; border: 1px solid #334155; border-radius: .5rem; }
+    .marker-row select { background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: .375rem; padding: .2rem .4rem; font-size: .85rem; }
+    .chapters { width: 100%; font-family: ui-monospace, monospace; font-size: .8rem; background: #020617; color: #e2e8f0; border: 1px solid #334155; border-radius: .5rem; padding: .5rem; margin: .5rem 0; }
+    .outdoor-mode .rec-card, .outdoor-mode .marker-row { background: #fff; border: 2px solid #0f172a; color: #020617; }
+    .outdoor-mode .rec-action, .outdoor-mode .rec-btn { background: #e2e8f0; color: #0f172a; border: 2px solid #0f172a; }
+    .outdoor-mode .marker-row select, .outdoor-mode .chapters { background: #f1f5f9; color: #020617; border: 2px solid #0f172a; }
     @media (max-width: 480px) { .tab-btn { padding: .55rem .4rem; font-size: .8rem; } }
     body:not(.match-mode) [data-tab][hidden] { display: none; }
     .outdoor-mode .tab-bar { background: #fff; border: 2px solid #0f172a; }
@@ -260,6 +282,8 @@
           <span id="status-rtmp-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
           <span class="text-slate-300">RTMP</span>
         </span>
+        <!-- Recording -->
+        <span id="status-rec-badge" class="rec-badge hidden" title="Recording to this laptop">⏺ REC</span>
         <!-- YouTube Stream -->
         <span id="status-yt-badge"
               class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400">
@@ -287,6 +311,7 @@
       <button type="button" class="tab-btn" role="tab" data-tab-btn="main" onclick="selectTab('main')">📺 Main</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="cams" onclick="selectTab('cams')">🎥 Cams</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="network" onclick="selectTab('network')">🌐 Network</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="recordings" onclick="selectTab('recordings')">🎬 Recordings</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="checklist" onclick="selectTab('checklist')">✅ Checklist</button>
     </nav>
 
@@ -370,13 +395,18 @@
             <button onclick="adjustClock(60)" class="bg-slate-700 hover:bg-slate-600 text-white font-semibold py-2 rounded-lg text-sm">+1 min</button>
           </div>
         </div>
-        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex items-center gap-3">
+        <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex flex-wrap items-center gap-3">
           <span data-bind="yt_state" class="px-2 py-1 rounded text-xs font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           <span data-bind="yt_duration" class="font-mono text-lg text-white">00:00:00</span>
-          <button data-when-streaming onclick="stopStream()"
-                  class="hidden ml-auto bg-slate-600 hover:bg-slate-500 text-white font-bold px-4 py-3 rounded-lg">⏹ Stop</button>
-          <button data-when-stopped onclick="matchGoLive()"
-                  class="ml-auto bg-red-600 hover:bg-red-700 text-white font-bold px-4 py-3 rounded-lg">🔴 Go live</button>
+          <span data-rec-badge class="rec-badge hidden" title="Recording to this laptop">⏺ REC</span>
+          <div class="ml-auto flex gap-2">
+            <button data-when-recording onclick="markHighlight()" aria-label="Mark highlight" title="Mark highlight (H)"
+                    class="mark-btn hidden px-3 py-3">⭐</button>
+            <button data-when-streaming onclick="stopStream()"
+                    class="hidden bg-slate-600 hover:bg-slate-500 text-white font-bold px-4 py-3 rounded-lg">⏹ Stop</button>
+            <button data-when-stopped onclick="matchGoLive()"
+                    class="bg-red-600 hover:bg-red-700 text-white font-bold px-4 py-3 rounded-lg">🔴 Go live</button>
+          </div>
         </div>
       </div>
     </section>
@@ -749,7 +779,7 @@
          ───────────────────────────────────────────────────────────────── -->
     <section data-setup data-tab="main" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        ▶️ YouTube Stream
+        ▶️ YouTube Stream &amp; Recording
       </h2>
       <div class="space-y-4">
         <!-- Stream Key Input -->
@@ -778,6 +808,25 @@
             ⏹ STOP STREAM
           </button>
         </div>
+        <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+          <input id="record-with-live" type="checkbox" role="switch" checked class="overlay-switch"
+                 onchange="storeSet('mcc-record-with-live', this.checked ? 'on' : 'off')">
+          ⏺ Also record to this laptop when going live
+        </label>
+        <!-- Recording -->
+        <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-2">
+          <div class="flex flex-wrap items-center gap-2">
+            <span data-rec-badge class="rec-badge hidden">⏺ REC</span>
+            <span data-bind="rec_status" class="text-sm text-slate-300">Not recording</span>
+          </div>
+          <p data-bind="rec_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
+          <div class="flex flex-wrap gap-2">
+            <button data-when-not-recording data-rec-start onclick="startRecording()" class="rec-btn">⏺ Record only (no YouTube)</button>
+            <button data-when-recording onclick="stopRecording()" class="rec-btn hidden">⏹ Stop recording</button>
+            <button data-when-recording onclick="markHighlight()" class="mark-btn hidden">⭐ Mark highlight</button>
+          </div>
+          <p class="text-xs text-slate-500">Records the broadcast picture with scoreboard. Goals are marked automatically; recordings, clips and chapters are in the 🎬 Recordings tab.</p>
+        </div>
         <!-- Duration Timer -->
         <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
           <span class="pulse-live text-red-500 text-lg">🔴</span>
@@ -788,7 +837,20 @@
     </section>
 
     <!-- ─────────────────────────────────────────────────────────────────
-         7. INTERACTIVE SIDELINE CHECKLIST
+         7. RECORDINGS & HIGHLIGHTS
+         ───────────────────────────────────────────────────────────────── -->
+    <section data-setup data-tab="recordings" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <h2 class="text-lg font-semibold text-white mb-2 flex items-center gap-2">
+        🎬 Recordings &amp; Highlights
+      </h2>
+      <p data-bind="rec_free" class="text-xs text-slate-400 mb-4"></p>
+      <div id="recordings-list" class="space-y-4">
+        <p data-recordings-empty class="text-sm text-slate-400">No recordings yet. Start one in the Main tab (⏺ Record only, or GO LIVE with recording on).</p>
+      </div>
+    </section>
+
+    <!-- ─────────────────────────────────────────────────────────────────
+         8. INTERACTIVE SIDELINE CHECKLIST
          ───────────────────────────────────────────────────────────────── -->
     <section data-setup data-tab="checklist" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
@@ -951,6 +1013,7 @@
       streamKeyVisible: false,
       matchMode: false,
       tab: 'main',
+      recording: {active: false},
       muted: false,
       matchPreview: true,
       lastOverlayUpdate: 0,
@@ -1195,7 +1258,7 @@
       window.scrollTo(0, 0);
     }
 
-    const TABS = ['main', 'cams', 'network', 'checklist'];
+    const TABS = ['main', 'cams', 'network', 'recordings', 'checklist'];
 
     function selectTab(tab) {
       state.tab = TABS.includes(tab) ? tab : 'main';
@@ -1205,6 +1268,7 @@
         btn.setAttribute('aria-selected', String(btn.dataset.tabBtn === state.tab));
       });
       syncPreviews();
+      if (state.tab === 'recordings') loadRecordings(true);
     }
 
     function toggleMatchPreview() {
@@ -1259,11 +1323,12 @@
       document.getElementById('stream-key').focus();
     }
 
-    // Keys 1–3 cut cameras and M toggles mute in match mode (laptop keyboard).
+    // Keys 1–3 cut cameras, M toggles mute and H marks a highlight in match mode (laptop keyboard).
     document.addEventListener('keydown', event => {
       if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
+      if ((event.key === 'h' || event.key === 'H') && state.recording && state.recording.active) markHighlight();
       if (event.key === 'm' || event.key === 'M') toggleMute();
     });
 
@@ -1364,6 +1429,188 @@
         frame.classList.toggle('border-red-500', c === state.activeCam);
         frame.classList.toggle('border-slate-700', c !== state.activeCam);
       });
+    }
+
+    // ──────────────────────── Recording & highlights ────────────────────────
+    let recPending = false;
+    const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+    const fmtBytes = bytes => bytes >= 1073741824 ? (bytes / 1073741824).toFixed(1) + ' GB' : Math.round(bytes / 1048576) + ' MB';
+    function fmtDuration(seconds) {
+      const s = Math.max(0, Math.floor(seconds || 0));
+      return [Math.floor(s / 3600), Math.floor(s % 3600 / 60), s % 60].map(n => String(n).padStart(2, '0')).join(':');
+    }
+
+    function renderRecording(rec) {
+      const r = state.recording = rec || {active: false};
+      const live = state.ytLive || ['starting', 'live', 'reconnecting'].includes(state.streamState);
+      document.getElementById('status-rec-badge').classList.toggle('hidden', !r.active);
+      document.querySelectorAll('[data-rec-badge]').forEach(el => el.classList.toggle('hidden', !r.active));
+      document.querySelectorAll('[data-when-recording]').forEach(el => { el.classList.toggle('hidden', !r.active); el.disabled = recPending; });
+      document.querySelectorAll('[data-when-not-recording]').forEach(el => { el.classList.toggle('hidden', r.active); el.disabled = recPending; });
+      document.querySelectorAll('[data-rec-start]').forEach(el => { el.textContent = live ? '⏺ Start recording' : '⏺ Record only (no YouTube)'; });
+      bind('rec_status', r.active
+        ? `${fmtDuration(r.duration)} · ${fmtBytes(r.bytes || 0)} · ${r.markers || 0} highlight${r.markers === 1 ? '' : 's'}${r.writing ? '' : ' · starting…'}`
+        : 'Not recording');
+      document.querySelectorAll('[data-bind="rec_warning"]').forEach(el => {
+        el.textContent = r.warning ? '⚠ ' + r.warning : '';
+        el.classList.toggle('hidden', !r.warning);
+      });
+    }
+
+    async function startRecording() {
+      if (recPending) return;
+      recPending = true;
+      renderRecording(state.recording);
+      try { await apiPost('/api/recording/start', {profile: document.getElementById('quality-profile').value}); }
+      finally { recPending = false; await pollStatus(); }
+    }
+
+    async function stopRecording() {
+      if (recPending || !confirm('Stop recording? The file is saved on this laptop.')) return;
+      recPending = true;
+      renderRecording(state.recording);
+      try { await apiPost('/api/recording/stop'); }
+      finally { recPending = false; await pollStatus(); loadRecordings(true); }
+    }
+
+    async function markHighlight() {
+      const result = await apiPost('/api/markers', {label: 'Highlight'});
+      if (result) loadRecordings(true);
+    }
+
+    const recordingUrl = (id, name, download) =>
+      `/recordings/${encodeURIComponent(id)}/${name.split('/').map(encodeURIComponent).join('/')}${download ? '?download=1' : ''}`;
+    const recordingChips = {recording: ['⏺ REC', 'rec-badge'], finalizing: ['Saving…', 'chip chip-amber'], done: ['Ready', 'chip chip-green'],
+                            unfinished: ['Unfinished', 'chip chip-amber'], empty: ['Empty', 'chip chip-slate']};
+
+    function recordingMeta(rec) {
+      const created = new Date(rec.created * 1000).toLocaleString([], {dateStyle: 'medium', timeStyle: 'short'});
+      return `${created} · ${fmtDuration(rec.duration)} · ${fmtBytes(rec.bytes)} · ${rec.profile}`;
+    }
+
+    function markerRow(rec, mk) {
+      const labels = (state.recLabels || ['Highlight']).map(l => `<option${l === mk.label ? ' selected' : ''}>${esc(l)}</option>`).join('');
+      const detail = [mk.clock && mk.clock + "'", mk.score].filter(Boolean).join(' · ');
+      const clip = mk.clip
+        ? `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, mk.clip))}')" aria-label="Play clip">▶</button>
+           <a class="rec-action" href="${esc(recordingUrl(rec.id, mk.clip, true))}" aria-label="Download clip">⬇</a>`
+        : `<button class="rec-action" onclick="clipMarker(this, '${esc(rec.id)}', '${esc(mk.id)}')">🎬 Clip</button>`;
+      return `<li class="marker-row" data-marker="${esc(mk.id)}">
+        <span class="font-mono text-sm text-white">${esc(mk.time)}</span>
+        <select onchange="relabelMarker('${esc(rec.id)}', '${esc(mk.id)}', this.value)" aria-label="Highlight type">${labels}</select>
+        <span class="text-xs text-slate-400">${esc(detail)}</span>
+        <span class="ml-auto flex gap-1">${clip}
+          <button class="rec-action rec-danger" onclick="deleteMarker('${esc(rec.id)}', '${esc(mk.id)}')" aria-label="Remove highlight">✕</button></span>
+      </li>`;
+    }
+
+    function recordingCard(rec) {
+      const [chipText, chipClass] = recordingChips[rec.state] || [rec.state, 'chip chip-slate'];
+      const busy = ['recording', 'finalizing'].includes(rec.state);
+      const actions = [
+        rec.file && `<a class="rec-action" href="${esc(recordingUrl(rec.id, rec.file, true))}">⬇ Download MP4</a>`,
+        rec.file && `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, rec.file))}')">▶ Watch</button>`,
+        rec.state === 'unfinished' && `<button class="rec-action" onclick="recordingAction(this, '${esc(rec.id)}', 'finalize')">🔧 Finish saving</button>`,
+        rec.markers.length && `<button class="rec-action" onclick="recordingAction(this, '${esc(rec.id)}', 'reel')">🎞 ${rec.reel ? 'Rebuild' : 'Build'} highlight reel</button>`,
+        rec.reel && `<a class="rec-action" href="${esc(recordingUrl(rec.id, rec.reel, true))}">⬇ Highlight reel</a>`,
+        rec.reel && `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, rec.reel))}')">▶ Watch reel</button>`,
+        !busy && `<button class="rec-action rec-danger" onclick="deleteRecording('${esc(rec.id)}')">🗑 Delete</button>`,
+      ].filter(Boolean).join('');
+      const markers = rec.markers.length
+        ? `<ul class="space-y-1">${rec.markers.map(mk => markerRow(rec, mk)).join('')}</ul>`
+        : `<p class="text-xs text-slate-400">No highlights${rec.state === 'recording' ? ' yet — tap ⭐ Mark highlight; goals are marked automatically' : ''}.</p>`;
+      const chapters = rec.markers.length ? `<details>
+          <summary class="text-sm text-brand-cyan cursor-pointer">YouTube chapters for this recording</summary>
+          <textarea readonly rows="${Math.min(10, rec.chapters.split('\n').length + 1)}" class="chapters" aria-label="YouTube chapters">${esc(rec.chapters)}</textarea>
+          <button class="rec-action" onclick="copyToClipboard(this.previousElementSibling.value)">📋 Copy chapters</button>
+          <p class="text-xs text-slate-400 mt-1">Paste into the description when you upload this recording. Times match this file, not the live-stream archive. YouTube shows chapters from three entries on.</p>
+        </details>` : '';
+      return `<div class="flex flex-wrap items-center gap-2">
+          <h3 class="font-semibold text-white">${esc(rec.title)}</h3>
+          <span class="${chipClass}">${esc(chipText)}</span>
+        </div>
+        <p data-rec-meta class="text-xs text-slate-400"></p>
+        ${rec.error ? `<p class="text-xs font-semibold text-brand-amber">⚠ ${esc(rec.error)}</p>` : ''}
+        ${actions ? `<div class="flex flex-wrap gap-2">${actions}</div>` : ''}
+        <div data-player></div>
+        <h4 class="text-sm font-semibold text-slate-300">⭐ Highlights</h4>
+        ${markers}${chapters}`;
+    }
+
+    let recordingsBusy = false;
+    async function loadRecordings(force = false) {
+      if (recordingsBusy || (!force && (state.matchMode || state.tab !== 'recordings'))) return;
+      recordingsBusy = true;
+      try {
+        const info = await apiGet('/api/recordings');
+        if (info && info.ok) renderRecordings(info);
+      } finally {
+        recordingsBusy = false;
+      }
+    }
+    setInterval(loadRecordings, 3000);
+
+    function renderRecordings(info) {
+      state.recLabels = info.labels;
+      bind('rec_free', `${fmtBytes(info.free_bytes)} free on this laptop — about ${Math.floor(info.free_bytes / 2.1e9)} h of 720p or ${Math.floor(info.free_bytes / 2.8e9)} h of 1080p`);
+      const list = document.getElementById('recordings-list');
+      list.querySelector('[data-recordings-empty]').hidden = info.recordings.length > 0;
+      const seen = new Set();
+      info.recordings.forEach((rec, index) => {
+        seen.add(rec.id);
+        let card = list.querySelector(`[data-rec="${CSS.escape(rec.id)}"]`);
+        if (!card) {
+          card = document.createElement('article');
+          card.className = 'rec-card space-y-2';
+          card.dataset.rec = rec.id;
+        }
+        // Rebuild only on real changes, so a playing video or an open menu survives polls.
+        const live = rec.state === 'recording';
+        const signature = JSON.stringify({...rec, duration: live ? 0 : rec.duration, bytes: live ? 0 : rec.bytes, labels: state.recLabels});
+        const editing = card.contains(document.activeElement) && document.activeElement.matches('select, textarea, input');
+        if (card.dataset.signature !== signature && !editing) {
+          card.innerHTML = recordingCard(rec);
+          card.dataset.signature = signature;
+        }
+        card.querySelector('[data-rec-meta]').textContent = recordingMeta(rec);
+        const cards = list.querySelectorAll('[data-rec]');
+        if (cards[index] !== card) list.insertBefore(card, cards[index] || null);
+      });
+      list.querySelectorAll('[data-rec]').forEach(card => { if (!seen.has(card.dataset.rec)) card.remove(); });
+    }
+
+    function toggleVideo(button, url) {
+      const player = button.closest('[data-rec]').querySelector('[data-player]');
+      const current = player.querySelector('video');
+      if (current && current.getAttribute('src') === url) { player.innerHTML = ''; return; }
+      player.innerHTML = '';
+      const video = document.createElement('video');
+      Object.assign(video, {controls: true, autoplay: true, playsInline: true, className: 'w-full rounded-lg bg-black'});
+      video.setAttribute('src', url);
+      player.appendChild(video);
+    }
+
+    async function recordingRequest(button, url, body = {}) {
+      if (button) button.disabled = true;
+      try { return await apiPost(url, body); }
+      finally { if (button) button.disabled = false; await loadRecordings(true); }
+    }
+    function clipMarker(button, id, marker) {
+      return recordingRequest(button, `/api/recordings/${id}/markers/${marker}/clip`);
+    }
+    function relabelMarker(id, marker, label) {
+      document.activeElement.blur();
+      return recordingRequest(null, `/api/recordings/${id}/markers/${marker}`, {label});
+    }
+    function deleteMarker(id, marker) {
+      if (confirm('Remove this highlight?')) return recordingRequest(null, `/api/recordings/${id}/markers/${marker}`, {delete: true});
+    }
+    function recordingAction(button, id, action) {
+      if (action === 'reel') showToast('Building the highlight reel…', 'info');
+      return recordingRequest(button, `/api/recordings/${id}/${action}`);
+    }
+    function deleteRecording(id) {
+      if (confirm('Delete this recording with all its clips? This cannot be undone.')) return recordingRequest(null, `/api/recordings/${id}/delete`);
     }
 
     // ──────────────────────── Master mute ────────────────────────
@@ -1525,7 +1772,8 @@
       startCancelled = false;
       renderStreamControls();
       try {
-        const {ok, data} = await apiRequest('/api/stream/start', {stream_key: key, profile: document.getElementById('quality-profile').value});
+        const {ok, data} = await apiRequest('/api/stream/start', {stream_key: key, profile: document.getElementById('quality-profile').value,
+                                                                 record: document.getElementById('record-with-live').checked});
         if (sequence === streamSequence) showToast(data.message || data.error || 'Start failed', ok ? 'success' : 'error');
       } finally {
         startPending = false;
@@ -1536,7 +1784,9 @@
 
     async function stopStream() {
       if (stopPending) return;
-      if (!confirm('Stop the YouTube stream? Viewers will see the broadcast end.')) return;
+      const keepsRecording = state.recording && state.recording.active;
+      if (!confirm(keepsRecording ? 'Stop the YouTube stream? Viewers will see the broadcast end. Recording continues.'
+                                  : 'Stop the YouTube stream? Viewers will see the broadcast end.')) return;
       ++streamSequence;
       startCancelled = true;
       stopPending = true;
@@ -2137,6 +2387,7 @@
       }
 
       // --- Audio Source ---
+      renderRecording(stream.recording);
       if (typeof stream.muted === 'boolean' && !mutePending) {
         state.muted = stream.muted;
         renderMute();
@@ -2215,6 +2466,7 @@
 
     state.matchMode = storeGet('mcc-mode') === 'match';
     state.matchPreview = storeGet('mcc-match-preview') !== 'off';
+    document.getElementById('record-with-live').checked = storeGet('mcc-record-with-live') !== 'off';
     selectTab(storeGet('mcc-tab'));
     applyMode();
     applyOutdoorMode();
