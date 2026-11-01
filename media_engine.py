@@ -588,6 +588,16 @@ def _input(path):
     return ["-rtsp_transport", "tcp", "-timeout", "5000000", "-i", f"{RTSP_BASE}/{path}"]
 
 
+def _camera_input(path, audio_only=False):
+    """A camera input of a relay. Deep queue: with several cameras (picture-in-picture,
+    commentary from another camera) the default 8 packets blocked the start of a cut.
+    A camera that only contributes sound is fetched without its video."""
+    options = ["-thread_queue_size", "512"]
+    if audio_only:
+        options += ["-allowed_media_types", "audio"]
+    return options + _input(path)
+
+
 VIDEO_CODECS = {"H264", "H265", "AV1", "VP8", "VP9", "MPEG-4 Video", "MPEG-1/2 Video", "M-JPEG"}
 AUDIO_CODECS = {"MPEG-4 Audio", "MPEG-4 Audio LATM", "Opus", "G711", "G722", "MPEG-1/2 Audio", "AC-3", "LPCM", "Speex"}
 
@@ -691,7 +701,7 @@ def _relay_command(cam, wanted, replay=None):
         tracks = _probe(cam)
         if "video" not in tracks:
             raise ValueError(f"{cam} has no video")
-        cmd = _ffmpeg() + _input(cam)
+        cmd = _ffmpeg() + _camera_input(cam)
         layout = dict(_layout)
         inputs_by_camera = {cam: (0, tracks)}
     sources, missing, notes, next_input = [], set(), [], 1
@@ -707,7 +717,7 @@ def _relay_command(cam, wanted, replay=None):
         if "video" in secondary_tracks:
             secondary, secondary_index = selected, next_input
             inputs_by_camera[selected] = (next_input, secondary_tracks)
-            cmd += _input(selected)
+            cmd += _camera_input(selected)
             next_input += 1
         else:
             video_warning = f"{selected} is offline — showing main camera only"
@@ -729,7 +739,7 @@ def _relay_command(cam, wanted, replay=None):
             # A replay reuses what the live relay already plays instead of probing again.
             if (replay and channel in _relay_channels) or _channel_available(channel):
                 sources.append((channel, f"{next_input}:a:0", gain))
-                cmd += _input(channel)
+                cmd += _camera_input(channel, audio_only=True)
                 next_input += 1
             else:
                 missing.add(channel)

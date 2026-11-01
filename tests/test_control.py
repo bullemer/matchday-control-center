@@ -540,6 +540,19 @@ class MediaTests(unittest.TestCase):
         self.assertIn('alimiter',graph); self.assertIn('azmq=bind_address=tcp',graph)
         self.assertEqual(cmd[cmd.index('-f',cmd.index('alsa_input.mic')-3)+1],'pulse')
 
+    def test_commentary_camera_is_fetched_audio_only(self):
+        layout={'mode':'pip','main':'cam3','secondary':'cam2','position':'top-right'}
+        with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_layout',layout):
+            cmd, channels, *_ = m._relay_command('cam3',{'cam1':0.0})
+        inputs=[i for i,x in enumerate(cmd) if x=='-i']
+        cam1=next(i for i in inputs if cmd[i+1].endswith('/cam1'))
+        self.assertEqual(cmd[cam1-8:cam1-4],['-thread_queue_size','512','-allowed_media_types','audio'])
+        for path in ('/cam3','/cam2'):  # main picture and inset keep their video, deep queues too
+            i=next(i for i in inputs if cmd[i+1].endswith(path))
+            self.assertEqual(cmd[i-6:i-4],['-thread_queue_size','512'])
+            self.assertNotIn('-allowed_media_types',cmd[i-6:i])
+        self.assertEqual(channels,{'cam1':'m0'})
+
     def test_missing_usb_mic_degrades(self):
         with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_usb_device_available',return_value=False):
             _, channels, _, warning, _, _ = m._relay_command('cam2',{'usb:hw:1,0':0.0})
