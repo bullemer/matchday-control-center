@@ -38,8 +38,8 @@ from werkzeug.exceptions import HTTPException
 from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
                              stop_hotspot, get_usb_audio_devices, get_firewall_status)
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
-                          get_mediamtx_running, get_stream_status, start_youtube_stream,
-                          stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
+                          get_mediamtx_running, get_stream_status, start_stream, stop_stream,
+                          make_target, DESTINATIONS, PROFILES, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
                           get_recording_status, play_replay, stop_replay, get_replay_status,
@@ -229,7 +229,9 @@ def index():
     host = urlsplit(request.host_url).hostname or "localhost"
     if ":" in host:
         host = f"[{host}]"
-    return render_template("index.html", media_host=host)
+    destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
+    bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
+    return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates)
 
 
 @app.route("/tally/<cam_id>")
@@ -369,19 +371,26 @@ def api_hotspot_stop():
 @app.route("/api/stream/start", methods=["POST"])
 @api_endpoint
 def api_stream_start():
-    """Start the YouTube live stream encoder pipeline."""
+    """GO LIVE: {"destinations": {"youtube"|"facebook"|"twitch"|"custom": {"key", "server"?}},
+    "profile", "record"}. "stream_key" alone still means YouTube. While live, only the
+    destinations that are not running yet are added."""
     data = request.get_json(force=True, silent=True) or {}
-    stream_key = text_field(data, "stream_key", 200)
-
-    if not stream_key:
-        return jsonify({"ok": False, "error": "stream_key is required"}), 400
-
+    destinations = data.get("destinations")
+    if destinations is None and "stream_key" in data:
+        destinations = {"youtube": {"key": data["stream_key"]}}
+    if not isinstance(destinations, dict) or not destinations:
+        return jsonify({"ok": False, "error": "Choose at least one streaming destination"}), 400
+    targets = {}
+    for name, settings in destinations.items():
+        if not isinstance(settings, dict):
+            raise ValueError("Each destination needs a key and optional server")
+        targets[name] = make_target(name, text_field(settings, "key", 300), text_field(settings, "server", 300) or None)
     record = data.get("record", False)
     if type(record) is not bool:
         raise ValueError("record must be true or false")
-    log.info("Stream start requested (record=%s)", record)
-    success, msg = start_youtube_stream(stream_key, text_field(data, "profile", 10, "720p"),
-                                        record=record, title=_match_title())
+    log.info("Stream start requested (%s, record=%s)", ", ".join(targets), record)
+    success, msg = start_stream(targets, text_field(data, "profile", 10, "720p"),
+                                record=record, title=_match_title())
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
 
@@ -389,10 +398,12 @@ def api_stream_start():
 @app.route("/api/stream/stop", methods=["POST"])
 @api_endpoint
 def api_stream_stop():
-    """Stop the YouTube live stream encoder pipeline."""
-    log.info("Stream stop requested")
-    success, msg = stop_youtube_stream()
-    status_code = 200 if success else 502
+    """Stop streaming everywhere, or one destination with {"destination": name}."""
+    data = request.get_json(force=True, silent=True) or {}
+    name = text_field(data, "destination", 20) or None
+    log.info("Stream stop requested (%s)", name or "all destinations")
+    success, msg = stop_stream(name)
+    status_code = 200 if success else 409 if name else 502
     return jsonify({"ok": success, "message": msg}), status_code
 
 

@@ -32,6 +32,15 @@ MEDIAMTX_API = "http://127.0.0.1:9997"
 RTMP_BASE = "rtmp://127.0.0.1:1935"
 RTSP_BASE = "rtsp://127.0.0.1:8554"
 YOUTUBE_RTMP_BASE = "rtmps://a.rtmps.youtube.com:443/live2"
+# Default ingest servers (editable per destination: Facebook can issue per-broadcast
+# servers, Twitch has regional ones). Twitch: https://ingest.twitch.tv/ingests "Default".
+DESTINATIONS = {
+    "youtube": ("YouTube", lambda: YOUTUBE_RTMP_BASE, r"[A-Za-z0-9_-]{1,200}"),
+    "facebook": ("Facebook", lambda: "rtmps://live-api-s.facebook.com:443/rtmp", r"[A-Za-z0-9_.?=&-]{1,300}"),
+    "twitch": ("Twitch", lambda: "rtmps://ingest.global-contribute.live-video.net/app", r"[A-Za-z0-9_-]{1,200}"),
+    "custom": ("Custom RTMP", lambda: "", r"[A-Za-z0-9_.?=&:/~%+-]{0,300}"),
+}
+SERVER_PATTERN = r"rtmps?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9_.~%+/-]*)?"
 SCOREBOARD_PATH = str(BASE / "static/scoreboard.txt")
 CAMERA_IDS = ["cam1", "cam2", "cam3"]
 _lock = threading.RLock()
@@ -48,7 +57,7 @@ _encoder_thread = None
 # Output stage: the encoder burns in the scoreboard and publishes the finished picture
 # to the local "final" path; the YouTube pusher and the recorder only copy it. A YouTube
 # outage therefore restarts just the pusher and never interrupts the recording.
-_mediamtx_proc = _encoder_proc = _youtube_proc = _recorder_proc = _relay_proc = None
+_mediamtx_proc = _encoder_proc = _recorder_proc = _relay_proc = None
 _active_camera = None
 _layout = {"mode": "single", "main": "cam1", "secondary": "cam2", "position": "top-right"}
 _relay_secondary = None
@@ -72,12 +81,15 @@ _relay_failures = 0
 _relay_retry_at = 0.0
 _restore_check_at = 0.0
 _mediamtx_retry_at = 0.0
-_youtube_stream_key = None
+# Streaming destinations: name -> {"label", "url", "secret", "proc", "state", "error",
+# "failures", "retry_at", "started_at"}. Each is a copy-only reader of "final" with its own
+# reconnect backoff, so one platform dropping out never touches the others.
+_targets = {}
 _want_stream = False      # output stage (relay + encoder) wanted: streaming and/or recording
 _want_record = False
 _recording = None         # active recording session id
-_push_retry_at = _rec_retry_at = _disk_check_at = 0.0
-_push_failures = _rec_failures = 0
+_rec_retry_at = _disk_check_at = 0.0
+_rec_failures = 0
 _record_warning = ""
 # Instant replay: a temporary relay plays part of the running recording into program.
 # _active_camera keeps the live camera to return to; any cut or STOP ends the replay.
@@ -97,7 +109,7 @@ _relay_profile = None    # profile the running relay was built for
 # width, height, YouTube bitrate, camera-relay bitrate (relay output is re-encoded, so it
 # gets headroom). The relay runs at the stream resolution so 1080p is never upscaled.
 PROFILES = {"1080p": (1920, 1080, "6000k", "8000k"),
-            "720p": (1280, 720, "4500k", "4500k"),
+            "720p": (1280, 720, "4000k", "4500k"),  # 4 Mbps: top of Facebook/YouTube 720p30 range
             "480p": (854, 480, "1800k", "2500k")}
 
 
@@ -455,8 +467,14 @@ def _effective_mix(cam):
 
 
 def get_youtube_running():
-    encoder = _youtube_proc
-    return bool(encoder and encoder.healthy())
+    """True while at least one streaming destination is live."""
+    return any(t["proc"] and t["proc"].healthy() for t in list(_targets.values()))
+
+
+def get_destinations():
+    """Per-destination status for the dashboard (never the key or URL)."""
+    return {name: {"label": t["label"], "state": t["state"], "error": t["error"], "started_at": t["started_at"]}
+            for name, t in list(_targets.items())}
 
 
 def get_stream_status():
@@ -472,7 +490,7 @@ def get_stream_status():
             "audio_source": get_audio_source(), "muted": _muted,
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
-            "started_at": _started_at,
+            "started_at": _started_at, "destinations": get_destinations(),
             "error": _error, "profile": _profile, "fallback": get_active_camera() is None and not _replay,
             "recording": get_recording_status(), "replay": get_replay_status()}
 
@@ -1096,13 +1114,44 @@ def _launch_encoder():
     _encoder_proc = Process(cmd)
 
 
-def _launch_pusher():
-    """Forward the finished picture to YouTube without re-encoding."""
-    global _youtube_proc
+def _launch_pusher(target):
+    """Forward the finished picture to one destination without re-encoding."""
     cmd = _ffmpeg() + _input("final") + [
         "-map", "0:v:0", "-map", "0:a:0", "-c", "copy",
-        "-rw_timeout", "10000000", "-f", "flv", f"{YOUTUBE_RTMP_BASE}/{_youtube_stream_key}"]
-    _youtube_proc = Process(cmd, secret=_youtube_stream_key, copy=True)
+        "-rw_timeout", "10000000", "-f", "flv", target["url"]]
+    target["proc"] = Process(cmd, secret=target["secret"], copy=True)
+
+
+def make_target(name, key="", server=None):
+    """Validate one destination; ValueError names the problem without echoing secrets."""
+    if name not in DESTINATIONS:
+        raise ValueError("Unknown streaming destination")
+    label, default_server, key_pattern = DESTINATIONS[name]
+    server = (server or default_server()).strip().rstrip("/")
+    key = (key or "").strip()
+    if not server:
+        raise ValueError(f"{label}: enter the RTMP server URL")
+    if len(server) > 300 or not re.fullmatch(SERVER_PATTERN, server):
+        raise ValueError(f"{label}: the server must be an rtmp:// or rtmps:// address")
+    if not re.fullmatch(key_pattern, key) or (name != "custom" and not key):
+        raise ValueError(f"{label}: invalid stream key")
+    return {"label": label, "url": f"{server}/{key}" if key else server, "secret": key or None,
+            "proc": None, "state": "starting", "error": "", "failures": 0, "retry_at": 0.0, "started_at": None}
+
+
+def _summarize_targets():
+    """Under _lock: the overall stream state shown in the header (any platform live = live)."""
+    global _state, _error, _started_at
+    states = [t["state"] for t in _targets.values()]
+    for state in ("live", "reconnecting", "starting", "failed"):
+        if state in states:
+            _state = state
+            break
+    else:
+        _state = "stopped"
+    _error = "; ".join(f"{t['label']}: {t['error']}" for t in _targets.values() if t["error"])
+    started = [t["started_at"] for t in _targets.values() if t["started_at"]]
+    _started_at = min(started) if started else None
 
 
 def _launch_recorder():
@@ -1113,15 +1162,23 @@ def _launch_recorder():
     _recorder_proc = Process(cmd, copy=True)
 
 
+def start_stream(destinations, profile="720p", record=False, title=""):
+    """GO LIVE to {name: target} destinations (see make_target); with record, also record
+    to this laptop. While the output already runs, this only adds what is not running."""
+    return _start(dict(destinations), profile, record, title)
+
+
 def start_youtube_stream(stream_key, profile="720p", record=False, title=""):
-    """GO LIVE; with record, also record to this laptop. While a recording is already
-    running, this only adds the YouTube connection."""
-    return _start(stream_key, profile, record, title)
+    try:
+        target = make_target("youtube", stream_key)
+    except ValueError:
+        return False, "Invalid stream key"
+    return start_stream({"youtube": target}, profile, record, title)
 
 
 def start_recording(profile="720p", title=""):
-    """Record to this laptop; starts the output stage without YouTube if needed."""
-    return _start(None, profile, True, title)
+    """Record to this laptop; starts the output stage without streaming if needed."""
+    return _start({}, profile, True, title)
 
 
 def _check_disk():
@@ -1138,12 +1195,12 @@ def _begin_recording(title):
     _want_record, _rec_failures, _rec_retry_at, _record_warning = True, 0, 0.0, ""
 
 
-def _attach(stream_key, record, title):
-    """Under _lock, output already running: add YouTube and/or recording."""
-    global _youtube_stream_key, _state, _error, _push_failures, _push_retry_at, _started_at
-    if stream_key is not None and _youtube_stream_key:
+def _attach(targets, record, title):
+    """Under _lock, output already running: add destinations and/or recording."""
+    new = {name: t for name, t in targets.items() if name not in _targets}
+    if targets and not new:
         return False, "Stream is already starting or running; stop before changing settings"
-    if stream_key is None and _want_record:
+    if not targets and _want_record:
         return False, "Already recording"
     messages = []
     if record and not _want_record:
@@ -1152,22 +1209,22 @@ def _attach(stream_key, record, title):
             return False, problem
         _begin_recording(title)
         messages.append("Recording started")
-    if stream_key is not None:
-        _youtube_stream_key, _state, _error, _started_at = stream_key, "starting", "", None
-        _push_failures, _push_retry_at = 0, 0.0
-        messages.append("Connecting to YouTube; watch the live status for confirmation")
+    if new:
+        _targets.update(new)
+        _summarize_targets()
+        messages.append(f"Connecting to {', '.join(t['label'] for t in new.values())}; watch the live status for confirmation")
     return True, "; ".join(messages)
 
 
-def _start(stream_key, profile, record, title):
+def _start(targets, profile, record, title):
     global _state, _profile
-    if stream_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
-        return False, "Invalid stream key"
+    if not targets and not record:
+        return False, "Choose at least one streaming destination"
     if profile not in PROFILES:
         return False, "Invalid quality profile"
     with _lock:
         if _want_stream:
-            return _attach(stream_key, record, title)
+            return _attach(targets, record, title)
     if not _start_lock.acquire(blocking=False):
         return False, "Stream is already starting"
     try:
@@ -1176,10 +1233,10 @@ def _start(stream_key, profile, record, title):
             if _want_stream:
                 return False, "Stream is already starting or running; stop before changing settings"
             _profile = profile
-            if stream_key is not None:
+            if targets:
                 _state = "starting"
         try:
-            return _start_youtube_stream(stream_key, profile, token, record, title)
+            return _start_output(targets, profile, token, record, title)
         finally:
             with _lock:
                 if token == _stop_generation and not _want_stream:
@@ -1188,11 +1245,9 @@ def _start(stream_key, profile, record, title):
         _start_lock.release()
 
 
-def _start_youtube_stream(stream_key, profile, token, record=False, title=""):
-    global _want_stream, _youtube_stream_key, _state, _error, _profile, _retry_at, _retries
-    global _push_failures, _push_retry_at
-    if stream_key is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", stream_key):
-        return False, "Invalid stream key"
+def _start_output(targets, profile, token, record=False, title=""):
+    """Start relay + encoder (and the requested destinations / recording) from cold."""
+    global _want_stream, _state, _error, _profile, _retry_at, _retries
     if profile not in PROFILES:
         return False, "Invalid quality profile"
     if _want_stream:
@@ -1235,37 +1290,45 @@ def _start_youtube_stream(stream_key, profile, token, record=False, title=""):
             return False, SUPERSEDED
         if _want_stream:
             return False, "Stream is already starting or running; stop before changing settings"
-        _youtube_stream_key = stream_key
         try:
             _launch_encoder()
         except OSError:
-            _youtube_stream_key = None
             return False, "Unable to launch encoder"
         _want_stream, _error = True, ""
-        _state = "starting" if stream_key else "stopped"
+        _targets.clear()
+        _targets.update(targets)  # the supervisor connects them once the encoder runs
+        _summarize_targets()
         _retry_at, _retries = 0, 0
-        _push_failures, _push_retry_at = 0, 0.0
         if record:
             _begin_recording(title)
-        if stream_key is None:
+        if not targets:
             return True, "Recording starting"
-        return True, "Encoder starting" + (" and recording" if record else "") + "; watch the live status for confirmation"
+        names = ", ".join(t["label"] for t in targets.values())
+        return True, f"Going live on {names}" + (" and recording" if record else "") + "; watch the live status for confirmation"
+
+
+def stop_stream(name=None):
+    """STOP STREAM (all destinations) or stop one destination. A running recording, and
+    the other destinations, keep going; with nothing left the output stage stops."""
+    with _lock:
+        if name is not None and name not in _targets:
+            return False, "That destination is not live"
+        names = [name] if name else list(_targets)
+        remaining = [n for n in _targets if n not in names]
+        stop_everything = not (_want_stream and (_want_record or remaining))
+        if not stop_everything:
+            stopped = [_targets.pop(n) for n in names]
+            _summarize_targets()
+    if stop_everything:
+        return _stop_all()
+    for target in stopped:
+        _kill_process(target["proc"])
+    labels = ", ".join(t["label"] for t in stopped) or "Streaming"
+    return True, f"{labels} stopped" + ("; recording continues" if _want_record else "")
 
 
 def stop_youtube_stream():
-    """STOP STREAM: end the YouTube broadcast. A running recording keeps going."""
-    global _youtube_proc, _youtube_stream_key, _state, _error, _started_at
-    with _lock:
-        if _want_stream and _want_record:
-            pusher, _youtube_proc = _youtube_proc, None
-            _youtube_stream_key = _started_at = None
-            _state, _error = "stopped", ""
-        else:
-            pusher = False
-    if pusher is not False:
-        _kill_process(pusher)
-        return True, "YouTube stream stopped; recording continues"
-    return _stop_all()
+    return stop_stream()
 
 
 def stop_recording():
@@ -1274,7 +1337,7 @@ def stop_recording():
     with _lock:
         if not (_want_record and _recording):
             return False, "Not recording"
-        if _want_stream and _youtube_stream_key:
+        if _want_stream and _targets:
             recorder, session = _recorder_proc, _recording
             _recorder_proc, _recording, _want_record, _record_warning = None, None, False, ""
         else:
@@ -1289,8 +1352,8 @@ def stop_recording():
 
 
 def _stop_all(finalize=True):
-    global _want_stream, _youtube_proc, _relay_proc, _active_camera, _generation
-    global _youtube_stream_key, _state, _error, _started_at, _pending_camera, _encoder_proc
+    global _want_stream, _relay_proc, _active_camera, _generation
+    global _state, _error, _started_at, _pending_camera, _encoder_proc
     global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
     global _recorder_proc, _want_record, _recording, _record_warning, _replay, _relay_zmq
     with _lock:
@@ -1298,9 +1361,10 @@ def _stop_all(finalize=True):
         _want_stream = False
         _stop_generation += 1
         _generation += 1  # abort any cut in flight
-        processes = (_youtube_proc, _recorder_proc, _encoder_proc, _relay_proc)
-        _youtube_proc = _recorder_proc = _encoder_proc = _relay_proc = None
-        _active_camera = _youtube_stream_key = _started_at = _pending_camera = None
+        processes = tuple(t["proc"] for t in _targets.values()) + (_recorder_proc, _encoder_proc, _relay_proc)
+        _targets.clear()
+        _recorder_proc = _encoder_proc = _relay_proc = None
+        _active_camera = _started_at = _pending_camera = None
         _relay_channels, _relay_missing, _relay_muted = {}, set(), set()
         _state, _error = "stopped", ""
         _relay_secondary, _layout_warning = None, ""
@@ -1395,9 +1459,9 @@ def _supervise_encoder():
             return
         else:
             healthy = False
-            if _youtube_stream_key:
-                _state = "reconnecting"
             _error = (encoder.error if encoder else "") or "Encoder stopped producing frames"
+            if _targets:
+                _state = "reconnecting"
             token = _stop_generation
             _encoder_proc = None
     if healthy:
@@ -1419,35 +1483,43 @@ def _supervise_encoder():
 
 
 def _supervise_pusher(now):
-    """Keep the YouTube connection up; reconnect with backoff without touching the encoder."""
-    global _youtube_proc, _state, _error, _started_at, _push_failures, _push_retry_at
+    """Keep every destination connected; each reconnects with its own backoff without
+    touching the encoder, the recording or the other destinations."""
+    for name in list(_targets):
+        _supervise_target(name, now)
+
+
+def _supervise_target(name, now):
     with _lock:
-        if not (_want_stream and _youtube_stream_key):
+        target = _targets.get(name)
+        if not (_want_stream and target):
             return
-        pusher = _youtube_proc
+        pusher = target["proc"]
         if pusher and pusher.healthy():
-            _state, _error, _push_failures = "live", "", 0
-            if _started_at is None:
-                _started_at = datetime.now(timezone.utc).isoformat()
+            if target["state"] != "live":
+                target.update(state="live", error="", failures=0)
+                target["started_at"] = target["started_at"] or datetime.now(timezone.utc).isoformat()
+                _summarize_targets()
             return
         if pusher and pusher.poll() is None and now - pusher.launched < 20:
             return
         if pusher:
-            _state = "reconnecting"
-            _error = pusher.error or "YouTube connection lost"
-        _youtube_proc, token = None, _stop_generation
+            target.update(state="reconnecting", error=pusher.error or "Connection lost")
+            _summarize_targets()
+        target["proc"], token = None, _stop_generation
     _kill_process(pusher)
     with _lock:
-        if not (_want_stream and _youtube_stream_key) or token != _stop_generation or _youtube_proc:
+        if _targets.get(name) is not target or token != _stop_generation or target["proc"] or not _want_stream:
             return
-        if now >= _push_retry_at:
+        if now >= target["retry_at"]:
             if pusher:
-                _push_failures += 1
-                _push_retry_at = now + min(30, 2 ** min(_push_failures, 5))
+                target["failures"] += 1
+                target["retry_at"] = now + min(30, 2 ** min(target["failures"], 5))
             try:
-                _launch_pusher()
+                _launch_pusher(target)
             except OSError:
-                _state, _error = "failed", "Cannot start the YouTube connection"
+                target.update(state="failed", error="Cannot start the connection")
+                _summarize_targets()
 
 
 def _supervise_recorder(now):

@@ -17,7 +17,26 @@ a.get_replay_status=lambda: ({'active':True,'available':True,'label':'Replay','s
                              if replay['active'] else {'active':False,'available':recording['active']})
 a.play_replay=lambda seconds=10,speed=1.0,marker=None: (replay['calls'].append([seconds,speed,marker]) or replay.update(active=True,speed=speed) or True,'Replay on air (10 s)')
 a.stop_replay=lambda: (replay.update(active=False) or True,'Back to live')
-a.get_stream_status=lambda: {'active':False,'state':'stopped','active_camera':None,'selected_camera':'cam1' if replay['active'] else None,
+# Streaming destinations: Facebook "reconnects", everything else goes live at once.
+streams={'calls':[],'stops':[],'live':{}}
+def fake_start(targets, profile='720p', record=False, title=''):
+    streams['calls'].append({'profile':profile,'record':record,'urls':{n:t['url'] for n,t in targets.items()}})
+    for name,target in targets.items():
+        streams['live'][name]={'label':target['label'],'state':'live','error':'','started_at':None}
+        if name=='facebook':
+            streams['live'][name].update(state='reconnecting',error='Connection refused')
+    return True,'Going live'
+def fake_stop(name=None):
+    streams['stops'].append(name)
+    streams['live'].pop(name,None) if name else streams['live'].clear()
+    return True,'Stopped'
+a.start_stream=fake_start
+a.stop_stream=fake_stop
+@a.app.route('/test/stream-calls')
+def stream_calls():
+    return a.jsonify(streams)
+a.get_stream_status=lambda: {'active':bool(streams['live']),'state':'live' if streams['live'] else 'stopped','active_camera':None,
+                             'selected_camera':'cam1' if replay['active'] else None,'destinations':dict(streams['live']),
                              'audio_source':'active','audio_on_air':['cam1'],'error':'','fallback':not replay['active'],
                              'recording':a.get_recording_status(),'replay':a.get_replay_status()}
 @a.app.route('/test/replay-calls')

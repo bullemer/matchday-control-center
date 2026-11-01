@@ -443,7 +443,7 @@ test('operator mobile tally screen loads without basic auth and displays camera 
 test('setup tabs group sections, persist the choice and play previews only on Main', async ({page}) => {
   await page.goto('/');
   await expect(page.getByRole('tab', {name: /Main/})).toHaveAttribute('aria-selected', 'true');
-  for (const title of ['Multiview', 'Scoreboard & Match Clock', 'YouTube Stream & Recording']) {
+  for (const title of ['Multiview', 'Scoreboard & Match Clock', 'Live Stream & Recording']) {
     await expect(page.getByRole('heading', {name: title})).toBeVisible();
   }
   for (const title of ['Network Controls', 'Camera RTMP Links', 'Sideline Checklist', 'Recordings & Highlights']) {
@@ -570,4 +570,62 @@ test('instant replay controls follow the recording and drive the replay API', as
   await page.getByRole('tab', {name: /Main/}).click();
   page.once('dialog', dialog => dialog.accept());
   await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
+});
+
+test('stream to several platforms at once, each with its own key, status and stop', async ({page}) => {
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Main/}).click();
+  const row = name => page.locator(`[data-dest="${name}"]`);
+  const need = page.locator('[data-bind="upload_need"]');
+  await expect(row('youtube').locator('[data-dest-enabled]')).toBeChecked();  // YouTube on by default
+  await expect(row('facebook').locator('[data-dest-key]')).toBeHidden();
+  await expect(need).toHaveText('Upload needed: about 4.1 Mbit/s (1 × 4.1).');
+  await expect(page.locator('[data-dest-start]:visible, [data-dest-stop]:visible')).toHaveCount(0);  // not streaming yet
+  for (const name of ['facebook', 'twitch']) await row(name).locator('[data-dest-enabled]').check();
+  await expect(need).toContainText('about 12.4 Mbit/s (3 × 4.1). That is a lot for mobile data — consider a lower quality');
+  await expect(row('twitch').locator('[data-dest-server]')).toHaveValue('rtmps://ingest.global-contribute.live-video.net/app');
+  await page.getByRole('button', {name: '🔴 GO LIVE'}).click();
+  await expect(page.locator('#toast-container')).toContainText('Enter the stream key for ▶️ YouTube, 📘 Facebook, 🟣 Twitch');
+  await row('youtube').locator('[data-dest-key]').fill('yt-key');
+  await row('facebook').locator('[data-dest-key]').fill('FB-1?s_bl=1&a=Xy');
+  await row('twitch').locator('[data-dest-key]').fill('live_42_abc');
+  await row('twitch').locator('summary').click();
+  await row('twitch').locator('[data-dest-server]').fill('rtmps://euc10.contribute.live-video.net/app');
+  await page.getByRole('button', {name: '🔴 GO LIVE'}).click();
+  await expect(row('youtube').locator('[data-dest-state]')).toHaveText('LIVE');
+  await expect(row('facebook').locator('[data-dest-state]')).toHaveText('RECONNECTING…');
+  await expect(row('facebook').locator('[data-dest-error]')).toHaveText('⚠ Connection refused');
+  let calls = await (await page.request.get('/test/stream-calls')).json();
+  expect(calls.calls[0]).toEqual({profile: '720p', record: true, urls: {
+    youtube: 'rtmps://a.rtmps.youtube.com:443/live2/yt-key',
+    facebook: 'rtmps://live-api-s.facebook.com:443/rtmp/FB-1?s_bl=1&a=Xy',
+    twitch: 'rtmps://euc10.contribute.live-video.net/app/live_42_abc'}});
+  // Match mode shows a status chip per platform.
+  await page.locator('#mode-toggle').click();
+  await expect(page.locator('#match-panel [data-dest-summary] span')).toHaveText(['YT', 'FB', 'TW']);
+  await page.locator('#mode-toggle').click();
+  // Add Custom RTMP while live: only that one is started.
+  await row('custom').locator('[data-dest-enabled]').check();
+  await row('custom').locator('[data-dest-server]').fill('rtmp://10.0.0.2/live');
+  await row('custom').locator('[data-dest-key]').fill('club');
+  await row('custom').getByRole('button', {name: '▶ Start'}).click();
+  await expect(row('custom').locator('[data-dest-state]')).toHaveText('LIVE');
+  await expect(row('custom').getByRole('button', {name: '▶ Start'})).toBeHidden();
+  await expect(row('youtube').getByRole('button', {name: '▶ Start'})).toBeHidden();  // already live
+  calls = await (await page.request.get('/test/stream-calls')).json();
+  expect(calls.calls[1].urls).toEqual({custom: 'rtmp://10.0.0.2/live/club'});
+  // Stop one platform; the others stay.
+  page.once('dialog', dialog => dialog.accept());
+  await row('facebook').getByRole('button', {name: '⏹ Stop'}).click();
+  await expect(row('facebook').locator('[data-dest-state]')).toBeHidden();
+  await expect(row('youtube').locator('[data-dest-state]')).toHaveText('LIVE');
+  // Choices and servers survive a reload; stream keys never do.
+  await page.reload();
+  await expect(row('twitch').locator('[data-dest-enabled]')).toBeChecked();
+  await expect(row('custom').locator('[data-dest-server]')).toHaveValue('rtmp://10.0.0.2/live');
+  await expect(row('youtube').locator('[data-dest-key]')).toHaveValue('');
+  calls = await (await page.request.get('/test/stream-calls')).json();
+  expect(calls.stops).toEqual(['facebook']);
+  await page.request.post('/api/stream/stop', {data: {}});
+  for (const name of ['facebook', 'twitch', 'custom']) await row(name).locator('[data-dest-enabled]').uncheck();
 });

@@ -1,7 +1,8 @@
 # Matchday Control Center
 
 A Linux dashboard for USB internet tethering, an application-owned Wi-Fi hotspot,
-three camera inputs, a live scoreboard, and a supervised YouTube encoder.
+three camera inputs, a live scoreboard, and a supervised encoder that streams to YouTube,
+Facebook, Twitch and any other RTMP server at the same time, records and replays.
 
 ## Requirements and first launch
 
@@ -25,7 +26,7 @@ locally, or supply your own password through `MCC_OPERATOR_PASSWORD` before laun
 To change the login, edit `data/operator-user` and `data/operator-password` (one line
 each) and restart, or set `MCC_OPERATOR_USER` / `MCC_OPERATOR_PASSWORD`.
 Keep the password private; camera operators only need their camera publishing URL.
-The application never stores a YouTube stream key on disk or intentionally logs it.
+The application never stores a stream key on disk or intentionally logs it.
 
 HTTP Basic authentication is intended for a trusted local network. Use a TLS
 reverse proxy before exposing the control panel beyond it. To restrict the control
@@ -54,12 +55,14 @@ workers: the hardware process manager and live match state are process-local.
    audio warning; the chosen source is restored automatically when it returns.
    **Mute** (Main tab audio panel, Match mode, or key M in Match mode) silences every
    source on the broadcast at once — for a stoppage, an injury or a private word on the
-   bench. Picture, scoreboard and the YouTube connection keep running; unmuting restores
+   bench. Picture, scoreboard and the streaming connections keep running; unmuting restores
    the previous mix. Audio-source and level changes made while muted take effect on
    unmute. Mute lasts until it is switched off, including across camera cuts, and resets
    to off when the app restarts.
-5. Enter the YouTube stream key, choose 1080p, 720p or 480p, and click GO LIVE.
-   1080p needs about 7 Mbps of reliable upload; use 720p on a weak mobile connection. The app
+5. Switch on the platforms (YouTube, Facebook, Twitch, Custom RTMP), enter their stream
+   keys, choose 1080p, 720p or 480p, and click GO LIVE. See *Streaming destinations*
+   below. Each platform needs its own full upload (720p about 4.1 Mbps each); the panel
+   shows the total. Use 720p or fewer platforms on a weak mobile connection. The app
    validates a camera relay before launching the output encoder. “Starting” is not
    “Live”: frame progress is required for live status.
 6. Tap **Match mode** in the header for a one-screen sideline view: program preview
@@ -81,7 +84,8 @@ workers: the hardware process manager and live match state are process-local.
    (choose in the Multiview panel), **🐢 Slow-mo** the same at half speed; in Match mode
    ⏪ / 🐢 or keys R / S. Any highlight of the running match can be replayed from the
    🎬 Recordings tab. See *Instant replay* below.
-9. STOP STREAM ends the YouTube broadcast; a running recording continues until **Stop
+9. STOP ALL ends the broadcast on every platform (⏹ Stop on a platform's row ends only
+   that one); a running recording continues until **Stop
    recording**. Stopping whichever runs last also stops the encoder and camera relay. Ctrl+C / SIGTERM also cleans up the
    managed media processes. The hotspot remains under its explicit start/stop controls.
 
@@ -91,7 +95,30 @@ Camera phones publish RTMP to `cam1`, `cam2`, or `cam3`. A relay normalizes the
 selected camera to H.264 at the stream resolution and stereo 48 kHz AAC on `program`. MediaMTX 1.21.2's
 always-available program path supplies fallback video and silence when that publisher
 is absent. A separate encoder reads the continuous program over loopback RTSP,
-adds the scoreboard, and publishes RTMPS to YouTube.
+adds the scoreboard, and publishes the finished picture locally; each streaming
+destination and the recorder copy it from there.
+
+## Streaming destinations
+
+| Platform | Default server (editable under **Server**) | Key |
+|---|---|---|
+| YouTube | `rtmps://a.rtmps.youtube.com:443/live2` | YouTube Studio stream key |
+| Facebook | `rtmps://live-api-s.facebook.com:443/rtmp` | Live Producer stream key (may contain `?`, `=`, `&`) |
+| Twitch | `rtmps://ingest.global-contribute.live-video.net/app` (Twitch "Default"; regional servers from ingest.twitch.tv) | Twitch stream key |
+| Custom RTMP | none: enter the `rtmp://` or `rtmps://` server | optional |
+
+Every platform gets its own copy of the same stream (no extra encoding, so no extra CPU),
+its own status (LIVE / CONNECTING / RECONNECTING / FAILED with the reason) and its own
+reconnect timing: one platform failing never interrupts the others or the recording.
+The header shows ON AIR while any platform is live. Platforms can be added (▶ Start on
+the row) or stopped (⏹ Stop) while live. On/off choices and servers are remembered per
+device; stream keys are never stored.
+
+The stream meets the common requirements of all three platforms: H.264 up to 1080p30,
+AAC 48 kHz 128 kbps, a keyframe every 2 s, constant bitrate. 720p uses 4 Mbps, the top
+of Facebook's and YouTube's recommended 720p range. With Facebook, depending on how the
+key was created, the broadcast may only become public after **Go live** in Live Producer.
+Upload is the limit: three platforms at 720p need about 12.4 Mbps of steady upload.
 
 The final encoder uses two filter threads, six H.264 encoder threads, and explicit
 YUV420 overlay composition to reduce CPU overhead. Resolution, bitrate, the
@@ -125,7 +152,7 @@ camera recovery and microphone probes. The supervisor monitors advancing frames,
 encoders with bounded backoff. Active-camera loss leaves program fallback available;
 the selected source is retried when it returns. The dashboard reports fallback and
 connection loss explicitly. “Live” indicates the local encoder is producing output;
-check YouTube Studio to confirm platform-side reception and audience availability.
+check YouTube Studio, Live Producer or the Twitch dashboard to confirm platform-side reception.
 
 MediaMTX's control API and RTSP transport are loopback-only. Program publishing is
 loopback-only; camera publishing and preview reading are available on the LAN.
@@ -149,8 +176,8 @@ Recording refuses to start with less than 3 GB free and stops (and saves) by its
 below 1 GB.
 
 Pipeline: the output encoder publishes its finished picture to the local `final` path.
-The YouTube connection and the recorder only copy that stream (no second encode), so a
-YouTube outage reconnects the YouTube side alone and never interrupts the recording.
+The streaming connections and the recorder only copy that stream (no second encode), so a
+platform outage reconnects that platform alone and never interrupts the recording.
 The recorder writes crash-safe MPEG-TS parts; if the encoder or recorder restarts, the
 recording continues in a new part and the gap is short. Stopping joins the parts into
 one MP4 (`<date>_<Home>-vs-<Away>.mp4`). If the app stops mid-recording, the parts are
@@ -196,7 +223,7 @@ The scoreboard is applied over the composed output, so top corners are preferabl
 
 If the second camera disappears, recovery rebuilds a main-only view and restores the
 chosen composition when it returns. Main-camera loss uses the existing program fallback.
-Layout changes replace the relay while keeping the YouTube encoder alive; the current
+Layout changes replace the relay while keeping the output encoder alive; the current
 picture stays on air until the new layout is ready. Layout selections are kept for the current app session.
 
 ## Scoreboard sources
@@ -242,10 +269,10 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/network/usb-connect` | Connect detected USB ethernet |
 | POST | `/api/network/hotspot-start` | Start/update owned hotspot with `ssid`, `password` |
 | POST | `/api/network/hotspot-stop` | Stop owned hotspot only |
-| POST | `/api/stream/start` | `stream_key`, optional `profile`: `1080p`, `720p` or `480p`, `record`: also record |
-| POST | `/api/stream/stop` | Stop the YouTube stream (a recording continues) |
+| POST | `/api/stream/start` | `destinations`: `{youtube\|facebook\|twitch\|custom: {key, server?}}` (or legacy `stream_key` = YouTube), optional `profile`: `1080p`, `720p` or `480p`, `record`: also record. While live, adds platforms not yet running |
+| POST | `/api/stream/stop` | Stop all platforms, or one with `destination` (a recording continues) |
 | POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
-| POST | `/api/recording/stop` | Stop recording and save the MP4 (a YouTube stream continues) |
+| POST | `/api/recording/stop` | Stop recording and save the MP4 (streaming continues) |
 | POST | `/api/replay` | Instant replay: `seconds` (3–30) and `speed` (1 or 0.5), or `marker` (highlight id) |
 | POST | `/api/replay/stop` | Back to live now |
 | POST | `/api/markers` | Mark a highlight now on the running recording, optional `label` |
@@ -282,13 +309,14 @@ PATH="$PATH" venv/bin/python tests/media_smoke.py
 
 The media smoke test requires a provisioned `mediamtx` binary plus ffmpeg/ffprobe.
 It uses synthetic cameras and private loopback test ports (21935, 28554, 29997).
-The simulated YouTube destination is another local MediaMTX path: it never contacts
-YouTube or changes networking. It checks startup, repeated cuts with the same output
+The simulated YouTube destination is another local MediaMTX path and a local ffmpeg RTMP
+server stands in for a second platform: it never contacts a platform or changes networking. It checks startup, repeated cuts with the same output
 encoder PID, active-camera disconnect/fallback, recovery to another camera, and automatic restart after encoder failure.
 Browser tests run a separate fixture on port 25000 with mocked hardware.
 
 A real venue rehearsal is still required for physical USB tethering, AP driver/Polkit
-behavior, microphone capture, phone WebRTC compatibility, and YouTube reception.
+behavior, microphone capture, phone WebRTC compatibility, and reception on YouTube,
+Facebook and Twitch (keys, upload bandwidth).
 Local recording, audio meters, QR onboarding, and adaptive bandwidth control remain
 possible future features; they are not implemented by this reliability repair.
 

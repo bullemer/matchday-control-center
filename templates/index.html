@@ -123,6 +123,13 @@
     /* Recording & highlights */
     .rec-badge { display: inline-flex; align-items: center; gap: .25rem; background: #dc2626; color: #fff; font-weight: 700; font-size: .75rem; padding: .2rem .5rem; border-radius: .375rem; white-space: nowrap; animation: mute-pulse 1.6s ease-in-out infinite; }
     .rec-badge.hidden { display: none; }
+    .dest-row { background: #0f172a; border: 1px solid #334155; border-radius: .6rem; padding: .6rem .75rem; }
+    .dest-input { width: 100%; background: #020617; border: 1px solid #475569; border-radius: .5rem; padding: .55rem .75rem; font-size: .875rem; color: #fff; }
+    .dest-input:focus { border-color: #22d3ee; outline: none; }
+    .chip-red { background: #991b1b; color: #fee2e2; }
+    .upload-warning { color: #fbbf24; font-weight: 600; }
+    .outdoor-mode .dest-row { background: #fff; border: 2px solid #0f172a; }
+    .outdoor-mode .dest-input { background: #f1f5f9; color: #020617; border: 2px solid #0f172a; }
     .replay-badge { background: #7c3aed; }
     .replay-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #7c3aed; color: #fff; white-space: nowrap; }
     .replay-btn:hover { background: #8b5cf6; }
@@ -143,7 +150,7 @@
     .rec-action { display: inline-flex; align-items: center; gap: .25rem; padding: .4rem .7rem; border-radius: .5rem; font-size: .85rem; font-weight: 600; background: #334155; color: #e2e8f0; }
     .rec-action:hover { background: #475569; }
     .rec-danger { color: #fca5a5; }
-    .rec-action[hidden] { display: none; }
+    .rec-action[hidden], .rec-action.hidden { display: none; }
     .rec-card { background: #0f172a; border: 1px solid #334155; border-radius: .75rem; padding: .9rem; }
     .marker-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .4rem .5rem; background: #1e293b; border: 1px solid #334155; border-radius: .5rem; }
     .marker-row select { background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: .375rem; padding: .2rem .4rem; font-size: .85rem; }
@@ -408,6 +415,7 @@
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 flex flex-wrap items-center gap-3">
           <span data-bind="yt_state" class="px-2 py-1 rounded text-xs font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           <span data-bind="yt_duration" class="font-mono text-lg text-white">00:00:00</span>
+          <span data-dest-summary class="flex flex-wrap gap-1"></span>
           <span data-rec-badge class="rec-badge hidden" title="Recording to this laptop">⏺ REC</span>
           <span data-replay-badge class="rec-badge replay-badge hidden">⏪ REPLAY</span>
           <div class="ml-auto flex flex-wrap gap-2">
@@ -812,23 +820,53 @@
          ───────────────────────────────────────────────────────────────── -->
     <section data-setup data-tab="main" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
       <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        ▶️ YouTube Stream &amp; Recording
+        📡 Live Stream &amp; Recording
       </h2>
       <div class="space-y-4">
-        <!-- Stream Key Input -->
-        <div>
-          <label class="block text-sm text-slate-400 mb-1">Stream Key</label>
-          <div class="flex flex-col sm:flex-row gap-2">
-            <select id="quality-profile" aria-label="Stream quality" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4.5 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
-            <div class="relative flex-1">
-              <input id="stream-key" type="password" placeholder="Paste YouTube stream key…"
-                     class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand-cyan focus:outline-none pr-12 font-mono">
-              <button onclick="toggleStreamKeyVisibility()"
-                      class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm px-2 py-1">
-                👁
-              </button>
+        <div class="flex flex-wrap items-center gap-2">
+          <label for="quality-profile" class="text-sm text-slate-400">Quality</label>
+          <select id="quality-profile" aria-label="Stream quality" onchange="renderDestinations()" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
+        </div>
+        <!-- Streaming destinations: each its own connection, all at the same time -->
+        <div id="destinations" class="space-y-2" data-bitrates='{{ bitrates|tojson }}'>
+          {% set icons = {'youtube': '▶️', 'facebook': '📘', 'twitch': '🟣', 'custom': '🔗'} %}
+          {% for name, label, server in destinations %}
+          <div class="dest-row" data-dest="{{ name }}">
+            <div class="flex flex-wrap items-center gap-2">
+              <label class="flex items-center gap-2 cursor-pointer font-semibold text-white">
+                <input type="checkbox" role="switch" class="overlay-switch" data-dest-enabled onchange="destinationToggled()">
+                {{ icons[name] }} {{ label }}
+              </label>
+              <span data-dest-state class="chip chip-slate hidden"></span>
+              <span class="ml-auto flex gap-2">
+                <button data-dest-start onclick="startDestination('{{ name }}')" class="rec-action hidden">▶ Start</button>
+                <button data-dest-stop onclick="stopDestination('{{ name }}')" class="rec-action rec-danger hidden">⏹ Stop</button>
+              </span>
+            </div>
+            <div data-dest-fields class="hidden mt-2 space-y-2">
+              {% if name == 'custom' %}
+              <input data-dest-server type="url" placeholder="rtmp://server/app  or  rtmps://…" aria-label="{{ label }} server"
+                     class="dest-input font-mono" autocomplete="off" spellcheck="false">
+              {% endif %}
+              <div class="relative">
+                <input {% if name == 'youtube' %}id="stream-key" {% endif %}data-dest-key type="password" autocomplete="off" spellcheck="false"
+                       placeholder="{{ 'Stream key (optional)' if name == 'custom' else 'Paste ' ~ label ~ ' stream key…' }}" aria-label="{{ label }} stream key"
+                       class="dest-input font-mono pr-12">
+                <button type="button" onclick="toggleKeyVisibility(this)" aria-label="Show {{ label }} stream key"
+                        class="password-toggle absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-sm px-2 py-1">👁</button>
+              </div>
+              {% if name != 'custom' %}
+              <details class="text-xs text-slate-400">
+                <summary class="cursor-pointer">Server</summary>
+                <input data-dest-server data-default="{{ server }}" value="{{ server }}" aria-label="{{ label }} server"
+                       class="dest-input font-mono mt-1" autocomplete="off" spellcheck="false">
+              </details>
+              {% endif %}
+              <p data-dest-error class="hidden text-xs font-semibold text-brand-amber"></p>
             </div>
           </div>
+          {% endfor %}
+          <p data-bind="upload_need" class="text-xs text-slate-400"></p>
         </div>
         <!-- Go Live / Stop -->
         <div class="flex gap-3">
@@ -838,7 +876,7 @@
           </button>
           <button onclick="stopStream()"
                   class="flex-1 bg-slate-600 hover:bg-slate-500 text-white font-bold py-3 rounded-xl transition-colors text-base flex items-center justify-center gap-2">
-            ⏹ STOP STREAM
+            ⏹ STOP ALL
           </button>
         </div>
         <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
@@ -1043,10 +1081,10 @@
       clockRunning: false,
       clockElapsed: 0,             // seconds from server
       clockLastServerUpdate: null, // Date.now() of last server sync
-      streamKeyVisible: false,
       matchMode: false,
       tab: 'main',
       recording: {active: false},
+      destinations: {},
       replay: {active: false, available: false},
       muted: false,
       matchPreview: true,
@@ -1351,11 +1389,14 @@
     }
 
     function matchGoLive() {
-      if (document.getElementById('stream-key').value.trim()) return goLive();
-      showToast('Enter the stream key in Setup first', 'warning');
+      const {chosen, missing} = chosenDestinations();
+      if (Object.keys(chosen).length && !missing.length) return goLive();
+      showToast('Enter the stream keys in Setup first', 'warning');
       selectTab('main');
       toggleMode();
-      document.getElementById('stream-key').focus();
+      const firstEmpty = DESTINATIONS.map(destRow).find(row => row.querySelector('[data-dest-enabled]').checked
+        && !row.querySelector(row.dataset.dest === 'custom' ? '[data-dest-server]' : '[data-dest-key]').value.trim());
+      (firstEmpty || destRow('youtube')).querySelector('[data-dest-key]').focus();
     }
 
     // Match-mode keys (laptop keyboard): 1–3 cut, M mute, H highlight, R replay, S slow-motion replay.
@@ -1806,10 +1847,102 @@
     }
 
     // ──────────────────────── YouTube Stream ────────────────────────
-    function toggleStreamKeyVisibility() {
-      const input = document.getElementById('stream-key');
-      state.streamKeyVisible = !state.streamKeyVisible;
-      input.type = state.streamKeyVisible ? 'text' : 'password';
+    function toggleKeyVisibility(button) {
+      const input = button.parentElement.querySelector('[data-dest-key]');
+      input.type = input.type === 'password' ? 'text' : 'password';
+    }
+
+    // ──────────────────────── Streaming destinations ────────────────────────
+    const DESTINATIONS = ['youtube', 'facebook', 'twitch', 'custom'];
+    const DEST_SHORT = {youtube: 'YT', facebook: 'FB', twitch: 'TW', custom: 'RTMP'};
+    const DEST_STATES = {live: ['LIVE', 'chip chip-green'], starting: ['CONNECTING…', 'chip chip-amber'],
+                         reconnecting: ['RECONNECTING…', 'chip chip-amber'], failed: ['FAILED', 'chip chip-red']};
+    const destRow = name => document.querySelector(`[data-dest="${name}"]`);
+    function destSettings(name) {
+      const row = destRow(name);
+      return {enabled: row.querySelector('[data-dest-enabled]').checked,
+              key: row.querySelector('[data-dest-key]').value.trim(),
+              server: row.querySelector('[data-dest-server]').value.trim()};
+    }
+    function saveDestinations() {
+      // Choices and servers are remembered on this device; stream keys never are.
+      DESTINATIONS.forEach(name => {
+        const {enabled, server} = destSettings(name);
+        storeSet('mcc-dest-' + name, JSON.stringify({enabled, server}));
+      });
+    }
+    function loadDestinations() {
+      DESTINATIONS.forEach(name => {
+        let saved = null;
+        try { saved = JSON.parse(storeGet('mcc-dest-' + name) || 'null'); } catch {}
+        const row = destRow(name);
+        row.querySelector('[data-dest-enabled]').checked = saved ? !!saved.enabled : name === 'youtube';
+        if (saved && saved.server) row.querySelector('[data-dest-server]').value = saved.server;
+      });
+      renderDestinations();
+    }
+    function destinationToggled() {
+      saveDestinations();
+      renderDestinations();
+    }
+    document.addEventListener('change', event => { if (event.target.matches('[data-dest-server]')) saveDestinations(); });
+
+    // Enabled destinations with what they need; reports what is missing instead.
+    function chosenDestinations(names = DESTINATIONS) {
+      const chosen = {}, missing = [];
+      names.forEach(name => {
+        const {enabled, key, server} = destSettings(name);
+        if (!enabled) return;
+        const label = destRow(name).querySelector('label').textContent.trim();
+        if (name === 'custom' ? !server : !key) { missing.push(label); return; }
+        chosen[name] = {key, server};
+      });
+      return {chosen, missing};
+    }
+
+    function renderDestinations() {
+      const live = state.destinations || {};
+      const streaming = Object.keys(live).length > 0 || ['starting', 'live', 'reconnecting'].includes(state.streamState);
+      let enabled = 0;
+      DESTINATIONS.forEach(name => {
+        const row = destRow(name), status = live[name];
+        const on = row.querySelector('[data-dest-enabled]').checked;
+        enabled += on || status ? 1 : 0;
+        row.querySelector('[data-dest-fields]').classList.toggle('hidden', !on);
+        const chip = row.querySelector('[data-dest-state]');
+        const [text, look] = status ? DEST_STATES[status.state] || [status.state.toUpperCase(), 'chip chip-slate'] : ['', ''];
+        chip.textContent = text;
+        chip.className = (look || 'chip chip-slate') + (status ? '' : ' hidden');
+        row.querySelector('[data-dest-start]').classList.toggle('hidden', !(streaming && on && !status));
+        row.querySelector('[data-dest-stop]').classList.toggle('hidden', !status);
+        const error = row.querySelector('[data-dest-error]');
+        error.textContent = status && status.error ? '⚠ ' + status.error : '';
+        error.classList.toggle('hidden', !(status && status.error));
+      });
+      const kbps = JSON.parse(document.getElementById('destinations').dataset.bitrates)[document.getElementById('quality-profile').value];
+      const need = document.querySelector('[data-bind="upload_need"]');
+      need.textContent = enabled
+        ? `Upload needed: about ${(enabled * kbps / 1000).toFixed(1)} Mbit/s (${enabled} × ${(kbps / 1000).toFixed(1)}).` +
+          (enabled * kbps > 10000 ? ' That is a lot for mobile data — consider a lower quality or fewer platforms.' : '')
+        : 'Turn on at least one platform to go live.';
+      need.classList.toggle('upload-warning', enabled * kbps > 10000);
+      document.querySelectorAll('[data-dest-summary]').forEach(box => {
+        box.innerHTML = DESTINATIONS.filter(name => live[name]).map(name => [name, live[name]]).map(([name, s]) =>
+          `<span class="${(DEST_STATES[s.state] || ['', 'chip chip-slate'])[1]}" title="${esc(s.label)}: ${esc(s.state)}">${DEST_SHORT[name] || esc(name)}</span>`).join('');
+      });
+    }
+
+    async function startDestination(name) {
+      const {chosen, missing} = chosenDestinations([name]);
+      if (!chosen[name]) { showToast(`Enter the ${missing[0] || name} stream key first`, 'warning'); return; }
+      await apiPost('/api/stream/start', {destinations: chosen, profile: document.getElementById('quality-profile').value});
+      await pollStatus();
+    }
+    async function stopDestination(name) {
+      const label = (state.destinations[name] || {}).label || name;
+      if (!confirm(`Stop streaming to ${label}? The other platforms keep going.`)) return;
+      await apiPost('/api/stream/stop', {destination: name});
+      await pollStatus();
     }
 
     let startPending = false, startCancelled = false, stopPending = false, streamSequence = 0;
@@ -1834,9 +1967,13 @@
 
     async function goLive() {
       if (startPending || stopPending) return;
-      const key = document.getElementById('stream-key').value.trim();
-      if (!key) {
-        showToast('Enter a YouTube stream key first', 'warning');
+      const {chosen, missing} = chosenDestinations();
+      if (missing.length) {
+        showToast(`Enter the stream key for ${missing.join(', ')} (or switch it off)`, 'warning');
+        return;
+      }
+      if (!Object.keys(chosen).length) {
+        showToast('Turn on at least one platform and enter its stream key', 'warning');
         return;
       }
       const sequence = ++streamSequence;
@@ -1844,7 +1981,7 @@
       startCancelled = false;
       renderStreamControls();
       try {
-        const {ok, data} = await apiRequest('/api/stream/start', {stream_key: key, profile: document.getElementById('quality-profile').value,
+        const {ok, data} = await apiRequest('/api/stream/start', {destinations: chosen, profile: document.getElementById('quality-profile').value,
                                                                  record: document.getElementById('record-with-live').checked});
         if (sequence === streamSequence) showToast(data.message || data.error || 'Start failed', ok ? 'success' : 'error');
       } finally {
@@ -1857,8 +1994,8 @@
     async function stopStream() {
       if (stopPending) return;
       const keepsRecording = state.recording && state.recording.active;
-      if (!confirm(keepsRecording ? 'Stop the YouTube stream? Viewers will see the broadcast end. Recording continues.'
-                                  : 'Stop the YouTube stream? Viewers will see the broadcast end.')) return;
+      if (!confirm(keepsRecording ? 'Stop streaming on all platforms? Viewers will see the broadcast end. Recording continues.'
+                                  : 'Stop streaming on all platforms? Viewers will see the broadcast end.')) return;
       ++streamSequence;
       startCancelled = true;
       stopPending = true;
@@ -2461,6 +2598,8 @@
       // --- Audio Source ---
       renderRecording(stream.recording);
       renderReplay(stream.replay);
+      state.destinations = stream.destinations || {};
+      renderDestinations();
       if (typeof stream.muted === 'boolean' && !mutePending) {
         state.muted = stream.muted;
         renderMute();
@@ -2542,6 +2681,7 @@
     document.getElementById('record-with-live').checked = storeGet('mcc-record-with-live') !== 'off';
     const savedReplaySeconds = storeGet('mcc-replay-seconds');
     if (['6', '10', '15', '20'].includes(savedReplaySeconds)) document.getElementById('replay-seconds').value = savedReplaySeconds;
+    loadDestinations();
     selectTab(storeGet('mcc-tab'));
     applyMode();
     applyOutdoorMode();

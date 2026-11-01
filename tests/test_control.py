@@ -172,7 +172,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.post('/api/stream/start',{'stream_key':123}).status_code,400)
 
     def test_media_contract(self):
-        for url, function, body in [('/api/stream/start','start_youtube_stream',{'stream_key':'test'}),('/api/stream/stop','stop_youtube_stream',{}),('/api/switch/cam2','switch_camera',{}),('/api/audio-source','set_audio_source',{'mode':'active'})]:
+        for url, function, body in [('/api/stream/start','start_stream',{'stream_key':'test'}),('/api/stream/stop','stop_stream',{}),('/api/switch/cam2','switch_camera',{}),('/api/audio-source','set_audio_source',{'mode':'active'})]:
             with patch.object(a,function,return_value=(True,'ok')):
                 self.assertEqual(self.post(url,body).status_code,200)
             with patch.object(a,function,return_value=(False,'failed')):
@@ -685,8 +685,8 @@ class ConcurrencyRegressionTests(unittest.TestCase):
         from contextlib import ExitStack
         self.stack = self.enterContext(ExitStack())
         values = dict(_want_stream=False, _state='stopped', _active_camera=None,
-                      _relay_proc=None, _youtube_proc=None, _encoder_proc=None, _recorder_proc=None,
-                      _want_record=False, _recording=None, _youtube_stream_key=None,
+                      _relay_proc=None, _targets={}, _encoder_proc=None, _recorder_proc=None,
+                      _want_record=False, _recording=None,
                       _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _audio_warning='', _generation=0, _stop_generation=0,
                       _pending_camera=None, _follow=False, _profile='720p', _relay_profile='720p',
@@ -799,8 +799,8 @@ class EngineStateCase(unittest.TestCase):
         self.tmp = self.enterContext(tempfile.TemporaryDirectory())
         self.stack.enter_context(patch.object(m.recordings, 'RECORDINGS_DIR', Path(self.tmp)))
         values = dict(_want_stream=False, _state='stopped', _active_camera=None, _relay_proc=None,
-                      _youtube_proc=None, _encoder_proc=None, _recorder_proc=None, _want_record=False,
-                      _recording=None, _youtube_stream_key=None, _started_at=None, _generation=0,
+                      _targets={}, _encoder_proc=None, _recorder_proc=None, _want_record=False,
+                      _recording=None, _started_at=None, _generation=0,
                       _stop_generation=0, _pending_camera=None, _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _profile='720p', _relay_profile='720p', _record_warning='')
         for key, value in values.items():
@@ -814,7 +814,8 @@ class EngineStateCase(unittest.TestCase):
         m._want_stream = True
         m._encoder_proc, m._relay_proc = MagicMock(name='encoder'), MagicMock(name='relay')
         if key:
-            m._youtube_stream_key, m._youtube_proc = key, MagicMock(name='pusher')
+            m._targets['youtube'] = m.make_target('youtube', key)
+            m._targets['youtube']['proc'] = MagicMock(name='pusher')
         if record:
             m._recording = m.recordings.create_session('720p', 'A vs B')
             m._want_record, m._recorder_proc = True, MagicMock(name='recorder')
@@ -825,22 +826,22 @@ class RecordingTests(EngineStateCase):
     """Recording lifecycle (engine state only, no processes) and the recordings store."""
     def test_stop_stream_while_recording_keeps_recording(self):
         self.running(key='key')
-        pusher, recorder = m._youtube_proc, m._recorder_proc
-        self.assertEqual(m.stop_youtube_stream(), (True, 'YouTube stream stopped; recording continues'))
+        pusher, recorder = m._targets['youtube']['proc'], m._recorder_proc
+        self.assertEqual(m.stop_youtube_stream(), (True, 'YouTube stopped; recording continues'))
         self.kill.assert_called_once_with(pusher)
         self.assertTrue(m._want_stream and m._want_record)
         self.assertIs(m._recorder_proc, recorder)
-        self.assertIsNone(m._youtube_stream_key)
+        self.assertEqual(m._targets, {})
         self.assertEqual(m._state, 'stopped')
 
     def test_stop_recording_while_live_keeps_youtube(self):
         self.running(key='key')
-        session, pusher = m._recording, m._youtube_proc
+        session, pusher = m._recording, m._targets['youtube']['proc']
         with patch.object(m.recordings, 'close_part') as close:
             self.assertTrue(m.stop_recording()[0])
         close.assert_called_once_with(session)
         m.recordings.finalize_async.assert_called_once_with(session)
-        self.assertTrue(m._want_stream and m._youtube_proc is pusher)
+        self.assertTrue(m._want_stream and m._targets['youtube']['proc'] is pusher)
         self.assertFalse(m._want_record)
         self.assertIsNone(m._recording)
 
@@ -858,7 +859,7 @@ class RecordingTests(EngineStateCase):
         self.running()
         ok, message = m.start_youtube_stream('key2')
         self.assertTrue(ok, message)
-        self.assertEqual((m._youtube_stream_key, m._state), ('key2', 'starting'))
+        self.assertEqual((m._targets['youtube']['url'].rsplit('/', 1)[1], m._state), ('key2', 'starting'))
         self.assertFalse(m.start_youtube_stream('key3')[0])  # already live
         self.assertEqual(m.start_recording(), (False, 'Already recording'))
 
@@ -946,6 +947,99 @@ class RecordingTests(EngineStateCase):
             r.recover()
         info = r.get(sid)
         self.assertEqual((info['state'], info['duration']), ('unfinished', 42.0))
+
+
+class DestinationTests(EngineStateCase):
+    """Streaming to several platforms at once, each with its own connection."""
+    def test_targets_validate_keys_and_servers_per_platform(self):
+        fb = m.make_target('facebook', 'FB-123?s_bl=1&s_vt=api-s&a=AbC_d-9')
+        self.assertEqual(fb['url'], 'rtmps://live-api-s.facebook.com:443/rtmp/FB-123?s_bl=1&s_vt=api-s&a=AbC_d-9')
+        self.assertEqual(m.make_target('twitch', 'live_123_abc')['url'],
+                         'rtmps://ingest.global-contribute.live-video.net/app/live_123_abc')
+        tw = m.make_target('twitch', 'live_1', 'rtmps://euc10.contribute.live-video.net/app/')
+        self.assertEqual(tw['url'], 'rtmps://euc10.contribute.live-video.net/app/live_1')
+        self.assertEqual(m.make_target('custom', '', 'rtmp://192.168.1.5:1935/live/club')['url'], 'rtmp://192.168.1.5:1935/live/club')
+        for name, key, server, problem in [
+                ('youtube', 'a?b', None, 'invalid stream key'), ('twitch', '', None, 'invalid stream key'),
+                ('custom', 'k', None, 'enter the RTMP server'), ('custom', 'k', 'http://example.com/live', 'rtmp:// or rtmps://'),
+                ('custom', 'k', 'rtmp://evil.com live', 'rtmp:// or rtmps://'), ('facebook', 'a b', None, 'invalid stream key'),
+                ('vimeo', 'vimeo-key-1', None, 'Unknown')]:
+            with self.subTest(name=name, key=key, server=server):
+                with self.assertRaises(ValueError) as error:
+                    m.make_target(name, key, server)
+                self.assertIn(problem, str(error.exception))
+                if key:
+                    self.assertNotIn(key, str(error.exception))
+
+    def live(self, *names):
+        m._want_stream = True
+        m._encoder_proc = MagicMock(name='encoder')
+        for name in names:
+            target = m.make_target(name, 'key-' + name, 'rtmp://example.com/live' if name == 'custom' else None)
+            target['proc'] = MagicMock(name=name)
+            target['proc'].healthy.return_value = True
+            target['proc'].poll.return_value = None
+            m._targets[name] = target
+
+    def test_one_platform_dropping_out_leaves_the_others_live(self):
+        self.live('youtube', 'twitch')
+        m._targets['twitch']['proc'].healthy.return_value = False
+        m._targets['twitch']['proc'].poll.return_value = 1
+        m._targets['twitch']['proc'].error = 'Connection refused'
+        youtube = m._targets['youtube']['proc']
+        with patch.object(m, 'Process') as proc:
+            m._supervise_pusher(m.time.monotonic())
+        self.assertEqual(m._targets['youtube']['state'], 'live')
+        self.assertIs(m._targets['youtube']['proc'], youtube)
+        self.assertEqual(m._targets['twitch']['state'], 'reconnecting')
+        self.assertIs(m._targets['twitch']['proc'], proc.return_value)  # first retry at once
+        self.assertEqual(proc.call_args.args[0][-1], 'rtmps://ingest.global-contribute.live-video.net/app/key-twitch')
+        self.assertEqual(m._state, 'live')  # header stays ON AIR while any platform is live
+        self.assertIn('Twitch: Connection refused', m._error)
+        status = m.get_stream_status()['destinations']
+        self.assertEqual({n: d['state'] for n, d in status.items()}, {'youtube': 'live', 'twitch': 'reconnecting'})
+        self.assertNotIn('key-', json.dumps(status))  # keys never reach the dashboard
+
+    def test_stop_one_platform_keeps_the_rest(self):
+        self.live('youtube', 'facebook')
+        facebook = m._targets['facebook']['proc']
+        self.assertEqual(m.stop_stream('facebook'), (True, 'Facebook stopped'))
+        self.kill.assert_called_once_with(facebook)
+        self.assertEqual(list(m._targets), ['youtube'])
+        self.assertTrue(m._want_stream)
+        self.assertFalse(m.stop_stream('twitch')[0])
+        with patch.object(m.recordings, 'close_part'):
+            self.assertEqual(m.stop_stream('youtube'), (True, 'Streaming stopped'))  # last one: output stops
+        self.assertFalse(m._want_stream)
+
+    def test_adding_a_platform_while_live(self):
+        self.live('youtube')
+        ok, message = m.start_stream({'twitch': m.make_target('twitch', 'live_9'), 'youtube': m.make_target('youtube', 'other')})
+        self.assertTrue(ok, message)
+        self.assertEqual(message, 'Connecting to Twitch; watch the live status for confirmation')
+        self.assertEqual(m._targets['youtube']['url'].rsplit('/', 1)[1], 'key-youtube')  # running one untouched
+        self.assertEqual(m._targets['twitch']['state'], 'starting')
+        self.assertFalse(m.start_stream({'twitch': m.make_target('twitch', 'live_9')})[0])
+
+    def test_api_builds_destinations_and_hides_keys_in_errors(self):
+        a.app.config['OPERATOR_PASSWORD'] = 'test'
+        client, headers = a.app.test_client(), {'Authorization': 'Basic ' + base64.b64encode(b'operator:test').decode()}
+        with patch.object(a, 'start_stream', return_value=(True, 'ok')) as start:
+            r = client.post('/api/stream/start', headers=headers, json={'profile': '480p', 'record': True, 'destinations': {
+                'facebook': {'key': 'FB-1?a=b'}, 'custom': {'key': 'club', 'server': 'rtmp://10.0.0.2/live'}}})
+        self.assertEqual(r.status_code, 200)
+        targets = start.call_args.args[0]
+        self.assertEqual({n: t['url'] for n, t in targets.items()}, {
+            'facebook': 'rtmps://live-api-s.facebook.com:443/rtmp/FB-1?a=b', 'custom': 'rtmp://10.0.0.2/live/club'})
+        self.assertEqual(start.call_args.args[1], '480p')
+        self.assertTrue(start.call_args.kwargs['record'])
+        r = client.post('/api/stream/start', headers=headers, json={'destinations': {'twitch': {'key': 'secret key!'}}})
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn('secret', r.get_json()['error'])
+        self.assertEqual(client.post('/api/stream/start', headers=headers, json={'destinations': {}}).status_code, 400)
+        with patch.object(a, 'stop_stream', return_value=(True, 'Twitch stopped')) as stop:
+            self.assertEqual(client.post('/api/stream/stop', headers=headers, json={'destination': 'twitch'}).status_code, 200)
+        stop.assert_called_once_with('twitch')
 
 
 class ReplayTests(EngineStateCase):

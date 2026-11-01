@@ -65,7 +65,7 @@ def run():
             wait(lambda: m.get_recording_status()['writing'])
             session = m.get_recording_status()['session']
             recorder_pid = m._recorder_proc.proc.pid
-            m._youtube_proc.proc.kill()  # YouTube connection drops
+            m._targets['youtube']['proc'].proc.kill()  # YouTube connection drops
             wait(lambda: m.get_stream_status()['state'] == 'reconnecting', seconds=10)
             wait(lambda: m.get_stream_status()['state'] == 'live', seconds=30)
             assert m._recorder_proc.proc.pid == recorder_pid and m._encoder_proc.proc.pid == encoder_pid
@@ -74,6 +74,34 @@ def run():
             marker = m.recordings.add_marker(session, 'Goal', '12:00', 'Red 1-0 Blue')
             assert marker['offset'] > 5, marker
             print(f"PASS: highlight marked at {marker['offset']}s on the recording", flush=True)
+            # A second platform: a separate local RTMP server stands in for Custom RTMP.
+            def rtmp_sink():
+                sink = subprocess.Popen(['ffmpeg','-hide_banner','-loglevel','error','-listen','1','-i',
+                                         'rtmp://127.0.0.1:21998/live/club','-c','copy','-f','null','-'],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                sources.append(sink)  # cleaned up with the cameras
+                time.sleep(1)
+                return sink
+            sink = rtmp_sink()
+            ok, message = m.start_stream({'custom': m.make_target('custom', 'club', 'rtmp://127.0.0.1:21998/live')})
+            assert ok and message.startswith('Connecting to Custom RTMP'), message
+            custom_state = lambda: m.get_destinations().get('custom', {}).get('state')
+            wait(lambda: custom_state() == 'live', seconds=30)
+            youtube_pid = m._targets['youtube']['proc'].proc.pid
+            print('PASS: second platform added while live', flush=True)
+            sink.kill(); sink.wait()
+            wait(lambda: custom_state() == 'reconnecting', seconds=30)
+            assert m.get_destinations()['youtube']['state'] == 'live' and m._targets['youtube']['proc'].proc.pid == youtube_pid
+            assert m._recorder_proc.proc.pid == recorder_pid and m._encoder_proc.proc.pid == encoder_pid
+            assert m.get_stream_status()['state'] == 'live'  # still on air elsewhere
+            print('PASS: one platform dropping out leaves YouTube, encoder and recording untouched', flush=True)
+            sink = rtmp_sink()
+            wait(lambda: custom_state() == 'live', seconds=60)
+            print('PASS: the dropped platform reconnects by itself', flush=True)
+            assert m.stop_stream('custom') == (True, 'Custom RTMP stopped; recording continues')
+            assert list(m._targets) == ['youtube'] and m._targets['youtube']['proc'].proc.pid == youtube_pid
+            sink.kill()
+            print('PASS: stopping one platform keeps the others live', flush=True)
             def program_pixels():
                 result = subprocess.run(['ffmpeg','-v','error','-rtsp_transport','tcp','-timeout','5000000',
                     '-i',f'{m.RTSP_BASE}/program','-an','-frames:v','1','-vf','scale=160:90',
