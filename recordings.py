@@ -222,6 +222,12 @@ def _source(session, offset):
     raise ValueError("Nothing has been recorded yet")
 
 
+def source_at(sid, offset):
+    """(file path, offset within it) for a timeline offset of a session."""
+    with _lock:
+        return _source(_load(sid), offset)
+
+
 def _run(cmd, timeout=120):
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     if result.returncode:

@@ -42,7 +42,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
                           stop_youtube_stream, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
-                          get_recording_status)
+                          get_recording_status, play_replay, stop_replay, get_replay_status,
+                          add_replay_listener)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -162,7 +163,9 @@ def _write_scoreboard_locked():
     with _clock_lock:
         clock_str = _format_clock(_clock_elapsed())
 
-    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if _scoreboard["visible"] and _scoreboard["source"] == "builtin" else ""
+    # During an instant replay the recording's own scoreboard is in the picture.
+    shown = _scoreboard["visible"] and _scoreboard["source"] == "builtin" and not get_replay_status()["active"]
+    text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if shown else ""
 
     try:
         if Path(SCOREBOARD_PATH).read_text() == text:
@@ -251,7 +254,8 @@ def api_tally_status(cam_id):
     publishing = bool(cameras.get(cam_id))
     active_cam = stream.get("active_camera") or stream.get("selected_camera")
     secondary_cam = stream.get("secondary_camera")
-    on_air = bool(publishing and active_cam == cam_id)
+    replay = stream.get("replay", {}).get("active", False)
+    on_air = bool(publishing and active_cam == cam_id and not replay)
     secondary = bool(publishing and secondary_cam == cam_id)
     stream_active = bool(stream.get("active") or stream.get("state") == "live")
     return jsonify({
@@ -263,6 +267,7 @@ def api_tally_status(cam_id):
         "secondary": secondary,
         "stream_active": stream_active,
         "stream_state": stream.get("state", "stopped"),
+        "replay": replay,
     })
 
 
@@ -512,6 +517,43 @@ def recording_file(sid, name):
     return send_file(path, mimetype="video/mp2t" if path.suffix == ".ts" else "video/mp4",
                      as_attachment=request.args.get("download") == "1",
                      download_name=path.name, conditional=True, max_age=0)
+
+
+@app.route("/api/replay", methods=["POST"])
+@api_endpoint
+def api_replay():
+    """Instant replay from the running recording: {"seconds": 3-30, "speed": 1|0.5}
+    for the last seconds, or {"marker": "<id>"} around a highlight."""
+    data = request.get_json(force=True, silent=True) or {}
+    seconds, speed, marker = data.get("seconds", 10), data.get("speed", 1), data.get("marker")
+    if type(seconds) not in (int, float) or type(speed) not in (int, float):
+        raise ValueError("seconds and speed must be numbers")
+    if marker is not None and type(marker) is not str:
+        raise ValueError("marker must be a highlight id")
+    log.info("Replay requested (seconds=%s, speed=%s, marker=%s)", seconds, speed, marker)
+    success, msg = play_replay(float(seconds), float(speed), marker=marker)
+    if not success and msg == SUPERSEDED:
+        return jsonify({"ok": True, "message": "Replaced by a newer action"})
+    return jsonify({"ok": success, "message": msg}), 200 if success else 409
+
+
+@app.route("/api/replay/stop", methods=["POST"])
+@api_endpoint
+def api_replay_stop():
+    success, msg = stop_replay()
+    return jsonify({"ok": success, "message": msg}), 200 if success else 409
+
+
+def _replay_changed(active):
+    """Hide the live scoreboard while a replay (with its own scoreboard) is on air."""
+    browser_overlay.suspend(active)
+    try:
+        _write_scoreboard_file()
+    except OSError:
+        log.exception("Cannot update scoreboard")
+
+
+add_replay_listener(_replay_changed)
 
 
 # --- Camera switching --------------------------------------------------

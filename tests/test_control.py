@@ -62,6 +62,21 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.client.get('/recordings/'+sid+'/session.json',headers=self.headers).status_code,404)
             self.assertEqual(self.client.get('/recordings/'+sid+'/x.mp4').status_code,401)
 
+    def test_replay_hides_live_scoreboard_and_tally(self):
+        with patch.object(a,'get_replay_status',return_value={'active':True,'available':True}):
+            a._write_scoreboard_file()
+            self.assertEqual(Path(a.SCOREBOARD_PATH).read_text(),'')
+            with patch.object(a,'get_camera_status',return_value={'cam1':True}),patch.object(a,'get_stream_status',return_value={
+                    'active_camera':None,'selected_camera':'cam1','replay':{'active':True},'state':'live','active':True}):
+                tally=self.client.get('/api/tally/cam1').get_json()
+            self.assertEqual((tally['on_air'],tally['replay']),(False,True))
+        a._write_scoreboard_file()
+        self.assertIn('HOME',Path(a.SCOREBOARD_PATH).read_text())
+        with patch.object(a,'play_replay',return_value=(True,'Replay on air (10 s)')) as replay:
+            self.assertEqual(self.post('/api/replay',{'seconds':10,'speed':0.5}).status_code,200)
+            replay.assert_called_once_with(10.0,0.5,marker=None)
+        self.assertEqual(self.post('/api/replay',{'seconds':'ten'}).status_code,400)
+
     def test_external_source_validation_persistence_and_builtin_restoration(self):
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'score67'}).status_code, 400)
         self.assertEqual(self.post('/api/scoreboard/update', {'source':'other'}).status_code, 400)
@@ -776,8 +791,8 @@ class ConcurrencyRegressionTests(unittest.TestCase):
             launch.assert_called_once()
 
 
-class RecordingTests(unittest.TestCase):
-    """Recording lifecycle (engine state only, no processes) and the recordings store."""
+class EngineStateCase(unittest.TestCase):
+    """Engine state with mocked processes and a temporary recordings folder."""
     def setUp(self):
         from contextlib import ExitStack
         self.stack = self.enterContext(ExitStack())
@@ -804,6 +819,10 @@ class RecordingTests(unittest.TestCase):
             m._recording = m.recordings.create_session('720p', 'A vs B')
             m._want_record, m._recorder_proc = True, MagicMock(name='recorder')
 
+
+
+class RecordingTests(EngineStateCase):
+    """Recording lifecycle (engine state only, no processes) and the recordings store."""
     def test_stop_stream_while_recording_keeps_recording(self):
         self.running(key='key')
         pusher, recorder = m._youtube_proc, m._recorder_proc
@@ -927,6 +946,99 @@ class RecordingTests(unittest.TestCase):
             r.recover()
         info = r.get(sid)
         self.assertEqual((info['state'], info['duration']), ('unfinished', 42.0))
+
+
+class ReplayTests(EngineStateCase):
+    """Instant replay: where it reads from, how it is built, and how it ends."""
+    def setUp(self):
+        super().setUp()
+        for key, value in dict(_replay=None, _relay_zmq=None, _muted=False, _follow=False,
+                               _mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS}).items():
+            self.stack.enter_context(patch.object(m, key, value))
+        self.stack.enter_context(patch.object(m, 'get_mediamtx_running', return_value=True))
+        self.running()
+        m._active_camera = 'cam2'
+        r = m.recordings
+        r.new_part(m._recording); r.part_started(m._recording, 1000.0)
+        Path(self.tmp, m._recording, 'part-001.ts').write_bytes(b'x')
+        self.marker = r.add_marker(m._recording, 'Goal', wall=1040.0)
+        self.install = self.stack.enter_context(patch.object(m, '_install_replay', return_value=(True, 'Replay on air')))
+        self.stack.enter_context(patch.object(m.time, 'time', return_value=1060.0))
+
+    def replay_args(self):
+        generation, camera, replay = self.install.call_args.args
+        return camera, replay
+
+    def test_last_seconds_end_just_behind_the_recording(self):
+        self.assertTrue(m.play_replay(10)[0])
+        camera, replay = self.replay_args()
+        self.assertEqual(camera, 'cam2')  # returns to the live camera
+        self.assertAlmostEqual(replay['start'], 60 - m.REPLAY_MARGIN - 10, places=2)
+        self.assertEqual((replay['length'], replay['speed']), (10, 1.0))
+        self.assertTrue(replay['source'].endswith('part-001.ts'))
+
+    def test_highlight_replay_surrounds_the_marker(self):
+        self.assertTrue(m.play_replay(marker=self.marker['id'], speed=0.5)[0])
+        _, replay = self.replay_args()
+        self.assertEqual((replay['start'], replay['length'], replay['label'], replay['speed']), (32.0, 12.0, 'Goal', 0.5))
+
+    def test_replay_guards(self):
+        self.assertIn('slow motion', m.play_replay(10, 2.0)[1])
+        self.assertIn('3 to 30', m.play_replay(60)[1])
+        self.assertEqual(m.play_replay(marker='nope'), (False, 'Unknown highlight'))
+        with patch.object(m.time, 'time', return_value=1002.0):
+            self.assertEqual(m.play_replay(10), (False, 'Not enough has been recorded yet'))
+        m._want_record = False
+        self.assertEqual(m.play_replay(10), (False, 'Instant replay needs the recording on'))
+        self.install.assert_not_called()
+
+    def test_replay_command_plays_the_recording_under_the_live_mix(self):
+        with patch.object(m, '_probe', side_effect=AssertionError('replays must not probe the picture source')), \
+                patch.object(m, '_channel_available', return_value=True):
+            cmd, channels, *_ = m._relay_command('cam2', {'cam1': 0.0}, replay={
+                'source': '/rec/part-001.ts', 'start': 12.5, 'length': 10.0, 'speed': 0.5, 'label': 'Goal'})
+        self.assertEqual(cmd[cmd.index('-i') - 6:cmd.index('-i') + 2],
+                         ['-readrate', '0.5', '-ss', '12.50', '-t', '10.00', '-i', '/rec/part-001.ts'])
+        self.assertIn(m.RTSP_BASE + '/cam1', cmd)  # live commentary over the replay
+        self.assertNotIn(m.RTSP_BASE + '/cam2', cmd)
+        self.assertEqual(channels, {'cam1': 'm0'})
+        graph = cmd[cmd.index('-filter_complex') + 1]
+        self.assertIn("setpts=(PTS-STARTPTS)/0.5", graph)
+        self.assertIn("text='SLOW-MO REPLAY'", graph)
+        self.assertIn('tpad=stop=-1:stop_mode=clone', graph)  # held until live takes over
+
+    def test_relays_alternate_control_ports_for_seamless_switching(self):
+        first = m._spare_zmq()
+        m._relay_zmq = first
+        self.assertNotEqual(m._spare_zmq(), first)
+        m._relay_zmq = m._spare_zmq()
+        self.assertEqual(m._spare_zmq(), first)
+
+    def test_cut_ends_replay_and_tally_follows(self):
+        m._replay = {'camera': 'cam2', 'generation': 0, 'label': 'Replay', 'speed': 1.0, 'ends_at': 0}
+        m._relay_proc.healthy.return_value = True
+        self.assertIsNone(m.get_active_camera())  # the camera is not on air during a replay
+        self.assertFalse(m.get_stream_status()['fallback'])
+        listener = MagicMock()
+        m._replay_listeners.append(listener)
+        self.addCleanup(m._replay_listeners.remove, listener)
+        candidate = MagicMock()
+        with patch.object(m, '_relay_command', return_value=(['ffmpeg'], {}, set(), '', None, '')), \
+                patch.object(m, 'Process', return_value=candidate), patch.object(m, '_wait_progress', return_value=True):
+            old = m._relay_proc
+            self.assertTrue(m.switch_camera('cam3')[0])
+        self.assertIsNone(m._replay)
+        listener.assert_called_once_with(False)
+        self.assertIs(m._relay_proc, candidate)
+        self.kill.assert_called_with(old)  # replaced only after the new relay was on air
+
+    def test_failed_cut_keeps_the_current_relay_on_air(self):
+        old = m._relay_proc
+        with patch.object(m, '_relay_command', return_value=(['ffmpeg'], {}, set(), '', None, '')), \
+                patch.object(m, 'Process'), patch.object(m, '_wait_progress', return_value=False):
+            self.assertFalse(m.switch_camera('cam3')[0])
+        self.assertIs(m._relay_proc, old)
+        self.assertNotIn(unittest.mock.call(old), self.kill.call_args_list)
 
 
 if __name__=='__main__':

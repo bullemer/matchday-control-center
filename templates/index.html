@@ -123,6 +123,14 @@
     /* Recording & highlights */
     .rec-badge { display: inline-flex; align-items: center; gap: .25rem; background: #dc2626; color: #fff; font-weight: 700; font-size: .75rem; padding: .2rem .5rem; border-radius: .375rem; white-space: nowrap; animation: mute-pulse 1.6s ease-in-out infinite; }
     .rec-badge.hidden { display: none; }
+    .replay-badge { background: #7c3aed; }
+    .replay-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #7c3aed; color: #fff; white-space: nowrap; }
+    .replay-btn:hover { background: #8b5cf6; }
+    .replay-btn:disabled { opacity: .6; cursor: wait; }
+    .live-btn { padding: .6rem 1rem; border-radius: .5rem; font-weight: 700; background: #16a34a; color: #fff; white-space: nowrap; }
+    .live-btn:hover { background: #22c55e; }
+    .replay-select { background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: .5rem; padding: .5rem; font-size: .875rem; }
+    .outdoor-mode .replay-select { background: #f1f5f9; color: #020617; border: 2px solid #0f172a; }
     .chip { font-size: .75rem; font-weight: 700; padding: .15rem .5rem; border-radius: .375rem; white-space: nowrap; }
     .chip-green { background: #166534; color: #dcfce7; }
     .chip-amber { background: #92400e; color: #fef3c7; }
@@ -135,6 +143,7 @@
     .rec-action { display: inline-flex; align-items: center; gap: .25rem; padding: .4rem .7rem; border-radius: .5rem; font-size: .85rem; font-weight: 600; background: #334155; color: #e2e8f0; }
     .rec-action:hover { background: #475569; }
     .rec-danger { color: #fca5a5; }
+    .rec-action[hidden] { display: none; }
     .rec-card { background: #0f172a; border: 1px solid #334155; border-radius: .75rem; padding: .9rem; }
     .marker-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; padding: .4rem .5rem; background: #1e293b; border: 1px solid #334155; border-radius: .5rem; }
     .marker-row select { background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: .375rem; padding: .2rem .4rem; font-size: .85rem; }
@@ -280,10 +289,11 @@
         <!-- RTMP Server -->
         <span class="flex items-center gap-1.5" title="RTMP Server">
           <span id="status-rtmp-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></span>
-          <span class="text-slate-300">RTMP</span>
+          <span class="hidden sm:inline text-slate-300">RTMP</span>
         </span>
         <!-- Recording -->
         <span id="status-rec-badge" class="rec-badge hidden" title="Recording to this laptop">⏺ REC</span>
+        <span id="status-replay-badge" class="rec-badge replay-badge hidden" title="A replay is on air">⏪ REPLAY</span>
         <!-- YouTube Stream -->
         <span id="status-yt-badge"
               class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-400">
@@ -399,9 +409,15 @@
           <span data-bind="yt_state" class="px-2 py-1 rounded text-xs font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           <span data-bind="yt_duration" class="font-mono text-lg text-white">00:00:00</span>
           <span data-rec-badge class="rec-badge hidden" title="Recording to this laptop">⏺ REC</span>
-          <div class="ml-auto flex gap-2">
+          <span data-replay-badge class="rec-badge replay-badge hidden">⏪ REPLAY</span>
+          <div class="ml-auto flex flex-wrap gap-2">
             <button data-when-recording onclick="markHighlight()" aria-label="Mark highlight" title="Mark highlight (H)"
                     class="mark-btn hidden px-3 py-3">⭐</button>
+            <button data-when-replay-ready onclick="playReplay(1)" aria-label="Instant replay" title="Instant replay (R)"
+                    class="replay-btn hidden px-3 py-3">⏪</button>
+            <button data-when-replay-ready onclick="playReplay(0.5)" aria-label="Slow-motion replay" title="Slow-motion replay (S)"
+                    class="replay-btn hidden px-3 py-3">🐢</button>
+            <button data-when-replay-on onclick="backToLive()" class="live-btn hidden px-3 py-3">⏹ Live</button>
             <button data-when-streaming onclick="stopStream()"
                     class="hidden bg-slate-600 hover:bg-slate-500 text-white font-bold px-4 py-3 rounded-lg">⏹ Stop</button>
             <button data-when-stopped onclick="matchGoLive()"
@@ -618,6 +634,23 @@
           <span>🎥 CUT TO CAM 3</span>
           <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
+      </div>
+
+      <!-- Instant replay -->
+      <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 mb-4 space-y-2">
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="text-sm text-slate-400">⏪ Instant replay:</span>
+          <button data-when-replay-ready onclick="playReplay(1)" class="replay-btn hidden">⏪ Replay</button>
+          <button data-when-replay-ready onclick="playReplay(0.5)" class="replay-btn hidden">🐢 Slow-mo</button>
+          <select id="replay-seconds" data-when-replay-ready aria-label="Replay length" class="replay-select hidden"
+                  onchange="storeSet('mcc-replay-seconds', this.value)">
+            <option value="6">last 6 s</option><option value="10" selected>last 10 s</option>
+            <option value="15">last 15 s</option><option value="20">last 20 s</option>
+          </select>
+          <button data-when-replay-on onclick="backToLive()" class="live-btn hidden">⏹ Back to live</button>
+          <span data-bind="replay_status" class="text-sm text-slate-300"></span>
+        </div>
+        <p data-when-replay-off class="text-xs text-slate-500">Replays need the recording on (⏺ in the YouTube Stream &amp; Recording panel). Keys in Match mode: R replay, S slow-mo.</p>
       </div>
 
       <!-- Audio Source Toggle -->
@@ -1014,6 +1047,7 @@
       matchMode: false,
       tab: 'main',
       recording: {active: false},
+      replay: {active: false, available: false},
       muted: false,
       matchPreview: true,
       lastOverlayUpdate: 0,
@@ -1284,7 +1318,8 @@
       document.body.classList.toggle('outdoor-mode', isOutdoor);
       const toggle = document.getElementById('outdoor-toggle');
       if (toggle) {
-        toggle.textContent = isOutdoor ? '🌙 Dark mode' : '☀️ Outdoor';
+        // Icon only on phones: the header must stay on two lines above the match controls.
+        toggle.innerHTML = isOutdoor ? '🌙<span class="hidden sm:inline"> Dark mode</span>' : '☀️<span class="hidden sm:inline"> Outdoor</span>';
         toggle.setAttribute('aria-pressed', String(isOutdoor));
         toggle.title = isOutdoor ? 'Switch to Dark Mode' : 'Switch to High-Contrast Outdoor Sunlight Mode';
       }
@@ -1323,12 +1358,14 @@
       document.getElementById('stream-key').focus();
     }
 
-    // Keys 1–3 cut cameras, M toggles mute and H marks a highlight in match mode (laptop keyboard).
+    // Match-mode keys (laptop keyboard): 1–3 cut, M mute, H highlight, R replay, S slow-motion replay.
     document.addEventListener('keydown', event => {
       if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
       if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
       if ((event.key === 'h' || event.key === 'H') && state.recording && state.recording.active) markHighlight();
+      if ((event.key === 'r' || event.key === 'R') && state.replay.available) playReplay(1);
+      if ((event.key === 's' || event.key === 'S') && state.replay.available) playReplay(0.5);
       if (event.key === 'm' || event.key === 'M') toggleMute();
     });
 
@@ -1410,6 +1447,8 @@
           look = 'bg-brand-amber text-white pulse-live'; label = 'Switching…';
         } else if (cam === state.activeCam) {
           look = 'bg-brand-red text-white ring-2 ring-red-300'; label = 'On air';
+        } else if (cam === state.selectedCam && state.replay.active) {
+          look = 'bg-brand-amber text-white'; label = 'Back after replay';
         } else if (cam === state.selectedCam) {
           look = 'bg-red-950 text-red-200 ring-2 ring-red-500'; label = publishing ? 'Fallback — retrying' : 'Fallback — no signal';
         } else if (secondary && cam === state.secondaryCam) {
@@ -1478,6 +1517,38 @@
       if (result) loadRecordings(true);
     }
 
+    let replayPending = false;
+    function renderReplay(replay) {
+      const r = state.replay = replay || {active: false, available: false};
+      document.getElementById('status-replay-badge').classList.toggle('hidden', !r.active);
+      document.querySelectorAll('[data-replay-badge]').forEach(el => el.classList.toggle('hidden', !r.active));
+      document.querySelectorAll('[data-when-replay-ready]').forEach(el => { el.classList.toggle('hidden', !r.available); el.disabled = replayPending; });
+      document.querySelectorAll('[data-when-replay-on]').forEach(el => el.classList.toggle('hidden', !r.active));
+      document.querySelectorAll('[data-when-replay-off]').forEach(el => el.classList.toggle('hidden', r.available));
+      document.querySelectorAll('[data-marker-replay]').forEach(el => { el.hidden = !r.available; });
+      const left = r.active ? Math.max(0, Math.ceil(r.ends_at - Date.now() / 1000)) : 0;
+      bind('replay_status', r.active ? `${r.speed < 1 ? 'Slow-mo replay' : 'Replay'} on air · ${left} s` : '');
+      updateTallyButtons();
+    }
+
+    async function replayRequest(body) {
+      if (replayPending) return;
+      replayPending = true;
+      renderReplay(state.replay);
+      try { await apiPost('/api/replay', body); }
+      finally { replayPending = false; await pollStatus(); }
+    }
+    function playReplay(speed) {
+      return replayRequest({seconds: Number(document.getElementById('replay-seconds').value), speed});
+    }
+    function replayMarker(marker) {
+      return replayRequest({marker});
+    }
+    async function backToLive() {
+      await apiPost('/api/replay/stop');
+      await pollStatus();
+    }
+
     const recordingUrl = (id, name, download) =>
       `/recordings/${encodeURIComponent(id)}/${name.split('/').map(encodeURIComponent).join('/')}${download ? '?download=1' : ''}`;
     const recordingChips = {recording: ['⏺ REC', 'rec-badge'], finalizing: ['Saving…', 'chip chip-amber'], done: ['Ready', 'chip chip-green'],
@@ -1499,7 +1570,8 @@
         <span class="font-mono text-sm text-white">${esc(mk.time)}</span>
         <select onchange="relabelMarker('${esc(rec.id)}', '${esc(mk.id)}', this.value)" aria-label="Highlight type">${labels}</select>
         <span class="text-xs text-slate-400">${esc(detail)}</span>
-        <span class="ml-auto flex gap-1">${clip}
+        <span class="ml-auto flex gap-1">${rec.state === 'recording'
+          ? `<button class="rec-action" data-marker-replay ${state.replay.available ? '' : 'hidden'} onclick="replayMarker('${esc(mk.id)}')" title="Play this highlight as a replay on the stream">⏪ Replay</button>` : ''}${clip}
           <button class="rec-action rec-danger" onclick="deleteMarker('${esc(rec.id)}', '${esc(mk.id)}')" aria-label="Remove highlight">✕</button></span>
       </li>`;
     }
@@ -2388,6 +2460,7 @@
 
       // --- Audio Source ---
       renderRecording(stream.recording);
+      renderReplay(stream.replay);
       if (typeof stream.muted === 'boolean' && !mutePending) {
         state.muted = stream.muted;
         renderMute();
@@ -2467,6 +2540,8 @@
     state.matchMode = storeGet('mcc-mode') === 'match';
     state.matchPreview = storeGet('mcc-match-preview') !== 'off';
     document.getElementById('record-with-live').checked = storeGet('mcc-record-with-live') !== 'off';
+    const savedReplaySeconds = storeGet('mcc-replay-seconds');
+    if (['6', '10', '15', '20'].includes(savedReplaySeconds)) document.getElementById('replay-seconds').value = savedReplaySeconds;
     selectTab(storeGet('mcc-tab'));
     applyMode();
     applyOutdoorMode();

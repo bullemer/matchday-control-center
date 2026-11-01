@@ -532,3 +532,42 @@ test('recording controls, highlight marking and the Recordings tab', async ({pag
   await expect(page.locator('#status-rec-badge')).toBeHidden();
   await expect(start).toBeVisible();
 });
+
+test('instant replay controls follow the recording and drive the replay API', async ({page}) => {
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Main/}).click();
+  const multiview = page.locator('section[data-tab="main"]').first();
+  await expect(multiview.getByRole('button', {name: '⏪ Replay'})).toBeHidden();
+  await expect(multiview.getByText('Replays need the recording on')).toBeVisible();
+  await page.locator('[data-rec-start]').click();
+  await expect(multiview.getByRole('button', {name: '⏪ Replay'})).toBeVisible();
+  await page.locator('#replay-seconds').selectOption('15');
+  await multiview.getByRole('button', {name: '🐢 Slow-mo'}).click();
+  await expect(page.locator('#status-replay-badge')).toBeVisible();
+  await expect(multiview.locator('[data-bind="replay_status"]')).toContainText('Slow-mo replay on air');
+  await expect(page.locator('[data-cut="cam1"] [data-cut-state]').first()).toHaveText('Back after replay');
+  await multiview.getByRole('button', {name: '⏹ Back to live'}).click();
+  await expect(page.locator('#status-replay-badge')).toBeHidden();
+  // Match mode buttons and keys; the highlight replay in the Recordings tab.
+  await page.locator('#mode-toggle').click();
+  await expect(page.locator('#match-panel [aria-label="Instant replay"]')).toBeVisible();
+  await page.keyboard.press('r');
+  await expect(page.locator('#match-panel [data-replay-badge]')).toBeVisible();
+  await page.locator('#match-panel').getByRole('button', {name: '⏹ Live'}).click();
+  await page.keyboard.press('s');
+  await page.locator('#match-panel').getByRole('button', {name: '⏹ Live'}).click();
+  await page.locator('#mode-toggle').click();
+  await page.getByRole('tab', {name: /Recordings/}).click();
+  const live = page.locator('#recordings-list [data-rec]').first();
+  await live.locator('[data-marker]').first().getByRole('button', {name: '⏪ Replay'}).click();
+  await expect(page.locator('#status-replay-badge')).toBeVisible();
+  const done = page.locator('#recordings-list [data-rec]').nth(1);
+  await expect(done.getByRole('button', {name: '⏪ Replay'})).toHaveCount(0);  // only the running match
+  const calls = await (await page.request.get('/test/replay-calls')).json();
+  expect(calls.slice(0, 3)).toEqual([[15, 0.5, null], [15, 1, null], [15, 0.5, null]]);
+  expect(calls[3][2]).toMatch(/^m1-/);
+  await page.request.post('/api/replay/stop', {data: {}});
+  await page.getByRole('tab', {name: /Main/}).click();
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
+});

@@ -76,6 +76,8 @@ class BrowserOverlay:
         self._generation = 0
         self._state = {'state': 'off', 'message': '', 'updated_at': 0.0}
         self._thread = None
+        self._suspended = False
+        self._last = BLANK
 
     def configure(self, source, visible, url):
         desired = url if source == 'score67' and visible else ''
@@ -85,9 +87,16 @@ class BrowserOverlay:
             self._url = desired
             self._generation += 1
             # Clear immediately; an old in-flight screenshot may never restore this frame.
+            self._last = BLANK
             write_frame(self.path, BLANK)
             self._state = {'state': 'loading' if desired else 'off', 'message': '', 'updated_at': time.time()}
             self._wake.set()
+
+    def suspend(self, suspended):
+        """Hide the overlay (during an instant replay) without stopping the renderer."""
+        with self._lock:
+            self._suspended = bool(suspended)
+            write_frame(self.path, BLANK if suspended else self._last)
 
     def status(self):
         with self._lock:
@@ -109,7 +118,8 @@ class BrowserOverlay:
         with self._lock:
             if generation != self._generation or self._stop.is_set():
                 return False
-            write_frame(self.path, frame)
+            self._last = frame
+            write_frame(self.path, BLANK if self._suspended else frame)
             self._state = {'state': state, 'message': message, 'updated_at': time.time()}
             return True
 

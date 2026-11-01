@@ -74,6 +74,67 @@ def run():
             marker = m.recordings.add_marker(session, 'Goal', '12:00', 'Red 1-0 Blue')
             assert marker['offset'] > 5, marker
             print(f"PASS: highlight marked at {marker['offset']}s on the recording", flush=True)
+            def program_pixels():
+                result = subprocess.run(['ffmpeg','-v','error','-rtsp_transport','tcp','-timeout','5000000',
+                    '-i',f'{m.RTSP_BASE}/program','-an','-frames:v','1','-vf','scale=160:90',
+                    '-pix_fmt','rgb24','-f','rawvideo','-'],capture_output=True,timeout=15)
+                assert result.returncode == 0, result.stderr
+                frame = result.stdout
+                return lambda x, y: frame[(y*160+x)*3:(y*160+x)*3+3]
+            def watch_program(seconds):
+                """Average colour of every program frame (5 per second) while something switches."""
+                return subprocess.Popen(['ffmpeg','-v','error','-rtsp_transport','tcp','-i',f'{m.RTSP_BASE}/program',
+                    '-an','-t',str(seconds),'-vf','fps=5,scale=1:1','-pix_fmt','rgb24','-f','rawvideo','-'],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            def colours(watcher):
+                data = watcher.communicate(timeout=60)[0]
+                return [data[i:i+3] for i in range(0, len(data) - 2, 3)]
+            watcher = watch_program(12)
+            time.sleep(2)
+            started = time.monotonic()
+            assert m.switch_camera('cam2')[0]
+            cut_time = time.monotonic() - started
+            frames = colours(watcher)
+            dark = [c for c in frames if max(c) < 60]
+            assert len(frames) > 40 and not dark, (len(frames), dark[:5])
+            print(f'PASS: cut red→blue in {cut_time:.1f} s with the old picture on air until the switch ({len(frames)} frames, none black)', flush=True)
+            time.sleep(9)  # blue footage in the recording
+            assert m.switch_camera('cam1')[0]  # live is red again
+            recorder_pid = m._recorder_proc.proc.pid
+            watcher = watch_program(30)
+            time.sleep(2)
+            started = time.monotonic()
+            ok, message = m.play_replay(15)  # reaches back into the blue period
+            replay_start = time.monotonic() - started
+            assert ok, message
+            assert m.get_replay_status()['active'] and m.get_active_camera() is None
+            def replay_on_program():  # the first frame read may still be from the switch-over
+                px = program_pixels()
+                blue, label = px(80, 60), px(8, 6)
+                return blue[2] > 150 and blue[0] < 80 and label[0] > 150 and label[2] < 90
+            wait(replay_on_program, seconds=5)
+            assert not m.get_stream_status()['fallback']
+            wait(lambda: not m.get_replay_status()['active'] and m.get_active_camera() == 'cam1', seconds=25)
+            assert m._encoder_proc.proc.pid == encoder_pid and m._recorder_proc.proc.pid == recorder_pid
+            assert m.get_youtube_running()
+            frames = colours(watcher)
+            dark = [c for c in frames if max(c) < 60]
+            assert not dark, ('black frames around the replay', len(dark), len(frames))
+            print(f'PASS: replay on air after {replay_start:.1f} s, shows recorded footage with a REPLAY label, '
+                  f'returns to live; no black frames in {len(frames)}', flush=True)
+            assert m.play_replay(4, 0.5)[0]
+            on_air = time.monotonic()
+            wait(lambda: not m.get_replay_status()['active'], seconds=20)
+            airtime = time.monotonic() - on_air
+            assert 6 <= airtime <= 13, airtime  # 8 s of slow motion; live takes over when ready
+            print(f'PASS: slow-motion replay of 4 s is on air for {airtime:.1f} s', flush=True)
+            wait(lambda: m.get_active_camera() == 'cam1', seconds=15)
+            assert m.play_replay(marker=marker['id'])[0]
+            assert m.switch_camera('cam2')[0]  # operator cut ends the replay at once
+            assert not m.get_replay_status()['active'] and m.get_active_camera() == 'cam2'
+            time.sleep(2)
+            assert m.get_active_camera() == 'cam2' and m._encoder_proc.proc.pid == encoder_pid
+            print('PASS: highlight replay starts and an operator cut ends it', flush=True)
             def picture():
                 result = subprocess.run(['ffmpeg','-v','error','-rtsp_transport','tcp','-timeout','5000000',
                     '-i',f'{m.RTSP_BASE}/program','-an','-frames:v','1','-vf','scale=160:90',
@@ -145,6 +206,13 @@ def run():
             time.sleep(3)
             assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print('PASS: source loss keeps output alive on fallback', flush=True)
+            # The recording stays in step with real time across the camera loss (no audio flood).
+            info = m.recordings._load(session)
+            part = info['parts'][-1]
+            written = m.recordings._probe_duration(m.recordings.RECORDINGS_DIR / session / part['file'])
+            elapsed = time.time() - part['start']
+            assert abs(written - elapsed) < 5, ('recording timeline drifted', written, elapsed)
+            print(f'PASS: recording timeline in step with real time after camera loss ({written:.0f}s written, {elapsed:.0f}s elapsed)', flush=True)
             assert m.switch_camera('cam1')[0]
             assert m._encoder_proc.proc.pid == encoder_pid
             print('PASS: recovery to available camera', flush=True)

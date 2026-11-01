@@ -77,7 +77,11 @@ workers: the hardware process manager and live match state are process-local.
    highlight** (Main tab, Match mode, or key H in Match mode); a goal (+1) is marked
    automatically and withdrawn again by a −1 within two minutes. See *Recordings and
    highlights* below.
-8. STOP STREAM ends the YouTube broadcast; a running recording continues until **Stop
+8. **Instant replay** (needs the recording on): **⏪ Replay** plays the last 6–20 s
+   (choose in the Multiview panel), **🐢 Slow-mo** the same at half speed; in Match mode
+   ⏪ / 🐢 or keys R / S. Any highlight of the running match can be replayed from the
+   🎬 Recordings tab. See *Instant replay* below.
+9. STOP STREAM ends the YouTube broadcast; a running recording continues until **Stop
    recording**. Stopping whichever runs last also stops the encoder and camera relay. Ctrl+C / SIGTERM also cleans up the
    managed media processes. The hotspot remains under its explicit start/stop controls.
 
@@ -105,10 +109,11 @@ show all active mixed inputs rather than guessing an input.
 The program preview is before the scoreboard overlay; its audio meter measures the
 local program, not YouTube reception. Clipboard denial offers a manual copy fallback.
 
-A cut probes the new source before stopping the old relay. Probing and waiting for
-frames never block STOP, status, or other controls; a newer cut supersedes one still in
-progress, and STOP aborts it. During relay replacement,
-the fallback may be visible: this is **not a promise of frame-perfect switching**.
+A cut probes the new source and starts the new relay while the old one stays on air
+(relays alternate between two local control ports, so both can run briefly). Probing
+and waiting for frames never block STOP, status, or other controls; a newer cut
+supersedes one still in progress, and STOP aborts it. The handover itself is not
+frame-accurate, but the fallback picture is no longer shown during a cut.
 An invalid source leaves the existing relay intact. A failed replacement preserves
 the previous selection for recovery. Audio changes also restart the relay.
 
@@ -161,6 +166,24 @@ still being recorded. **Build highlight reel** joins all clips in match order in
 description of the uploaded recording (it matches this file, not YouTube's own
 live-stream archive).
 
+## Instant replay
+
+A replay plays part of the running recording into the program: the picture as it was
+on air (layout and the scoreboard of that moment included) with a red **REPLAY** label,
+while the live commentary mix (and mute) continues over it. The live scoreboard is
+hidden during the replay so the two never overlap. The replay starts 1.5 s behind the
+live recording edge; a highlight replay runs from 8 s before to 4 s after the mark.
+When the clip ends, the program returns to the live camera by itself: the live relay
+starts shortly before the end and takes over as soon as it is ready, holding the
+replay's last frame meanwhile. **⏹ Back to live**, any camera cut, a layout change or
+STOP ends a replay at once. Camera tallies do not show ON AIR during a replay.
+Replays show the angle that was on air; other angles would need per-camera recording.
+
+Switching is seamless for camera cuts as well: a new relay starts while the current one
+stays on air, and MediaMTX hands the program over the moment the new picture is ready,
+so viewers do not see the fallback picture during a cut. A cut that fails leaves the
+current picture on air.
+
 ## Video layouts
 
 Use **Layout** above the program preview in Match mode, or beside Multiview in Setup.
@@ -173,8 +196,8 @@ The scoreboard is applied over the composed output, so top corners are preferabl
 
 If the second camera disappears, recovery rebuilds a main-only view and restores the
 chosen composition when it returns. Main-camera loss uses the existing program fallback.
-Layout changes replace the relay while keeping the YouTube encoder alive; fallback may
-briefly appear during replacement. Layout selections are kept for the current app session.
+Layout changes replace the relay while keeping the YouTube encoder alive; the current
+picture stays on air until the new layout is ready. Layout selections are kept for the current app session.
 
 ## Scoreboard sources
 
@@ -223,6 +246,8 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/stream/stop` | Stop the YouTube stream (a recording continues) |
 | POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
 | POST | `/api/recording/stop` | Stop recording and save the MP4 (a YouTube stream continues) |
+| POST | `/api/replay` | Instant replay: `seconds` (3–30) and `speed` (1 or 0.5), or `marker` (highlight id) |
+| POST | `/api/replay/stop` | Back to live now |
 | POST | `/api/markers` | Mark a highlight now on the running recording, optional `label` |
 | GET | `/api/recordings` | Recordings with highlights, chapters and free disk space |
 | POST | `/api/recordings/<id>/markers/<marker>` | `label`, or `delete: true` |

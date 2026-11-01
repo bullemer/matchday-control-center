@@ -12,8 +12,17 @@ a.get_camera_status=lambda: {'cam1':True,'cam2':False,'cam3':False,'program':Tru
 recording={'active':False,'session':None}
 a.get_recording_status=lambda: {'active':recording['active'],'session':recording['session'] if recording['active'] else None,
                                 'writing':True,'warning':'','duration':65.0,'bytes':150*1024**2,'markers':1}
-a.get_stream_status=lambda: {'active':False,'state':'stopped','active_camera':None,'audio_source':'active','audio_on_air':['cam1'],'error':'','fallback':True,
-                             'recording':a.get_recording_status()}
+replay={'active':False,'calls':[]}
+a.get_replay_status=lambda: ({'active':True,'available':True,'label':'Replay','speed':replay['speed'],'ends_at':__import__('time').time()+8,'camera':'cam1'}
+                             if replay['active'] else {'active':False,'available':recording['active']})
+a.play_replay=lambda seconds=10,speed=1.0,marker=None: (replay['calls'].append([seconds,speed,marker]) or replay.update(active=True,speed=speed) or True,'Replay on air (10 s)')
+a.stop_replay=lambda: (replay.update(active=False) or True,'Back to live')
+a.get_stream_status=lambda: {'active':False,'state':'stopped','active_camera':None,'selected_camera':'cam1' if replay['active'] else None,
+                             'audio_source':'active','audio_on_air':['cam1'],'error':'','fallback':not replay['active'],
+                             'recording':a.get_recording_status(),'replay':a.get_replay_status()}
+@a.app.route('/test/replay-calls')
+def replay_calls():
+    return a.jsonify(replay['calls'])
 a.start_recording=lambda profile,title='': (recording.update(active=True) or True,'Recording starting')
 a.stop_recording=lambda: (recording.update(active=False) or True,'Recording stopped; saving the file')
 a.switch_camera=lambda camera: (False,'Camera unavailable')

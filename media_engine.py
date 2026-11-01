@@ -66,6 +66,7 @@ _relay_muted = set()     # installed channels successfully muted in the running 
 _relay_missing = set()   # channels wanted by the running relay but unavailable at build
 _audio_warning = ""
 ZMQ_ADDRESS = "tcp://127.0.0.1:28765"
+_relay_zmq = None        # live-volume control address of the running relay
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
 _relay_retry_at = 0.0
@@ -78,6 +79,13 @@ _recording = None         # active recording session id
 _push_retry_at = _rec_retry_at = _disk_check_at = 0.0
 _push_failures = _rec_failures = 0
 _record_warning = ""
+# Instant replay: a temporary relay plays part of the running recording into program.
+# _active_camera keeps the live camera to return to; any cut or STOP ends the replay.
+_replay = None
+_replay_listeners = []    # called with True/False when a replay goes on/off air
+REPLAY_MARGIN = 1.5       # seconds behind the recording's write position
+REPLAY_SPEEDS = (1.0, 0.5)
+REPLAY_LEAD = 1.5         # start the return-to-live relay this long before the clip ends
 _state = "stopped"
 _error = ""
 _started_at = None
@@ -414,7 +422,7 @@ def get_camera_status():
 
 def get_active_camera():
     relay = _relay_proc
-    return _active_camera if relay and relay.healthy() else None
+    return _active_camera if relay and relay.healthy() and not _replay else None
 
 
 def get_audio_source():
@@ -465,8 +473,29 @@ def get_stream_status():
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
             "started_at": _started_at,
-            "error": _error, "profile": _profile, "fallback": get_active_camera() is None,
-            "recording": get_recording_status()}
+            "error": _error, "profile": _profile, "fallback": get_active_camera() is None and not _replay,
+            "recording": get_recording_status(), "replay": get_replay_status()}
+
+
+def get_replay_status():
+    replay = _replay
+    status = {"active": bool(replay), "available": bool(_want_stream and _want_record and _recording)}
+    if replay:
+        status.update(label=replay["label"], speed=replay["speed"], ends_at=replay["ends_at"],
+                      camera=replay["camera"])
+    return status
+
+
+def add_replay_listener(listener):
+    _replay_listeners.append(listener)
+
+
+def _notify_replay(active):
+    for listener in list(_replay_listeners):
+        try:
+            listener(active)
+        except Exception:
+            logger.exception("Replay listener failed")
 
 
 def get_recording_status():
@@ -540,20 +569,41 @@ def _video_filters(width, height, secondary_index, layout):
             f"[main][inset]overlay=x={x}:y={y}:eof_action=pass:repeatlast=0[vout]"]
 
 
-def _relay_command(cam, wanted):
+def _replay_filter(width, height, replay):
+    """Replay picture, slowed for slow motion, with a REPLAY label (top left: the
+    scoreboard burned into the recording stays visible at the bottom)."""
+    font = round(height / 22)
+    label = "SLOW-MO REPLAY" if replay["speed"] < 1 else "REPLAY"
+    return (f"[0:v:0]setpts=(PTS-STARTPTS)/{replay['speed']:g},scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30,"
+            # Hold the last frame until the live relay takes over: never a black gap.
+            f"tpad=stop=-1:stop_mode=clone,"
+            f"drawtext=text='{label}':expansion=none:fontcolor=white:fontsize={font}:box=1:"
+            f"boxcolor=0xdc2626@0.95:boxborderw={font // 3}:x={font}:y={font}[vout]")
+
+
+def _relay_command(cam, wanted, replay=None):
     """Return command, channel filters, missing audio, audio warning, second camera,
     and video warning for cutting
     to cam with the wanted {channel: gain dB} mix. Only missing video is fatal: if no
     wanted audio source is available, the camera's own sound (or silence) is used so the
-    picture never goes to fallback because of a microphone."""
-    tracks = _probe(cam)
-    if "video" not in tracks:
-        raise ValueError(f"{cam} has no video")
-    cmd = _ffmpeg() + _input(cam)
+    picture never goes to fallback because of a microphone.
+    With replay, the picture comes from the recording and the live mix plays over it."""
+    if replay:
+        cam, tracks = None, {"video"}
+        cmd = _ffmpeg() + ["-readrate", f"{replay['speed']:g}", "-ss", f"{replay['start']:.2f}",
+                           "-t", f"{replay['length']:.2f}", "-i", replay["source"]]
+        layout = {"mode": "single"}
+        inputs_by_camera = {}
+    else:
+        tracks = _probe(cam)
+        if "video" not in tracks:
+            raise ValueError(f"{cam} has no video")
+        cmd = _ffmpeg() + _input(cam)
+        layout = dict(_layout)
+        inputs_by_camera = {cam: (0, tracks)}
     sources, missing, notes, next_input = [], set(), [], 1
-    layout = dict(_layout)
     secondary, secondary_index, video_warning = None, None, ""
-    inputs_by_camera = {cam: (0, tracks)}
     if layout["mode"] != "single":
         selected = layout["secondary"]
         if selected == cam:
@@ -584,7 +634,8 @@ def _relay_command(cam, wanted):
                 missing.add(channel)
                 notes.append(f"{channel} has no audio")
         elif channel in CAMERA_IDS:
-            if _channel_available(channel):
+            # A replay reuses what the live relay already plays instead of probing again.
+            if (replay and channel in _relay_channels) or _channel_available(channel):
                 sources.append((channel, f"{next_input}:a:0", gain))
                 cmd += _input(channel)
                 next_input += 1
@@ -608,7 +659,9 @@ def _relay_command(cam, wanted):
         warning += "; broadcasting silence"
     # Generated silence is the first mix input, so the mix never ends when a source does.
     inputs = next_input
-    cmd += ["-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
+    # Paced to real time: once the camera picture ends, unpaced silence would flood program
+    # (and the recording) with minutes of audio per second until the relay is replaced.
+    cmd += ["-re", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
     parts, labels, channels = [], [], {}
     for index, (channel, pad, gain) in enumerate(sources):
         name = f"m{index}"
@@ -616,17 +669,25 @@ def _relay_command(cam, wanted):
                      f"volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}[{name}]")
         labels.append(f"[{name}]")
         channels[channel] = name
-    address = ZMQ_ADDRESS.replace(":", "\\\\:")  # escaped twice: filter option, then graph
+    address = _spare_zmq().replace(":", "\\\\:")  # escaped twice: filter option, then graph
     parts.append(f"[{inputs}:a:0]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:"
                  f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0,"
                  f"azmq=bind_address={address}[aout]")
     width, height, _, bitrate = PROFILES[_profile]
-    parts += _video_filters(width, height, secondary_index, layout)
+    parts += [_replay_filter(width, height, replay)] if replay else _video_filters(width, height, secondary_index, layout)
     return cmd + ["-filter_complex", ";".join(parts), "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
         "-c:a", "aac", "-ar", "48000", "-ac", "2",
         "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"], channels, missing, warning, secondary, video_warning
+
+
+def _spare_zmq():
+    """Relays alternate between two control ports, so the next relay can start while
+    the current one is still on air (a seamless switch)."""
+    host, port = ZMQ_ADDRESS.rsplit(":", 1)
+    alternate = f"{host}:{int(port) + 1}"
+    return alternate if _relay_zmq == ZMQ_ADDRESS else ZMQ_ADDRESS
 
 
 def _send_volume(name, volume):
@@ -636,7 +697,7 @@ def _send_volume(name, volume):
     for option, value in ((zmq.LINGER, 0), (zmq.RCVTIMEO, 1000), (zmq.SNDTIMEO, 1000)):
         sock.setsockopt(option, value)
     try:
-        sock.connect(ZMQ_ADDRESS)
+        sock.connect(_relay_zmq or ZMQ_ADDRESS)
         sock.send_string(f"volume@{name} volume {volume:.4f}")
         return sock.recv_string().startswith("0 ")
     except zmq.ZMQError:
@@ -686,7 +747,8 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
 
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
-    global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout
+    global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout, _replay
+    global _relay_zmq
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
@@ -701,8 +763,9 @@ def _replace_relay(cam_id, generation):
     with _lock:
         if not current():
             return False, SUPERSEDED
-        old, _relay_proc = _relay_proc, None
-    _kill_process(old)
+        old, zmq = _relay_proc, _spare_zmq()
+    # The current relay stays on air while the new one starts; when the new one
+    # publishes, MediaMTX hands program over to it at once (no fallback gap).
     try:
         candidate = Process(cmd)
     except OSError as exc:
@@ -711,13 +774,21 @@ def _replace_relay(cam_id, generation):
     ok = _wait_progress(candidate, aborted=lambda: not current())
     with _lock:
         installed = ok and current()
+        ended_replay = installed and _replay is not None
         if installed:
+            _replay, _relay_zmq = None, zmq
+            if _relay_proc is old:
+                _relay_proc = None
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
             _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
             _layout = {**_layout, "main": cam_id}
             _error, _relay_failures = "", 0
+    if installed:
+        _kill_process(old)
+    if ended_replay:
+        _notify_replay(False)
     if installed:
         if warning:
             logger.warning("Relay %s: %s", cam_id, warning)
@@ -730,6 +801,132 @@ def _replace_relay(cam_id, generation):
     # camera is publishing, and program shows fallback meanwhile.
     _error = message
     return False, message
+
+
+def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0):
+    """Put a replay on air: the last `seconds`, or around a highlight marker of the
+    running recording. Returns to the live camera when it ends."""
+    global _generation, _pending_camera
+    if speed not in REPLAY_SPEEDS:
+        return False, "Choose normal speed or slow motion"
+    if marker is None and not 3 <= seconds <= 30:
+        return False, "Replay length must be 3 to 30 seconds"
+    with _lock:
+        if not _want_stream or not get_mediamtx_running():
+            return False, "Go live or start recording first"
+        if not (_want_record and _recording):
+            return False, "Instant replay needs the recording on"
+        session = _recording
+        camera = _replay["camera"] if _replay else _active_camera
+    info = recordings.get(session, live_wall=time.time())
+    recorded = info["duration"] - REPLAY_MARGIN
+    if marker is not None:
+        found = next((m for m in info["markers"] if m["id"] == marker), None)
+        if found is None:
+            return False, "Unknown highlight"
+        start, label = found["offset"] - pre, found["label"]
+        length = pre + post
+    else:
+        start, length, label = recorded - seconds, seconds, "Replay"
+    start = max(0.0, start)
+    length = min(length, recorded - start)
+    if length < 2:
+        return False, "Not enough has been recorded yet"
+    try:
+        source, offset = recordings.source_at(session, start)
+    except ValueError as exc:
+        return False, str(exc)
+    with _lock:
+        _generation += 1
+        _pending_camera = None
+        generation = _generation
+    with _switch_lock:
+        return _install_replay(generation, camera, {"source": str(source), "start": offset, "length": length,
+                                                    "speed": speed, "label": label})
+
+
+def _install_replay(generation, camera, replay):
+    global _relay_proc, _relay_channels, _relay_missing, _relay_muted, _audio_warning
+    global _relay_secondary, _error, _replay, _relay_zmq
+    current = lambda: generation == _generation
+    if not current():
+        return False, SUPERSEDED
+    wanted = _effective_mix(camera) if camera else {}
+    try:
+        cmd, channels, missing, warning, _, _ = _relay_command(camera, wanted, replay=replay)
+    except Exception as exc:
+        return False, str(exc)
+    with _lock:
+        if not current():
+            return False, SUPERSEDED
+        old, zmq = _relay_proc, _spare_zmq()
+    try:
+        candidate = Process(cmd)  # live stays on air until the replay publishes
+    except OSError as exc:
+        return False, f"Cannot start replay: {exc}"
+    ok = _wait_progress(candidate, timeout=8, aborted=lambda: not current())
+    airtime = replay["length"] / replay["speed"]
+    with _lock:
+        installed = ok and current()
+        if installed:
+            _relay_proc, _relay_channels, _relay_missing, _relay_zmq = candidate, channels, missing, zmq
+            _relay_muted = set(channels) if _muted else set()
+            _audio_warning, _relay_secondary = warning, None
+            _replay = {**replay, "camera": camera, "generation": generation, "ends_at": time.time() + airtime}
+    if not installed:
+        message = candidate.error or "Replay did not start"
+        _kill_process(candidate)  # live (if still publishing) simply stays on air
+        return False, SUPERSEDED if not current() else message
+    _kill_process(old)
+    _notify_replay(True)
+    threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime),
+                     daemon=True, name="replay-watcher").start()
+    kind = "Slow-motion replay" if replay["speed"] < 1 else "Replay"
+    return True, f"{kind} on air ({airtime:.0f} s)"
+
+
+def _watch_replay(proc, generation, camera, airtime):
+    """Shortly before the clip ends, start the live relay; it takes over from the replay's
+    held last frame as soon as it is ready. An operator cut or STOP ends this early."""
+    global _replay, _relay_proc
+    returning = time.monotonic() + max(0.0, airtime - REPLAY_LEAD)
+    while proc.poll() is None and generation == _generation and time.monotonic() < returning:
+        time.sleep(.1)
+    while camera and proc.poll() is None and generation == _generation:
+        ok, message = switch_camera(camera, automatic=True)  # never overrides an operator cut
+        if ok or message == SUPERSEDED:
+            return
+        if message != BUSY:
+            logger.warning("Back to live after replay: %s", message)
+            break
+        time.sleep(.5)  # an operator cut is in progress; it ends the replay itself
+    with _lock:
+        ended = _replay is not None and _replay["generation"] == generation
+        if ended:
+            # The live camera could not be restored: leave it to the supervisor.
+            _replay = None
+            if _relay_proc is proc:
+                _relay_proc = None
+    if ended:
+        _kill_process(proc)
+        _notify_replay(False)
+
+
+def stop_replay():
+    """Back to live now."""
+    global _replay, _relay_proc
+    with _lock:
+        if not _replay:
+            return False, "No replay on air"
+        camera = _replay["camera"]
+    if camera:
+        ok, message = switch_camera(camera)
+        return ok, "Back to live" if ok else message
+    with _lock:
+        relay, _relay_proc, _replay = _relay_proc, None, None
+    _kill_process(relay)
+    _notify_replay(False)
+    return True, "Back to live"
 
 
 def set_layout(mode, main, secondary="cam2", position="top-right"):
@@ -1095,8 +1292,9 @@ def _stop_all(finalize=True):
     global _want_stream, _youtube_proc, _relay_proc, _active_camera, _generation
     global _youtube_stream_key, _state, _error, _started_at, _pending_camera, _encoder_proc
     global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
-    global _recorder_proc, _want_record, _recording, _record_warning
+    global _recorder_proc, _want_record, _recording, _record_warning, _replay, _relay_zmq
     with _lock:
+        ended_replay, _replay = _replay is not None, None
         _want_stream = False
         _stop_generation += 1
         _generation += 1  # abort any cut in flight
@@ -1107,8 +1305,11 @@ def _stop_all(finalize=True):
         _state, _error = "stopped", ""
         _relay_secondary, _layout_warning = None, ""
         session, _recording, _want_record, _record_warning = _recording, None, False, ""
+        _relay_zmq = None
     for proc in processes:
         _kill_process(proc)
+    if ended_replay:
+        _notify_replay(False)
     if session:
         recordings.close_part(session)
         if finalize:
@@ -1122,9 +1323,14 @@ def _supervise_relay(now):
     a degraded relay once that source is available again. Never holds _lock while slow."""
     global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at
     with _lock:
+        if _replay:
+            return  # the replay watcher returns to the live camera
         relay, camera = _relay_proc, _active_camera
         channels, missing = dict(_relay_channels), set(_relay_missing)
-        dead = relay and (relay.poll() is not None or
+        # A relay whose picture stalled while its camera stopped publishing is finished:
+        # replace it with fallback now instead of after the general 15 s health window.
+        stalled = relay and relay.last_progress and now - relay.last_progress > 3 and not _camera_status.get(camera)
+        dead = relay and (relay.poll() is not None or stalled or
                           (not relay.healthy() and now - relay.launched > 15))
         if dead:
             _relay_proc = None
