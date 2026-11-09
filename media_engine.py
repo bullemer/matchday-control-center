@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import platform
 import re
-import secrets
 import shutil
 import signal
 import subprocess
