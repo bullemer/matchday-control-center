@@ -84,7 +84,6 @@ _relay_slot = 0
 # instead of its "STREAM IS OFFLINE" segment.
 OFFLINE_CARD = str(BASE / "data/offline.mp4")
 CAMERA_USER = "camera"
-CAMERA_PASSWORD_FILE = str(BASE / "data/camera-password")
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
 _relay_retry_at = 0.0
@@ -404,30 +403,23 @@ def program_path():
 
 
 def camera_password():
-    """The password in every camera URL, kept across restarts so saved links keep working."""
-    configured = os.environ.get("MCC_CAMERA_PASSWORD")
-    if configured:
-        return configured
-    path = Path(CAMERA_PASSWORD_FILE)
-    if not path.exists():
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as output:
-            output.write(secrets.token_urlsafe(12))
-    return path.read_text().strip()
+    """Password for publishing a camera; empty (the default) means no password."""
+    return os.environ.get("MCC_CAMERA_PASSWORD", "")
 
 
 def generate_mediamtx_config():
     # A continuous program path supplies video + silence during cuts/source loss.
-    # Program publishing is loopback-only; phones need the camera password for camera paths.
+    # Program publishing is loopback-only; phones may publish only camera paths.
+    password = camera_password()
+    camera_publish = [{"action": "publish", "path": "~^cam[123]$"}]
     config = {
         "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
         "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
         "rtmp": True, "rtmpAddress": ":1935", "hls": True, "hlsAddress": ":8888",
         "webrtc": True, "webrtcAddress": ":8889", "srt": False, "moq": False,
         "authInternalUsers": [
-            {"user": CAMERA_USER, "pass": camera_password(), "ips": [], "permissions": [
-                {"action": "publish", "path": "~^cam[123]$"}]},
+            {"user": CAMERA_USER, "pass": password, "ips": [], "permissions": camera_publish}
+            if password else {"user": "any", "ips": [], "permissions": camera_publish},
             {"user": "any", "ips": [], "permissions": [{"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
                 {"action": "api"}, {"action": "publish", "path": "~^(program|final|cam[123])$"}]},

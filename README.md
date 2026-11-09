@@ -174,9 +174,9 @@ connection loss explicitly. “Live” indicates the local encoder is producing 
 check YouTube Studio, Live Producer or the Twitch dashboard to confirm platform-side reception.
 
 MediaMTX's control API and RTSP transport are loopback-only. Program publishing is
-loopback-only. Publishing a camera needs the camera password, which is part of every
-link and QR code on the dashboard and is kept in `data/camera-password` (or set
-`MCC_CAMERA_PASSWORD`). Preview reading is available on the LAN. A camera that reconnects
+loopback-only. By default anyone on the hotspot can publish a camera. To require a password,
+set `MCC_CAMERA_PASSWORD`; it is then part of every link and QR code on the dashboard, and
+any saved camera link, including the Raspberry Pi's, must be updated. Preview reading is available on the LAN. A camera that reconnects
 takes over its own stale session, so do not give two phones the same camera link. Publishing to the output encoder's `final` path is loopback-only too. Ports: TCP 5000 (control), 1935 (camera
 RTMP), 8888 (HLS), 8889 (WebRTC signaling), and UDP 8189 (WebRTC media).
 Firewall diagnostics distinguish listening sockets from verified remote reachability;

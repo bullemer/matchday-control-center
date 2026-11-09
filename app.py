@@ -226,6 +226,11 @@ def api_endpoint(f):
 
 # --- UI ---------------------------------------------------------------
 
+def _camera_query():
+    password = camera_password()
+    return f"?user={CAMERA_USER}&pass={quote(password, safe='')}" if password else ""
+
+
 @app.route("/")
 def index():
     """Serve the main dashboard UI."""
@@ -235,7 +240,7 @@ def index():
     destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
     return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
-                           camera_query=f"?user={CAMERA_USER}&pass={quote(camera_password(), safe='')}")
+                           camera_query=_camera_query())
 
 
 @app.route("/tally/<cam_id>")
@@ -246,7 +251,7 @@ def tally_page(cam_id):
     host = urlsplit(request.host_url).hostname or "localhost"
     if ":" in host:
         host = f"[{host}]"
-    return render_template("tally.html", cam_id=cam_id, media_host=host)
+    return render_template("tally.html", cam_id=cam_id, media_host=host, show_url=not camera_password())
 
 
 @app.route("/api/tally/<cam_id>")

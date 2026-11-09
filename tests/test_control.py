@@ -171,6 +171,13 @@ class ApiTests(unittest.TestCase):
             t=self.client.get('/api/tally/cam1').get_json()
         self.assertEqual((t['on_air'],t['selected'],t['stream_active']),(True,False,True))
 
+    def test_camera_links_have_no_password_by_default(self):
+        with patch.dict(os.environ,{'MCC_CAMERA_PASSWORD':''}):
+            page=self.client.get('/',headers=self.headers).get_data(as_text=True)
+            tally=self.client.get('/tally/cam1').get_data(as_text=True)
+        self.assertNotIn('pass=',page.split('cameraQuery =')[1][:40])
+        self.assertIn('RTMP Publishing URL',tally)
+
     def test_camera_links_carry_the_password_only_behind_login(self):
         page=self.client.get('/',headers=self.headers).get_data(as_text=True)
         self.assertIn('pass=cam-secret',page)
@@ -631,6 +638,14 @@ class MediaTests(unittest.TestCase):
         with patch.multiple(m,**case,_restore_check_at=1e12),patch.object(m,'switch_camera') as cut:
             m._supervise_relay(100.0)
         cut.assert_not_called()
+
+    def test_cameras_publish_without_password_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m,'MEDIAMTX_CONFIG',tmp+'/m.json'),\
+                patch.object(m,'_ensure_offline_card',return_value=False),patch.dict(os.environ,{'MCC_CAMERA_PASSWORD':''}):
+            m.generate_mediamtx_config()
+            users=json.loads(Path(tmp,'m.json').read_text())['authInternalUsers']
+        self.assertEqual((users[0]['user'],users[0]['permissions']),('any',[{'action':'publish','path':'~^cam[123]$'}]))
+        self.assertNotIn('pass',users[0])
 
     def test_process_requires_progress(self):
         proc=object.__new__(m.Process)
