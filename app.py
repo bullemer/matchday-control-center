@@ -34,11 +34,11 @@ import secrets
 import subprocess
 import signal
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from werkzeug.exceptions import HTTPException
 from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
                              stop_hotspot, get_usb_audio_devices, get_firewall_status)
-from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
+from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CAMERA_USER, camera_password,
                           get_mediamtx_running, get_stream_status, start_stream, stop_stream,
                           make_target, DESTINATIONS, PROFILES, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
@@ -132,6 +132,7 @@ _clock = {
     "elapsed": 0.0,        # seconds elapsed when last paused / updated
     "start_ts": None,      # time.monotonic() when clock was started
     "half": 1,
+    "half_length": 45,     # minutes; the 2nd half starts at this clock time
 }
 
 
@@ -198,6 +199,7 @@ def _get_scoreboard_state():
         sb["clock_running"] = _clock["running"]
         sb["clock_elapsed_secs"] = round(elapsed, 1)
         sb["half"] = _clock["half"]
+        sb["half_length"] = _clock["half_length"]
     sb["overlay_status"] = browser_overlay.status()
     return sb
 
@@ -224,6 +226,11 @@ def api_endpoint(f):
 
 # --- UI ---------------------------------------------------------------
 
+def _camera_query():
+    password = camera_password()
+    return f"?user={CAMERA_USER}&pass={quote(password, safe='')}" if password else ""
+
+
 @app.route("/")
 def index():
     """Serve the main dashboard UI."""
@@ -232,7 +239,8 @@ def index():
         host = f"[{host}]"
     destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
-    return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates)
+    return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
+                           camera_query=_camera_query())
 
 
 @app.route("/tally/<cam_id>")
@@ -243,7 +251,7 @@ def tally_page(cam_id):
     host = urlsplit(request.host_url).hostname or "localhost"
     if ":" in host:
         host = f"[{host}]"
-    return render_template("tally.html", cam_id=cam_id, media_host=host)
+    return render_template("tally.html", cam_id=cam_id, media_host=host, show_url=not camera_password())
 
 
 @app.route("/api/tally/<cam_id>")
@@ -255,18 +263,25 @@ def api_tally_status(cam_id):
     cameras = get_camera_status()
     stream = get_stream_status()
     publishing = bool(cameras.get(cam_id))
-    active_cam = stream.get("active_camera") or stream.get("selected_camera")
+    # Only the camera actually in the program picture counts (not one merely selected while
+    # the fallback card is on air), and only while the program goes out (stream or recording).
+    active_cam = stream.get("active_camera")
     secondary_cam = stream.get("secondary_camera")
     replay = stream.get("replay", {}).get("active", False)
-    on_air = bool(publishing and active_cam == cam_id and not replay)
-    secondary = bool(publishing and secondary_cam == cam_id)
-    stream_active = bool(stream.get("active") or stream.get("state") == "live")
+    # A short uplink drop is still a live broadcast: the operator keeps framing.
+    stream_active = bool(stream.get("active") or stream.get("state") in ("live", "reconnecting"))
+    going_out = stream_active or bool((stream.get("recording") or {}).get("active"))
+    in_program = bool(publishing and active_cam == cam_id and not replay)
+    on_air = in_program and going_out
+    selected = in_program and not going_out
+    secondary = bool(publishing and secondary_cam == cam_id and going_out)
     return jsonify({
         "ok": True,
         "cam_id": cam_id,
         "name": f"Camera {cam_id[3:]}" if cam_id.startswith("cam") else cam_id,
         "publishing": publishing,
         "on_air": on_air,
+        "selected": selected,
         "secondary": secondary,
         "stream_active": stream_active,
         "stream_state": stream.get("state", "stopped"),
@@ -771,18 +786,23 @@ def api_scoreboard_clock():
     Control the match clock.
 
     Accepts JSON with "action": start | pause | reset | set_half | adjust | set
-    For set_half, also accepts "half": 1 or 2
+    For set_half, also accepts "half": 1 or 2 and optional "minutes" (half length, 10-60)
+    set_half_length: "minutes" (10-60) without touching the clock.
     For adjust, "seconds" to add (negative to subtract); for set, "seconds" of match time.
     adjust and set keep the clock running or paused as it was.
     """
     data = request.get_json(force=True, silent=True) or {}
     action = text_field(data, "action", 20).lower()
 
-    if action not in ("start", "pause", "reset", "set_half", "adjust", "set"):
+    if action not in ("start", "pause", "reset", "set_half", "set_half_length", "adjust", "set"):
         return jsonify({
             "ok": False,
-            "error": "action must be one of: start, pause, reset, set_half, adjust, set",
+            "error": "action must be one of: start, pause, reset, set_half, set_half_length, adjust, set",
         }), 400
+    minutes = data.get("minutes")
+    if action == "set_half_length" or (action == "set_half" and minutes is not None):
+        if type(minutes) is not int or not 10 <= minutes <= 60:
+            raise ValueError("Half length must be a whole number of minutes between 10 and 60")
     if action in ("adjust", "set"):
         seconds = data.get("seconds")
         low = -3600 if action == "adjust" else 0
@@ -821,7 +841,13 @@ def api_scoreboard_clock():
             log.info("Match clock %s to %s", "adjusted" if action == "adjust" else "set",
                      _format_clock(target))
 
+        elif action == "set_half_length":
+            _clock["half_length"] = minutes
+            log.info("Half length set to %d min", minutes)
+
         elif action == "set_half":
+            if minutes is not None:
+                _clock["half_length"] = minutes
             half = data.get("half", 2)
             try:
                 half = int(half)
@@ -829,10 +855,10 @@ def api_scoreboard_clock():
                 half = 2
             _clock["half"] = half
             if half == 2:
-                _clock["elapsed"] = 45 * 60.0  # 45:00
+                _clock["elapsed"] = _clock["half_length"] * 60.0
                 _clock["running"] = False
                 _clock["start_ts"] = None
-                log.info("Match clock set to 45:00 for 2nd half")
+                log.info("Match clock set to %d:00 for 2nd half", _clock["half_length"])
             else:
                 _clock["elapsed"] = 0.0
                 _clock["running"] = False
@@ -907,8 +933,11 @@ def _restore_match():
             raise ValueError("Invalid persisted scoreboard visibility")
         with _scoreboard_lock:
             _scoreboard.update({key: state[key] for key in _scoreboard})
+            half_length = state.get("half_length", 45)  # saved before half length existed
+            if type(half_length) is not int or not 10 <= half_length <= 60:
+                half_length = 45
             _clock.update(running=False, elapsed=float(state["clock_elapsed_secs"]),
-                          start_ts=None, half=state["half"])
+                          start_ts=None, half=state["half"], half_length=half_length)
     except (ValueError, KeyError, OSError, TypeError):
         log.exception("Cannot restore saved match")
 

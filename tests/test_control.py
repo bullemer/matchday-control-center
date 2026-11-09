@@ -2,12 +2,14 @@ import base64
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import sys
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch, MagicMock
+os.environ['MCC_CAMERA_PASSWORD']='cam-secret'
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as a
 import media_engine as m
@@ -139,7 +141,7 @@ class ApiTests(unittest.TestCase):
         r = self.client.get('/tally/cam1')
         self.assertEqual(r.status_code, 200)
         self.assertIn(b'CAM1', r.data)
-        self.assertIn(b'RTMP Publishing URL', r.data)
+        self.assertIn(b'from the control dashboard', r.data)
 
         self.assertEqual(self.client.get('/tally/cam99').status_code, 404)
         self.assertEqual(self.client.get('/api/tally/cam99').status_code, 404)
@@ -162,6 +164,56 @@ class ApiTests(unittest.TestCase):
             self.assertFalse(data2['publishing'])
             self.assertFalse(data2['on_air'])
             self.assertFalse(data2['secondary'])
+
+    def test_tally_stays_live_during_an_uplink_drop(self):
+        with patch.object(a,'get_camera_status',return_value={'cam1':True}),\
+                patch.object(a,'get_stream_status',return_value={'active':False,'state':'reconnecting','active_camera':'cam1','recording':{'active':False}}):
+            t=self.client.get('/api/tally/cam1').get_json()
+        self.assertEqual((t['on_air'],t['selected'],t['stream_active']),(True,False,True))
+
+    def test_camera_links_have_no_password_by_default(self):
+        with patch.dict(os.environ,{'MCC_CAMERA_PASSWORD':''}):
+            page=self.client.get('/',headers=self.headers).get_data(as_text=True)
+            tally=self.client.get('/tally/cam1').get_data(as_text=True)
+        self.assertNotIn('pass=',page.split('cameraQuery =')[1][:40])
+        self.assertIn('RTMP Publishing URL',tally)
+
+    def test_camera_links_carry_the_password_only_behind_login(self):
+        page=self.client.get('/',headers=self.headers).get_data(as_text=True)
+        self.assertIn('pass=cam-secret',page)
+        self.assertNotIn('cam-secret',self.client.get('/tally/cam1').get_data(as_text=True))
+        self.assertNotIn('cam-secret',self.client.get('/api/tally/cam1').get_data(as_text=True))
+
+    def test_tally_selected_camera_is_not_live(self):
+        # Selected while the fallback card is on air, or in program but nothing goes out: not LIVE.
+        cams={'cam1':True,'cam2':True}
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':None,'selected_camera':'cam1','active':False,'state':'stopped'}):
+            d=self.client.get('/api/tally/cam1').json
+            self.assertEqual((d['on_air'],d['selected']),(False,False))
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':'cam2','secondary_camera':'cam1','active':False,'state':'stopped','recording':{'active':False}}):
+            d=self.client.get('/api/tally/cam2').json
+            self.assertEqual((d['on_air'],d['selected']),(False,True))
+            self.assertFalse(self.client.get('/api/tally/cam1').json['secondary'])
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':'cam2','secondary_camera':'cam1','active':False,'state':'stopped','recording':{'active':True}}):
+            d=self.client.get('/api/tally/cam2').json
+            self.assertEqual((d['on_air'],d['selected']),(True,False))  # recording counts as going out
+            self.assertTrue(self.client.get('/api/tally/cam1').json['secondary'])
+
+    def test_half_length(self):
+        r=self.post('/api/scoreboard/clock',{'action':'set_half_length','minutes':35})
+        self.assertEqual(r.json['scoreboard']['half_length'],35)
+        self.assertEqual(r.json['scoreboard']['clock'],'00:00')  # length alone does not move the clock
+        self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half','half':2}).json['scoreboard']['clock'],'35:00')
+        self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half','half':2,'minutes':20}).json['scoreboard']['clock'],'20:00')
+        for bad in [9,61,'30',30.5,None]:
+            self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half_length','minutes':bad}).status_code,400)
+        a._clock['half_length']=45
+        a._save_match(); a._clock['half_length']=10
+        a._restore_match()
+        self.assertEqual(a._clock['half_length'],45)
 
     def test_json_validation(self):
         for body in [[],None,'bad',1]:
@@ -427,6 +479,50 @@ class MediaTests(unittest.TestCase):
             self.assertFalse(m.set_audio_source('active')[0])
             self.assertEqual(m.get_audio_source(),'cam1')
 
+    def test_follow_keeps_sound_for_camera_without_audio(self):
+        # The Raspberry Pi camera publishes video only: cutting to it keeps the last camera's sound.
+        with self.mixer(),patch.object(m,'_follow',True),patch.object(m,'_follow_last',None), \
+             patch.object(m,'_camera_audio',{'cam1':True,'cam2':False,'cam3':True}):
+            self.assertEqual(m._effective_mix('cam3'),{'cam3':0.0})
+            self.assertEqual(m._effective_mix('cam2'),{'cam3':0.0})  # last camera with sound
+            self.assertEqual(m._effective_mix('cam1'),{'cam1':0.0})
+            self.assertEqual(m._effective_mix('cam2'),{'cam1':0.0})
+            m._camera_audio['cam1']=False; m._camera_audio['cam3']=False
+            self.assertEqual(m._effective_mix('cam2'),{'cam2':0.0})  # nobody has sound: unchanged
+        with self.mixer(),patch.object(m,'_follow',True),patch.object(m,'_follow_last',None),patch.object(m,'_camera_audio',{}):
+            self.assertEqual(m._effective_mix('cam2'),{'cam2':0.0})  # unknown tracks: old behaviour
+
+    def test_paths_records_camera_audio(self):
+        listing={'items':[{'name':'cam1','ready':True,'tracks':['H264','MPEG-4 Audio']},
+                          {'name':'cam2','ready':True,'tracks':['H264']},{'name':'program','ready':True,'tracks':['H264']}]}
+        response=MagicMock(); response.json.return_value=listing
+        with patch.object(m.requests,'get',return_value=response),patch.object(m,'_camera_audio',{'cam3':True}):
+            self.assertEqual(m._paths()['cam2'],True)
+            self.assertEqual(m._camera_audio,{'cam1':True,'cam2':False})
+
+    def test_reconnected_on_air_camera_gets_new_relay_at_once(self):
+        relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=False
+        relay.last_progress=0; relay.launched=1e12  # frozen, but not yet past the 15 s health window
+        common=dict(_replay=None,_relay_proc=relay,_active_camera='cam2',_relay_channels={},_relay_missing=set(),
+                    _camera_status={'cam2':True},_relay_sources={'cam2':'old-session'},_relay_retry_at=0.0)
+        with patch.multiple(m,**common,_camera_source={'cam2':'new-session'}),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut:
+            m._supervise_relay(100.0)
+            cut.assert_called_once_with('cam2',automatic=True)
+        with patch.multiple(m,**common,_camera_source={'cam2':'old-session'}),patch.object(m,'switch_camera') as cut:
+            m._supervise_relay(100.0)
+            cut.assert_not_called()
+
+    def test_camera_reconnect_resets_relay_backoff(self):
+        response=MagicMock(); response.json.return_value={'items':[{'name':'cam2','ready':True,'tracks':['H264']}]}
+        with patch.object(m.requests,'get',return_value=response),patch.object(m,'_camera_status',{c:False for c in m.CAMERA_IDS+['program']}), \
+             patch.object(m,'_relay_failures',5),patch.object(m,'_relay_retry_at',1e12), \
+             patch.object(m,'get_mediamtx_running',return_value=False),patch.object(m,'_mediamtx_retry_at',1e12):
+            try:
+                m._supervise_once()
+            except Exception:
+                pass
+            self.assertEqual((m._relay_failures,m._relay_retry_at),(0,0.0))
+
     def test_presets_and_custom_mix(self):
         with self.mixer(**{'usb:mic':{'on':False,'gain':0.0}}),patch.object(m,'_follow',False),patch.object(m,'_active_camera',None):
             self.assertEqual(m.get_audio_source(),'cam1')
@@ -502,10 +598,54 @@ class MediaTests(unittest.TestCase):
             self.assertTrue(config['paths']['program']['alwaysAvailable'])
             self.assertEqual(config['paths']['program']['alwaysAvailableFile'],tmp+'/offline.mp4')  # our card, not "STREAM IS OFFLINE"
             self.assertTrue(Path(tmp,'offline.mp4').stat().st_size>0)
-            public=config['authInternalUsers'][0]['permissions']
-            self.assertEqual([p for p in public if p['action']=='publish'],[{'action':'publish','path':'~^cam[123]$'}])
-            local=config['authInternalUsers'][1]['permissions']
-            self.assertIn({'action':'publish','path':'~^(program|final)$'},local)
+            users=config['authInternalUsers']
+            self.assertEqual((users[0]['user'],users[0]['pass']),('camera','cam-secret'))
+            self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^cam[123]$'}])
+            self.assertEqual(users[1]['permissions'],[{'action':'read'}])  # no password: nobody on the LAN may publish
+            self.assertEqual(users[2]['ips'],['127.0.0.1','::1'])
+            self.assertIn({'action':'publish','path':'~^(program|final|cam[123])$'},users[2]['permissions'])
+
+    def reconnect_case(self, **extra):
+        relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True
+        relay.last_progress=0; relay.launched=1e12
+        return dict(_replay=None,_relay_proc=relay,_active_camera='cam1',_relay_channels={},_relay_missing=set(),
+                    _relay_retry_at=0.0,_relay_failures=0,**extra)
+
+    def test_reconnected_commentary_or_inset_camera_rebuilds_the_relay(self):
+        case=self.reconnect_case(_camera_status={'cam1':True,'cam3':True},
+                                 _relay_sources={'cam1':'a','cam3':'old'},_camera_source={'cam1':'a','cam3':'new'})
+        with patch.multiple(m,**case),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut:
+            m._supervise_relay(100.0)
+        cut.assert_called_once_with('cam1',automatic=True)
+
+    def test_reconnect_is_retried_while_a_cut_is_busy(self):
+        case=self.reconnect_case(_camera_status={'cam1':True},_relay_sources={'cam1':'old'},_camera_source={'cam1':'new'})
+        with patch.multiple(m,**case),patch.object(m,'switch_camera',return_value=(False,m.BUSY)) as cut:
+            m._supervise_relay(100.0); m._supervise_relay(102.0)
+            self.assertEqual(cut.call_count,2)
+            self.assertEqual(m._relay_failures,0)
+
+    def test_failed_reconnect_rebuild_backs_off(self):
+        case=self.reconnect_case(_camera_status={'cam1':True},_relay_sources={'cam1':'old'},_camera_source={'cam1':'new'})
+        with patch.multiple(m,**case),patch.object(m,'switch_camera',return_value=(False,'no video')) as cut:
+            m._supervise_relay(100.0); m._supervise_relay(100.5)
+            cut.assert_called_once()
+            self.assertEqual(m._relay_failures,1)
+
+    def test_unchanged_sessions_do_not_rebuild(self):
+        case=self.reconnect_case(_camera_status={'cam1':True,'cam3':True},
+                                 _relay_sources={'cam1':'a','cam3':'b'},_camera_source={'cam1':'a','cam3':'b'})
+        with patch.multiple(m,**case,_restore_check_at=1e12),patch.object(m,'switch_camera') as cut:
+            m._supervise_relay(100.0)
+        cut.assert_not_called()
+
+    def test_cameras_publish_without_password_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m,'MEDIAMTX_CONFIG',tmp+'/m.json'),\
+                patch.object(m,'_ensure_offline_card',return_value=False),patch.dict(os.environ,{'MCC_CAMERA_PASSWORD':''}):
+            m.generate_mediamtx_config()
+            users=json.loads(Path(tmp,'m.json').read_text())['authInternalUsers']
+        self.assertEqual((users[0]['user'],users[0]['permissions']),('any',[{'action':'publish','path':'~^cam[123]$'}]))
+        self.assertNotIn('pass',users[0])
 
     def test_process_requires_progress(self):
         proc=object.__new__(m.Process)
@@ -905,6 +1045,19 @@ class RecordingTests(EngineStateCase):
             m._supervise_recorder(m.time.monotonic())
         self.assertFalse(m._want_record)
         self.assertIn('Disk almost full', m._record_warning)
+
+    def test_finalize_without_room_keeps_parts_and_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m.recordings,'RECORDINGS_DIR',Path(tmp)):
+            folder=Path(tmp,'s1'); folder.mkdir()
+            (folder/'p1.ts').write_bytes(b'x'*1000)
+            session={'id':'s1','title':'t','state':'stopped','parts':[{'file':'p1.ts','duration':1.0}],'markers':[],'error':''}
+            with patch.object(m.recordings,'_dir',return_value=folder),patch.object(m.recordings,'_load',return_value=session),patch.object(m.recordings,'_save'),\
+                    patch.object(m.recordings,'free_bytes',return_value=10),patch.object(m.recordings,'_run') as run:
+                ok,message=m.recordings.finalize('s1')
+            self.assertFalse(ok); run.assert_not_called()
+            self.assertIn('not enough free space',message)
+            self.assertEqual(session['state'],'unfinished')
+            self.assertTrue((folder/'p1.ts').exists())
 
     def test_dead_recorder_continues_in_a_new_part(self):
         self.running()

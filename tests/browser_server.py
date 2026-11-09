@@ -1,9 +1,11 @@
 """Isolated HTTP fixture: no hardware, runtime state, or real media processes."""
 import glob
+import os
 import shutil
 import sys
 import tempfile
 from pathlib import Path
+os.environ['MCC_CAMERA_PASSWORD']='browser-camera'
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 import app as a
 

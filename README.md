@@ -37,6 +37,25 @@ The launcher creates a venv and installs pinned Python dependencies when needed.
 It uses Waitress with a single Python process. Do not deploy multiple independent
 workers: the hardware process manager and live match state are process-local.
 
+## Run with Docker (other Linux laptops)
+
+The image bundles Python, ffmpeg, MediaMTX and Chromium, so a laptop only needs Docker,
+NetworkManager and an AP-capable Wi-Fi adapter. It runs on Linux only: Docker on Windows
+and macOS cannot control the laptop's Wi-Fi hotspot or USB tethering.
+
+```bash
+docker compose up -d --build
+docker compose exec matchday cat data/operator-password
+```
+
+Open `http://localhost:5000` and log in as **operator**. Settings are kept in `./data` and
+recordings in `./recordings`, next to `docker-compose.yml`; both are owned by root.
+
+The container uses the laptop's network and its NetworkManager socket, so it runs as root
+with AppArmor unconfined. Use it on a laptop dedicated to match day. USB microphones are
+not passed through; use camera audio, or run `./start.sh` directly. Encoding uses the CPU,
+so try a real stream before relying on a slower laptop.
+
 ## Match-day workflow
 
 1. Connect the phone by USB and enable internet tethering. USB devices are detected
@@ -155,8 +174,10 @@ connection loss explicitly. “Live” indicates the local encoder is producing 
 check YouTube Studio, Live Producer or the Twitch dashboard to confirm platform-side reception.
 
 MediaMTX's control API and RTSP transport are loopback-only. Program publishing is
-loopback-only; camera publishing and preview reading are available on the LAN.
-Camera paths reject replacement publishers. Publishing to the output encoder's `final` path is loopback-only too. Ports: TCP 5000 (control), 1935 (camera
+loopback-only. By default anyone on the hotspot can publish a camera. To require a password,
+set `MCC_CAMERA_PASSWORD`; it is then part of every link and QR code on the dashboard, and
+any saved camera link, including the Raspberry Pi's, must be updated. Preview reading is available on the LAN. A camera that reconnects
+takes over its own stale session, so do not give two phones the same camera link. Publishing to the output encoder's `final` path is loopback-only too. Ports: TCP 5000 (control), 1935 (camera
 RTMP), 8888 (HLS), 8889 (WebRTC signaling), and UDP 8189 (WebRTC media).
 Firewall diagnostics distinguish listening sockets from verified remote reachability;
 they do not claim that a matching rule or a listening socket guarantees access.

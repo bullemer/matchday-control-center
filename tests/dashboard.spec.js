@@ -7,7 +7,7 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await expect(page.locator('#net-hotspot-status')).toHaveText('Active');
   await expect(page.locator('#net-usb-status')).toHaveText('Phone connected');
-  await expect(page.locator('#url-cam1')).toHaveText('rtmp://10.55.0.1:1935/cam1');
+  await expect(page.locator('#url-cam1')).toHaveText('rtmp://10.55.0.1:1935/cam1?user=camera&pass=browser-camera');
   await expect(page.locator('#audio-follow')).toHaveClass(/bg-brand-blue/);
   await page.locator('#home-name').fill('Test FC');
   await page.waitForTimeout(2200);
@@ -16,8 +16,11 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.home_name)).toBe('Test FC');
   await page.evaluate(() => adjustScore('home',1));
   await expect(page.locator('#home-score-display')).toHaveText('1');
+  let halfQuestion='';
+  page.once('dialog', dialog => { halfQuestion=dialog.message(); dialog.accept(); });
   await page.evaluate(() => clockAction('second_half'));
   await expect(page.locator('#match-clock-display')).toHaveText('45:00');
+  expect(halfQuestion).toContain('45:00');
   await page.evaluate(() => clockAction('start'));
   await expect(page.locator('#match-clock-display')).not.toHaveText('45:00',{timeout:5000});
   await expect(page.locator('#btn-cut-cam2')).toBeDisabled();
@@ -106,7 +109,7 @@ test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address'
   });
   await page.goto('/');
   await page.getByRole('tab', {name: /Cams/}).click();
-  await expect(page.locator('#url-cam1')).toHaveText('rtmp://192.168.1.50:1935/cam1');
+  await expect(page.locator('#url-cam1')).toHaveText('rtmp://192.168.1.50:1935/cam1?user=camera&pass=browser-camera');
   await page.getByRole('tab', {name: /Network/}).click();
   await expect(page.locator('#camera-network-title')).toContainText('same Wi-Fi “Club WiFi”');
   await expect(page.locator('#status-hotspot-ip')).toHaveText('192.168.1.50');
@@ -434,7 +437,7 @@ test('operator mobile tally screen loads without basic auth and displays camera 
 
   await page.goto('/tally/cam1');
   await expect(page.locator('#cam-title')).toHaveText('CAM1');
-  await expect(page.locator('#rtmp-url')).toContainText('rtmp://');
+  await expect(page.locator('body')).toContainText('from the control dashboard');
   await expect(page.locator('#tally-box')).toBeVisible();
   await context.close();
 });

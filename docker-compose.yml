@@ -1,0 +1,21 @@
+services:
+  matchday:
+    build: .
+    image: matchday-control-center
+    container_name: matchday
+    # Cameras, previews and the hotspot use the laptop's own network.
+    network_mode: host
+    init: true
+    restart: unless-stopped
+    shm_size: 256m
+    # Ubuntu's default AppArmor profile blocks the D-Bus socket mounted below.
+    security_opt:
+      - apparmor=unconfined
+    environment:
+      MCC_OPERATOR_PASSWORD: ${MCC_OPERATOR_PASSWORD:-}
+      MCC_CAMERA_PASSWORD: ${MCC_CAMERA_PASSWORD:-}
+    volumes:
+      - ./data:/app/data
+      - ./recordings:/app/recordings
+      # Lets the app control the laptop's USB tethering and Wi-Fi hotspot.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
