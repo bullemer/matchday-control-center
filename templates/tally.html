@@ -23,6 +23,10 @@
       background-color: #2563eb !important;
       color: #ffffff !important;
     }
+    .tally-selected {
+      background-color: #b45309 !important;
+      color: #ffffff !important;
+    }
     .tally-standby {
       background-color: #15803d !important;
       color: #ffffff !important;
@@ -196,6 +200,9 @@
       } else if (data.secondary) {
         renderState('secondary', '🔵 ON AIR (PiP / 2nd)', 'Showing as inset / split screen');
         lastOnAir = false;
+      } else if (data.selected) {
+        renderState('selected', '🟡 SELECTED – NOT LIVE', 'Your picture is chosen, but nothing is broadcast or recorded yet.');
+        lastOnAir = false;
       } else if (data.publishing) {
         renderState('standby', '🟢 READY / STANDBY', 'Signal connected. Ready for director cut.');
         lastOnAir = false;
@@ -212,6 +219,8 @@
         box.className += 'tally-on-air border-red-300 tally-pulse';
       } else if (state === 'secondary') {
         box.className += 'tally-secondary border-blue-300';
+      } else if (state === 'selected') {
+        box.className += 'tally-selected border-amber-300';
       } else if (state === 'standby') {
         box.className += 'tally-standby border-green-300';
       } else {

@@ -414,7 +414,9 @@ def generate_mediamtx_config():
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
                 {"action": "api"}, {"action": "publish", "path": "~^(program|final)$"}]},
         ],
-        "paths": {c: {"overridePublisher": False} for c in CAMERA_IDS},
+        # A camera reconnecting after a Wi-Fi drop replaces its own stale session at once
+        # (otherwise it is refused until MediaMTX times the dead one out).
+        "paths": {c: {"overridePublisher": True} for c in CAMERA_IDS},
     }
     program = {"alwaysAvailable": True}
     if _ensure_offline_card():
@@ -432,7 +434,19 @@ def generate_mediamtx_config():
 def _paths():
     response = requests.get(f"{MEDIAMTX_API}/v3/paths/list", timeout=2)
     response.raise_for_status()
-    return {p["name"]: bool(p.get("ready")) for p in response.json().get("items", [])}
+    items = response.json().get("items", [])
+    for p in items:
+        if p.get("name") in CAMERA_IDS:
+            if p.get("ready"):
+                _camera_audio[p["name"]] = any(t in AUDIO_CODECS for t in p.get("tracks") or [])
+                _camera_source[p["name"]] = (p.get("source") or {}).get("id")
+            else:
+                _camera_audio.pop(p["name"], None)
+                _camera_source.pop(p["name"], None)
+    for name in set(_camera_audio) - {p.get("name") for p in items}:
+        _camera_audio.pop(name, None)
+        _camera_source.pop(name, None)
+    return {p["name"]: bool(p.get("ready")) for p in items}
 
 
 def start_mediamtx():
@@ -503,11 +517,30 @@ def get_mixer():
                          for c, setting in _mix.items()}}
 
 
+_camera_audio = {}     # camera -> True/False: publishes an audio track (from the MediaMTX path list)
+_camera_source = {}    # camera -> MediaMTX publisher session id; changes when a camera reconnects
+_relay_source = None   # publisher session of the on-air camera when its relay was built
+_follow_last = None    # last camera with sound that "sound follows the cut" put on air
+
+
+def _follow_channel(cam):
+    """The camera whose sound plays with cam on air in follow mode. A camera without
+    sound (e.g. the Raspberry Pi) keeps the last camera's sound instead of silence."""
+    global _follow_last
+    if _camera_audio.get(cam, True):
+        _follow_last = cam
+        return cam
+    if _follow_last and _follow_last != cam and _camera_audio.get(_follow_last):
+        return _follow_last
+    return next((c for c in CAMERA_IDS if c != cam and _camera_audio.get(c)), cam)
+
+
 def _effective_mix(cam):
     """Channels that should be on air when cam is cut, with their gain in dB."""
     wanted = {}
+    follow = _follow_channel(cam) if _follow and cam in CAMERA_IDS else None
     for channel, setting in _mix.items():
-        on = channel == cam if _follow and channel in CAMERA_IDS else setting["on"]
+        on = channel == follow if follow and channel in CAMERA_IDS else setting["on"]
         if on:
             wanted[channel] = setting["gain"]
     return wanted
@@ -862,6 +895,7 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
     global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout, _replay
+    global _relay_source
     global _relay_zmq, _relay_slot
     global _cut_seconds
     current = lambda: generation == _generation
@@ -869,6 +903,7 @@ def _replace_relay(cam_id, generation):
         return False, SUPERSEDED
     began = time.monotonic()
     wanted, profile = _effective_mix(cam_id), _profile
+    source = _camera_source.get(cam_id)
     try:
         # Probe and validate before disturbing the current publisher.
         cmd, channels, missing, warning, secondary, video_warning = _relay_command(cam_id, wanted)
@@ -894,6 +929,7 @@ def _replace_relay(cam_id, generation):
             if _relay_proc is old:
                 _relay_proc = None
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
+            _relay_source = source
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
             _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
@@ -1485,7 +1521,7 @@ def _stop_all(finalize=True):
 def _supervise_relay(now):
     """Restart a dead relay with backoff, and restore the chosen commentary source after
     a degraded relay once that source is available again. Never holds _lock while slow."""
-    global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at
+    global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at, _relay_source
     with _lock:
         if _replay:
             return  # the replay watcher returns to the live camera
@@ -1508,7 +1544,14 @@ def _supervise_relay(now):
             ok, message = switch_camera(camera, automatic=True)
             if not ok and message not in (BUSY, SUPERSEDED):
                 _relay_failures += 1
-                _relay_retry_at = now + min(30, 2 ** min(_relay_failures, 5))
+                _relay_retry_at = now + min(5, 2 ** min(_relay_failures, 3))  # 2, 4, 5, 5 … s
+    elif _camera_status.get(camera) and _relay_source and _camera_source.get(camera) \
+            and _camera_source[camera] != _relay_source:
+        # The on-air camera reconnected (new publisher session): the running relay still
+        # waits on the old one and shows a frozen picture, so cut to the new session now.
+        _relay_source = _camera_source[camera]  # one attempt per new session
+        logger.info("%s reconnected; rebuilding its relay", camera)
+        switch_camera(camera, automatic=True)
     elif relay.healthy() and now >= _restore_check_at:
         # A mixed-in source that stopped publishing is silent in the mix: rebuild without it
         # (falls back to the camera's own sound). A missing source that is back: restore it.
@@ -1527,12 +1570,17 @@ def _supervise_relay(now):
 
 def _supervise_once():
     global _camera_status, _state, _error, _started_at, _retry_at, _retries, _mediamtx_retry_at
+    global _relay_failures, _relay_retry_at
+    before = _camera_status
     try:
         paths = _paths()
         _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS}
         _camera_status["program"] = paths.get(program_path(), False)
     except (requests.RequestException, ValueError, KeyError):
         _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
+    if any(_camera_status.get(c) and not before.get(c) for c in CAMERA_IDS):
+        # A camera (re)connected: put it back on air right away, not after an old backoff.
+        _relay_failures, _relay_retry_at = 0, 0.0
     now = time.monotonic()
     # Cameras need MediaMTX whether or not we are live.
     if not get_mediamtx_running():
@@ -1576,7 +1624,7 @@ def _supervise_encoder():
             return
         if now >= _retry_at:
             _retries += 1
-            _retry_at = now + min(30, 2 ** min(_retries, 5))
+            _retry_at = now + min(8, 2 ** min(_retries, 3))
             try:
                 _launch_encoder()
             except OSError:
@@ -1615,7 +1663,7 @@ def _supervise_target(name, now):
         if now >= target["retry_at"]:
             if pusher:
                 target["failures"] += 1
-                target["retry_at"] = now + min(30, 2 ** min(target["failures"], 5))
+                target["retry_at"] = now + min(8, 2 ** min(target["failures"], 3))  # 2, 4, 8, 8 … s
             try:
                 _launch_pusher(target)
             except OSError:

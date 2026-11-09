@@ -856,9 +856,17 @@
           </button>
           <button onclick="clockAction('second_half')"
                   class="bg-brand-blue hover:bg-blue-600 text-white font-semibold py-3 rounded-lg transition-colors">
-            ⏩ 2nd Half (45:00)
+            ⏩ 2nd Half (<span data-bind="half_length">45</span>:00)
           </button>
         </div>
+        <label class="mt-3 flex items-center gap-2 text-sm text-slate-300">Half length
+          <select id="half-length" onchange="setHalfLength(this.value)"
+                  class="bg-slate-700 text-white rounded-lg px-2 py-1">
+            <option value="45">45 min</option><option value="40">40 min</option><option value="35">35 min</option>
+            <option value="30">30 min</option><option value="25">25 min</option><option value="20">20 min</option>
+            <option value="15">15 min</option><option value="10">10 min</option>
+          </select>
+        </label>
         <button onclick="openClockEditor()" class="mt-3 text-sm text-brand-cyan underline">✎ Adjust clock</button>
         <!-- Correct the clock without stopping it -->
         <div class="mt-3 flex flex-wrap items-center gap-2">
@@ -1045,7 +1053,7 @@
       </div>
       <div class="flex gap-2 mt-3">
         <button type="button" onclick="fillClockEditor(0)" class="flex-1 bg-slate-700 rounded-lg py-3">00:00</button>
-        <button type="button" onclick="fillClockEditor(2700)" class="flex-1 bg-slate-700 rounded-lg py-3">45:00</button>
+        <button type="button" onclick="fillClockEditor(halfLength * 60)" class="flex-1 bg-slate-700 rounded-lg py-3"><span data-bind="half_length">45</span>:00</button>
         <button type="button" onclick="fillClockEditor(5400)" class="flex-1 bg-slate-700 rounded-lg py-3">90:00</button>
       </div>
       <p id="clock-editor-error" role="alert" class="text-sm text-red-400 mt-2"></p>
@@ -2272,6 +2280,12 @@
 
     function applyScoreboard(sb, updateVisibility = true) {
       if (updateVisibility) scoreboardVisible = sb.visible !== false;
+      if (sb.half_length) {
+        halfLength = sb.half_length;
+        document.querySelectorAll('[data-bind="half_length"]').forEach(el => el.textContent = halfLength);
+        const select = document.getElementById('half-length');
+        if (select && document.activeElement !== select) select.value = String(halfLength);
+      }
       renderScoreboardVisibility();
       scoreboardSource = sb.source || 'builtin';
       if (!scoreboardSourceDirty) {
@@ -2342,8 +2356,16 @@
     }
 
     // ──────────────────────── Match Clock ────────────────────────
+    var halfLength = 45;  // minutes; the server's value arrives with every scoreboard update
+
+    function setHalfLength(minutes) {
+      apiPost('/api/scoreboard/clock', {action: 'set_half_length', minutes: parseInt(minutes, 10)}, {quiet: true})
+        .then(result => { if (result) applyScoreboard(result.scoreboard); });
+    }
+
     function clockAction(action) {
       if (action === 'reset' && !confirm('Reset the match clock to 00:00 (1st half)?')) return;
+      if (action === 'second_half' && !confirm(`Start the 2nd half? The clock jumps to ${halfLength}:00 and stays paused until you press Start.`)) return;
       apiPost('/api/scoreboard/clock', action === 'second_half' ? {action: 'set_half', half: 2} : {action}, {quiet: true})
         .then(result => { if (result) applyScoreboard(result.scoreboard); });
     }

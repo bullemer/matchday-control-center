@@ -16,8 +16,11 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await expect.poll(async () => (await page.request.get('/api/scoreboard')).json().then(x=>x.scoreboard.home_name)).toBe('Test FC');
   await page.evaluate(() => adjustScore('home',1));
   await expect(page.locator('#home-score-display')).toHaveText('1');
+  let halfQuestion='';
+  page.once('dialog', dialog => { halfQuestion=dialog.message(); dialog.accept(); });
   await page.evaluate(() => clockAction('second_half'));
   await expect(page.locator('#match-clock-display')).toHaveText('45:00');
+  expect(halfQuestion).toContain('45:00');
   await page.evaluate(() => clockAction('start'));
   await expect(page.locator('#match-clock-display')).not.toHaveText('45:00',{timeout:5000});
   await expect(page.locator('#btn-cut-cam2')).toBeDisabled();

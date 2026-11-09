@@ -163,6 +163,37 @@ class ApiTests(unittest.TestCase):
             self.assertFalse(data2['on_air'])
             self.assertFalse(data2['secondary'])
 
+    def test_tally_selected_camera_is_not_live(self):
+        # Selected while the fallback card is on air, or in program but nothing goes out: not LIVE.
+        cams={'cam1':True,'cam2':True}
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':None,'selected_camera':'cam1','active':False,'state':'stopped'}):
+            d=self.client.get('/api/tally/cam1').json
+            self.assertEqual((d['on_air'],d['selected']),(False,False))
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':'cam2','secondary_camera':'cam1','active':False,'state':'stopped','recording':{'active':False}}):
+            d=self.client.get('/api/tally/cam2').json
+            self.assertEqual((d['on_air'],d['selected']),(False,True))
+            self.assertFalse(self.client.get('/api/tally/cam1').json['secondary'])
+        with patch.object(a,'get_camera_status',return_value=cams), \
+             patch.object(a,'get_stream_status',return_value={'active_camera':'cam2','secondary_camera':'cam1','active':False,'state':'stopped','recording':{'active':True}}):
+            d=self.client.get('/api/tally/cam2').json
+            self.assertEqual((d['on_air'],d['selected']),(True,False))  # recording counts as going out
+            self.assertTrue(self.client.get('/api/tally/cam1').json['secondary'])
+
+    def test_half_length(self):
+        r=self.post('/api/scoreboard/clock',{'action':'set_half_length','minutes':35})
+        self.assertEqual(r.json['scoreboard']['half_length'],35)
+        self.assertEqual(r.json['scoreboard']['clock'],'00:00')  # length alone does not move the clock
+        self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half','half':2}).json['scoreboard']['clock'],'35:00')
+        self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half','half':2,'minutes':20}).json['scoreboard']['clock'],'20:00')
+        for bad in [9,61,'30',30.5,None]:
+            self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_half_length','minutes':bad}).status_code,400)
+        a._clock['half_length']=45
+        a._save_match(); a._clock['half_length']=10
+        a._restore_match()
+        self.assertEqual(a._clock['half_length'],45)
+
     def test_json_validation(self):
         for body in [[],None,'bad',1]:
             self.assertEqual(self.post('/api/scoreboard/update',body).status_code,400)
@@ -426,6 +457,53 @@ class MediaTests(unittest.TestCase):
         with self.mixer(),patch.object(m,'_follow',False),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_proc',None),patch.object(m,'switch_camera',return_value=(False,'bad')):
             self.assertFalse(m.set_audio_source('active')[0])
             self.assertEqual(m.get_audio_source(),'cam1')
+
+    def test_follow_keeps_sound_for_camera_without_audio(self):
+        # The Raspberry Pi camera publishes video only: cutting to it keeps the last camera's sound.
+        with self.mixer(),patch.object(m,'_follow',True),patch.object(m,'_follow_last',None), \
+             patch.object(m,'_camera_audio',{'cam1':True,'cam2':False,'cam3':True}):
+            self.assertEqual(m._effective_mix('cam3'),{'cam3':0.0})
+            self.assertEqual(m._effective_mix('cam2'),{'cam3':0.0})  # last camera with sound
+            self.assertEqual(m._effective_mix('cam1'),{'cam1':0.0})
+            self.assertEqual(m._effective_mix('cam2'),{'cam1':0.0})
+            m._camera_audio['cam1']=False; m._camera_audio['cam3']=False
+            self.assertEqual(m._effective_mix('cam2'),{'cam2':0.0})  # nobody has sound: unchanged
+        with self.mixer(),patch.object(m,'_follow',True),patch.object(m,'_follow_last',None),patch.object(m,'_camera_audio',{}):
+            self.assertEqual(m._effective_mix('cam2'),{'cam2':0.0})  # unknown tracks: old behaviour
+
+    def test_paths_records_camera_audio(self):
+        listing={'items':[{'name':'cam1','ready':True,'tracks':['H264','MPEG-4 Audio']},
+                          {'name':'cam2','ready':True,'tracks':['H264']},{'name':'program','ready':True,'tracks':['H264']}]}
+        response=MagicMock(); response.json.return_value=listing
+        with patch.object(m.requests,'get',return_value=response),patch.object(m,'_camera_audio',{'cam3':True}):
+            self.assertEqual(m._paths()['cam2'],True)
+            self.assertEqual(m._camera_audio,{'cam1':True,'cam2':False})
+
+    def test_reconnected_on_air_camera_gets_new_relay_at_once(self):
+        relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=False
+        relay.last_progress=0; relay.launched=1e12  # frozen, but not yet past the 15 s health window
+        common=dict(_replay=None,_relay_proc=relay,_active_camera='cam2',_relay_channels={},_relay_missing=set(),
+                    _camera_status={'cam2':True},_relay_source='old-session')
+        with patch.multiple(m,**common,_camera_source={'cam2':'new-session'}),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut:
+            m._supervise_relay(100.0)
+            cut.assert_called_once_with('cam2',automatic=True)
+            self.assertEqual(m._relay_source,'new-session')
+            m._supervise_relay(101.0)  # one attempt per new session
+            cut.assert_called_once()
+        with patch.multiple(m,**common,_camera_source={'cam2':'old-session'}),patch.object(m,'switch_camera') as cut:
+            m._supervise_relay(100.0)
+            cut.assert_not_called()
+
+    def test_camera_reconnect_resets_relay_backoff(self):
+        response=MagicMock(); response.json.return_value={'items':[{'name':'cam2','ready':True,'tracks':['H264']}]}
+        with patch.object(m.requests,'get',return_value=response),patch.object(m,'_camera_status',{c:False for c in m.CAMERA_IDS+['program']}), \
+             patch.object(m,'_relay_failures',5),patch.object(m,'_relay_retry_at',1e12), \
+             patch.object(m,'get_mediamtx_running',return_value=False),patch.object(m,'_mediamtx_retry_at',1e12):
+            try:
+                m._supervise_once()
+            except Exception:
+                pass
+            self.assertEqual((m._relay_failures,m._relay_retry_at),(0,0.0))
 
     def test_presets_and_custom_mix(self):
         with self.mixer(**{'usb:mic':{'on':False,'gain':0.0}}),patch.object(m,'_follow',False),patch.object(m,'_active_camera',None):
