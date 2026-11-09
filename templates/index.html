@@ -541,7 +541,7 @@
             <span class="font-semibold text-white">📹 Cam 1</span>
             <span id="cam-badge-cam1" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code id="url-cam1" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam1</code>
+          <code id="url-cam1" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam1{{ camera_query }}</code>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('cam1'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
@@ -559,7 +559,7 @@
             <span class="font-semibold text-white">📹 Cam 2</span>
             <span id="cam-badge-cam2" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code id="url-cam2" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam2</code>
+          <code id="url-cam2" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam2{{ camera_query }}</code>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('cam2'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
@@ -577,7 +577,7 @@
             <span class="font-semibold text-white">📹 Cam 3</span>
             <span id="cam-badge-cam3" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code id="url-cam3" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam3</code>
+          <code id="url-cam3" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam3{{ camera_query }}</code>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('cam3'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
@@ -1199,7 +1199,8 @@
     }
 
     let cameraHost = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
-    function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam; }
+    const cameraQuery = {{ camera_query | tojson }};
+    function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam + cameraQuery; }
     function tallyUrl(cam) {
       const port = location.port ? ':' + location.port : '';
       return location.protocol + '//' + cameraHost + port + '/tally/' + cam;

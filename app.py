@@ -34,11 +34,11 @@ import secrets
 import subprocess
 import signal
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from werkzeug.exceptions import HTTPException
 from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
                              stop_hotspot, get_usb_audio_devices, get_firewall_status)
-from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status,
+from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CAMERA_USER, camera_password,
                           get_mediamtx_running, get_stream_status, start_stream, stop_stream,
                           make_target, DESTINATIONS, PROFILES, switch_camera, set_audio_source, shutdown_all,
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
@@ -234,7 +234,8 @@ def index():
         host = f"[{host}]"
     destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
-    return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates)
+    return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
+                           camera_query=f"?user={CAMERA_USER}&pass={quote(camera_password(), safe='')}")
 
 
 @app.route("/tally/<cam_id>")
@@ -262,7 +263,8 @@ def api_tally_status(cam_id):
     active_cam = stream.get("active_camera")
     secondary_cam = stream.get("secondary_camera")
     replay = stream.get("replay", {}).get("active", False)
-    stream_active = bool(stream.get("active") or stream.get("state") == "live")
+    # A short uplink drop is still a live broadcast: the operator keeps framing.
+    stream_active = bool(stream.get("active") or stream.get("state") in ("live", "reconnecting"))
     going_out = stream_active or bool((stream.get("recording") or {}).get("active"))
     in_program = bool(publishing and active_cam == cam_id and not replay)
     on_air = in_program and going_out

@@ -149,7 +149,7 @@ def run():
             def replay_on_program():  # the first frame read may still be from the switch-over
                 px = program_pixels()
                 blue, label = px(80, 60), px(8, 6)
-                return blue[2] > 150 and blue[0] < 80 and label[0] > 150 and label[2] < 90
+                return blue[2] > 150 and blue[0] < 80 and label[0] > 150 and label[0] - label[2] > 70  # font edges soften the red
             wait(replay_on_program, seconds=5)
             assert not m.get_stream_status()['fallback']
             wait(lambda: not m.get_replay_status()['active'] and m.get_active_camera() == 'cam1', seconds=25)

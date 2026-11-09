@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -82,6 +83,8 @@ _relay_slot = 0
 # Shown by MediaMTX while program has no publisher (and for a frame or two at a handover)
 # instead of its "STREAM IS OFFLINE" segment.
 OFFLINE_CARD = str(BASE / "data/offline.mp4")
+CAMERA_USER = "camera"
+CAMERA_PASSWORD_FILE = str(BASE / "data/camera-password")
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
 _relay_retry_at = 0.0
@@ -400,19 +403,34 @@ def program_path():
     return "program"
 
 
+def camera_password():
+    """The password in every camera URL, kept across restarts so saved links keep working."""
+    configured = os.environ.get("MCC_CAMERA_PASSWORD")
+    if configured:
+        return configured
+    path = Path(CAMERA_PASSWORD_FILE)
+    if not path.exists():
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as output:
+            output.write(secrets.token_urlsafe(12))
+    return path.read_text().strip()
+
+
 def generate_mediamtx_config():
     # A continuous program path supplies video + silence during cuts/source loss.
-    # Program publishing is loopback-only; phones may publish only camera paths.
+    # Program publishing is loopback-only; phones need the camera password for camera paths.
     config = {
         "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
         "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
         "rtmp": True, "rtmpAddress": ":1935", "hls": True, "hlsAddress": ":8888",
         "webrtc": True, "webrtcAddress": ":8889", "srt": False, "moq": False,
         "authInternalUsers": [
-            {"user": "any", "ips": [], "permissions": [
-                {"action": "publish", "path": "~^cam[123]$"}, {"action": "read"}]},
+            {"user": CAMERA_USER, "pass": camera_password(), "ips": [], "permissions": [
+                {"action": "publish", "path": "~^cam[123]$"}]},
+            {"user": "any", "ips": [], "permissions": [{"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
-                {"action": "api"}, {"action": "publish", "path": "~^(program|final)$"}]},
+                {"action": "api"}, {"action": "publish", "path": "~^(program|final|cam[123])$"}]},
         ],
         # A camera reconnecting after a Wi-Fi drop replaces its own stale session at once
         # (otherwise it is refused until MediaMTX times the dead one out).
@@ -519,7 +537,7 @@ def get_mixer():
 
 _camera_audio = {}     # camera -> True/False: publishes an audio track (from the MediaMTX path list)
 _camera_source = {}    # camera -> MediaMTX publisher session id; changes when a camera reconnects
-_relay_source = None   # publisher session of the on-air camera when its relay was built
+_relay_sources = {}    # camera -> publisher session of every camera the running relay reads
 _follow_last = None    # last camera with sound that "sound follows the cut" put on air
 
 
@@ -895,7 +913,7 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
 def _replace_relay(cam_id, generation):
     global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
     global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout, _replay
-    global _relay_source
+    global _relay_sources
     global _relay_zmq, _relay_slot
     global _cut_seconds
     current = lambda: generation == _generation
@@ -903,7 +921,7 @@ def _replace_relay(cam_id, generation):
         return False, SUPERSEDED
     began = time.monotonic()
     wanted, profile = _effective_mix(cam_id), _profile
-    source = _camera_source.get(cam_id)
+    sessions = dict(_camera_source)
     try:
         # Probe and validate before disturbing the current publisher.
         cmd, channels, missing, warning, secondary, video_warning = _relay_command(cam_id, wanted)
@@ -929,7 +947,8 @@ def _replace_relay(cam_id, generation):
             if _relay_proc is old:
                 _relay_proc = None
             _relay_proc, _active_camera, _relay_profile = candidate, cam_id, profile
-            _relay_source = source
+            used = {cam_id, secondary, *(c for c in channels if c in CAMERA_IDS)} - {None}
+            _relay_sources = {c: sessions.get(c) for c in used}
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
             _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
@@ -1521,12 +1540,13 @@ def _stop_all(finalize=True):
 def _supervise_relay(now):
     """Restart a dead relay with backoff, and restore the chosen commentary source after
     a degraded relay once that source is available again. Never holds _lock while slow."""
-    global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at, _relay_source
+    global _relay_proc, _relay_failures, _relay_retry_at, _restore_check_at
     with _lock:
         if _replay:
             return  # the replay watcher returns to the live camera
         relay, camera = _relay_proc, _active_camera
         channels, missing = dict(_relay_channels), set(_relay_missing)
+        sources = dict(_relay_sources)
         # A relay whose picture stalled while its camera stopped publishing is finished:
         # replace it with fallback now instead of after the general 15 s health window.
         stalled = relay and relay.last_progress and now - relay.last_progress > 3 and not _camera_status.get(camera)
@@ -1539,19 +1559,23 @@ def _supervise_relay(now):
         relay = None
     if not camera:
         return
+    reconnected = sorted(c for c, session in sources.items() if session and _camera_status.get(c)
+                         and _camera_source.get(c) and _camera_source[c] != session)
     if relay is None:
         if _camera_status.get(camera) and now >= _relay_retry_at:
             ok, message = switch_camera(camera, automatic=True)
             if not ok and message not in (BUSY, SUPERSEDED):
                 _relay_failures += 1
                 _relay_retry_at = now + min(5, 2 ** min(_relay_failures, 3))  # 2, 4, 5, 5 … s
-    elif _camera_status.get(camera) and _relay_source and _camera_source.get(camera) \
-            and _camera_source[camera] != _relay_source:
-        # The on-air camera reconnected (new publisher session): the running relay still
-        # waits on the old one and shows a frozen picture, so cut to the new session now.
-        _relay_source = _camera_source[camera]  # one attempt per new session
-        logger.info("%s reconnected; rebuilding its relay", camera)
-        switch_camera(camera, automatic=True)
+    elif reconnected:
+        # A camera the relay reads reconnected (new publisher session): the relay still waits
+        # on the old one, so the picture or sound is frozen until it is rebuilt.
+        if now >= _relay_retry_at:
+            logger.info("%s reconnected; rebuilding the relay", ", ".join(reconnected))
+            ok, message = switch_camera(camera, automatic=True)
+            if not ok and message not in (BUSY, SUPERSEDED):
+                _relay_failures += 1
+                _relay_retry_at = now + min(5, 2 ** min(_relay_failures, 3))
     elif relay.healthy() and now >= _restore_check_at:
         # A mixed-in source that stopped publishing is silent in the mix: rebuild without it
         # (falls back to the camera's own sound). A missing source that is back: restore it.
@@ -1695,7 +1719,7 @@ def _supervise_recorder(now):
             if recordings.free_bytes() < recordings.MIN_FREE_KEEP:
                 logger.error("Disk almost full; stopping the recording")
                 stop_recording()
-                _record_warning = "Disk almost full — recording stopped and saved"
+                _record_warning = "Disk almost full — recording stopped. Check Recordings: it may need more free space to save."
         return
     if recorder:
         _kill_process(recorder)

@@ -26,6 +26,7 @@ RECORDINGS_DIR = Path(os.environ.get("MCC_RECORDINGS_DIR", BASE / "recordings"))
 GB = 1024 ** 3
 MIN_FREE_START = 3 * GB   # refuse to start recording below this
 MIN_FREE_KEEP = 1 * GB    # stop recording automatically below this
+JOIN_MARGIN = 200 * 1024 ** 2   # headroom when joining parts into the final file
 LABELS = ("Highlight", "Goal", "Chance", "Save", "Card", "Foul", "Other")
 CLIP_PRE, CLIP_POST = 20, 10
 _lock = threading.RLock()
@@ -370,6 +371,13 @@ def finalize(sid):
     listing = folder / "parts.txt"
     tmp = folder / "joined.part.mp4"
     try:
+        # Joining copies every part before any is removed, so it needs their size again.
+        needed = sum((folder / p["file"]).stat().st_size for p in parts) + JOIN_MARGIN
+        free = free_bytes()
+        if free < needed:
+            raise RuntimeError(f"not enough free space: needs {needed / GB:.1f} GB, "
+                               f"{free / GB:.1f} GB free. The recording parts are safe; "
+                               "free up space and restart the app to save it")
         listing.write_text("".join(f"file '{p['file']}'\n" for p in parts))
         _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
               "-safe", "0", "-i", str(listing), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
