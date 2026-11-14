@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from pathlib import Path
 import re
@@ -292,18 +293,66 @@ def export_clip(sid, mid, pre=CLIP_PRE, post=CLIP_POST):
     with _lock:
         session = _load(sid)
         marker = dict(_marker(session, mid))
-        source, offset = _source(session, marker["offset"])
-    if not source.exists():
-        raise ValueError("Recording file is missing")
-    start = max(0.0, offset - pre)
+    start = max(0.0, marker["offset"] - pre)
+    length = marker["offset"] - start + post
+    folder = _dir(sid)
     name = f"clips/{mid}.mp4"
-    target = _dir(sid) / name
-    tmp = target.with_suffix(".part.mp4")
-    _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
-          "-ss", f"{start:.2f}", "-i", str(source), "-t", f"{offset - start + post:.2f}",
-          "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-bsf:a", "aac_adtstoasc",
-          "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(tmp)])
-    os.replace(tmp, target)
+    target = folder / name
+    listing = None
+    fd, temporary = tempfile.mkstemp(dir=target.parent, suffix=".part.mp4")
+    os.close(fd)
+    tmp = Path(temporary)
+    try:
+        if session.get("file"):
+            source = folder / session["file"]
+            if not source.exists():
+                raise ValueError("Recording file is missing")
+            inputs = ["-ss", f"{start:.2f}", "-i", str(source)]
+        else:
+            # A restart splits the timeline into TS parts. Read every part that
+            # overlaps the clip, rather than only the part containing the marker.
+            parts, elapsed, seek = [], 0.0, start
+            for part in session["parts"]:
+                duration = part["duration"]
+                if duration is None or elapsed + duration > start:
+                    if not parts:
+                        seek = max(0.0, start - elapsed)
+                    if not (folder / part["file"]).is_file():
+                        raise ValueError("Recording file is missing")
+                    parts.append(part)
+                if duration is None:
+                    break
+                elapsed += duration
+                if elapsed >= start + length:
+                    break
+            if not parts:
+                raise ValueError("Nothing has been recorded at this moment")
+            fd, path = tempfile.mkstemp(dir=folder, suffix=".concat")
+            listing = Path(path)
+            seekable = True
+            with os.fdopen(fd, "w") as output:
+                for part in parts:
+                    output.write(f"file '{part['file']}'\n")
+                    duration = part["duration"]
+                    if duration is None:
+                        duration = _probe_duration(folder / part["file"])
+                    if duration and math.isfinite(duration):
+                        output.write(f"duration {duration:.6f}\n")
+                    else:
+                        seekable = False
+            # Durations let concat seek to the preceding keyframe without scanning
+            # hours of footage. Fall back to output seeking for an unprobeable part.
+            inputs = ["-f", "concat", "-safe", "0"]
+            inputs += (["-ss", f"{seek:.2f}", "-i", str(listing)] if seekable else
+                       ["-i", str(listing), "-ss", f"{seek:.2f}"])
+        _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", *inputs,
+              "-t", f"{length:.2f}", "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
+              "-bsf:a", "aac_adtstoasc", "-avoid_negative_ts", "make_zero", "-movflags", "+faststart", str(tmp)])
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+        if listing is not None:
+            listing.unlink(missing_ok=True)
     with _lock:
         session = _load(sid)
         _marker(session, mid)["clip"] = name

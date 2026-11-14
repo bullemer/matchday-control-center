@@ -931,8 +931,8 @@ def _replace_relay(cam_id, generation):
             _error = problem
         return False, problem
     with _lock:
-        installed = True
-        ended_replay = _replay is not None
+        installed = current()
+        ended_replay = installed and _replay is not None
         if installed:
             _replay, _relay_slot, _relay_zmq = None, slot, _slot_zmq(slot)
             if _relay_proc is old:
@@ -945,6 +945,9 @@ def _replace_relay(cam_id, generation):
             _relay_secondary, _layout_warning = secondary, video_warning
             _layout = {**_layout, "main": cam_id}
             _error, _relay_failures = "", 0
+    if not installed:
+        _kill_process(candidate)
+        return False, SUPERSEDED
     if installed:
         _kill_process(old)
         _cut_seconds = round(0.5 * _cut_seconds + 0.5 * (time.monotonic() - began), 2)
@@ -1024,7 +1027,7 @@ def _install_replay(generation, camera, replay):
         return False, problem
     airtime = replay["length"] / replay["speed"]
     with _lock:
-        installed = True
+        installed = current()
         if installed:
             _relay_proc, _relay_channels, _relay_missing = candidate, channels, missing
             _relay_slot, _relay_zmq = slot, _slot_zmq(slot)
@@ -1032,6 +1035,9 @@ def _install_replay(generation, camera, replay):
             _audio_warning, _relay_secondary = warning, None
             _replay = {**replay, "camera": camera, "generation": generation, "ends_at": time.time() + airtime,
                        "on_air_at": time.time()}
+    if not installed:
+        _kill_process(candidate)
+        return False, SUPERSEDED
     _kill_process(old)
     _notify_replay(True)
     threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime, replay["hold"]),
@@ -1050,16 +1056,36 @@ def _watch_replay(proc, generation, camera, airtime, hold=False):
     # The live relay takes over as soon as it is ready: start it as long before the end
     # as a cut takes here, so the replay's last frame is held as briefly as possible.
     returning = float("inf") if hold else time.monotonic() + max(0.0, airtime - max(REPLAY_LEAD, _cut_seconds + 0.5))
-    while proc.poll() is None and generation == _generation and time.monotonic() < returning:
+    def owns_replay():
+        replay = _replay
+        return replay is not None and replay["generation"] == generation
+
+    # A request generation changes before its replacement is ready. Keep the replay
+    # until a successful handover (or STOP) actually removes its ownership.
+    while proc.poll() is None and owns_replay() and time.monotonic() < returning:
         time.sleep(.1)
-    while camera and not hold and proc.poll() is None and generation == _generation:
-        ok, message = switch_camera(camera, automatic=True)  # never overrides an operator cut
-        if ok or message == SUPERSEDED:
+    while camera and not hold and proc.poll() is None and owns_replay():
+        if not _switch_lock.acquire(blocking=False):
+            time.sleep(.1)
+            continue
+        try:
+            with _lock:
+                if not owns_replay():
+                    return
+                token = _stop_generation
+                pending = _pending_camera is not None
+            if pending:
+                ok, message = False, BUSY
+            else:
+                ok, message = switch_camera(camera, automatic=True, expected_stop=token)
+        finally:
+            _switch_lock.release()
+        if ok:
             return
-        if message != BUSY:
+        if message not in (BUSY, SUPERSEDED):
             logger.warning("Back to live after replay: %s", message)
             break
-        time.sleep(.5)  # an operator cut is in progress; it ends the replay itself
+        time.sleep(.1)
     with _lock:
         ended = _replay is not None and _replay["generation"] == generation
         if ended:
@@ -1137,6 +1163,10 @@ def _apply_mix():
         muted = _muted
     if not camera:
         return True, "Mixer updated"
+    # The relay uses camera audio at unity gain when every requested source is
+    # missing. Preserve that same fallback when unmuting or adjusting the mixer.
+    if wanted and set(wanted) <= missing and camera in channels and camera not in wanted:
+        wanted = {camera: 0.0}
     # Muting never rebuilds: silencing the channels the relay has is enough.
     if relay is not None and relay.poll() is None and (muted or set(wanted) - missing <= set(channels)):
         applied = True
