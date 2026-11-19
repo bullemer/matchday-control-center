@@ -1824,7 +1824,9 @@
 
     function renderRecordings(info) {
       state.recLabels = info.labels;
-      bind('rec_free', `${fmtBytes(info.free_bytes)} free on this laptop — about ${Math.floor(info.free_bytes / 2.1e9)} h of 720p or ${Math.floor(info.free_bytes / 2.8e9)} h of 1080p`);
+      const room = info.recordable_bytes ?? info.free_bytes / 2;
+      const fmtRoom = rate => { const h = room / rate; return h < 3 ? `${Math.floor(h * 60)} min` : `${Math.floor(h)} h`; };
+      bind('rec_free', `${fmtBytes(info.free_bytes)} free on this laptop — room for about ${fmtRoom(2.1e9)} of 720p or ${fmtRoom(2.8e9)} of 1080p recording (saving the file needs the same space again)`);
       const list = document.getElementById('recordings-list');
       list.querySelector('[data-recordings-empty]').hidden = info.recordings.length > 0;
       const seen = new Set();
@@ -2633,8 +2635,15 @@
     }
 
     // ──────────────────────── Poll /api/status ────────────────────────
+    let statusFailures = 0;
     async function pollStatus() {
       const data = await apiGet('/api/status');
+      if (data && data.ok) statusFailures = 0;
+      else if (++statusFailures < 2) {
+        // One missed poll is not an outage: keep the previews and tallies as they are.
+        setBanner('Connection interrupted — retrying…', 'warning');
+        return;
+      }
       if (!data || !data.ok) {
         setBanner('Connection lost — controls may be stale', 'error');
         document.getElementById('status-yt-badge').textContent = 'UNKNOWN';

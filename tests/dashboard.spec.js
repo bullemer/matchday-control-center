@@ -442,6 +442,21 @@ test('operator mobile tally screen loads without basic auth and displays camera 
   await context.close();
 });
 
+test('tally tells the camera a replay returns to that it is about to be live again', async ({browser}) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const tally = {ok: true, cam_id: 'cam1', publishing: true, on_air: false, selected: false, secondary: false,
+                 stream_active: true, replay: true, returning: true, replay_hold: false};
+  await page.route('**/api/tally/cam1', route => route.fulfill({json: tally}));
+  await page.goto('/tally/cam1');
+  await expect(page.locator('#tally-status')).toContainText('REPLAY ON AIR');
+  await expect(page.locator('#tally-hint')).toContainText('live again in a moment');
+  await expect(page.locator('#tally-box')).toHaveClass(/tally-replay/);
+  Object.assign(tally, {replay: false, returning: false, on_air: true});
+  await expect(page.locator('#tally-status')).toContainText('LIVE ON AIR');
+  await context.close();
+});
+
 
 test('setup tabs group sections, persist the choice and play previews only on Main', async ({page}) => {
   await page.goto('/');

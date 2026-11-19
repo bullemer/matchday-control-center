@@ -88,6 +88,7 @@ _relay_failures = 0
 _relay_retry_at = 0.0
 _restore_check_at = 0.0
 _mediamtx_retry_at = 0.0
+_status_failures = 0     # consecutive failed camera-status queries
 # Streaming destinations: name -> {"label", "url", "secret", "proc", "state", "error",
 # "failures", "retry_at", "started_at"}. Each is a copy-only reader of "final" with its own
 # reconnect backoff, so one platform dropping out never touches the others.
@@ -98,6 +99,8 @@ _recording = None         # active recording session id
 _rec_retry_at = _disk_check_at = 0.0
 _rec_failures = 0
 _record_warning = ""
+_disk_warning = ""        # recording room is running out
+LOW_ROOM_MINUTES = 15
 # Instant replay: a temporary relay plays part of the running recording into program.
 # _active_camera keeps the live camera to return to; any cut or STOP ends the replay.
 _replay = None
@@ -611,7 +614,8 @@ def _notify_replay(active):
 def get_recording_status():
     session, recorder = _recording, _recorder_proc
     status = {"active": bool(_want_record and session), "session": session,
-              "writing": bool(recorder and recorder.healthy()), "warning": _record_warning}
+              "writing": bool(recorder and recorder.healthy()),
+              "warning": _record_warning or (_disk_warning if _want_record and session else "")}
     if session:
         try:
             info = recordings.get(session, live_wall=time.time())
@@ -626,6 +630,11 @@ def _ffmpeg():
             "-nostats", "-progress", "pipe:1"]
 
 
+def _relay_ffmpeg():
+    """A relay reports progress ten times a second: a cut waits for its first frames."""
+    return _ffmpeg() + ["-stats_period", "0.1"]
+
+
 def _input(path):
     return ["-rtsp_transport", "tcp", "-timeout", "5000000", "-i", f"{RTSP_BASE}/{path}"]
 
@@ -634,7 +643,9 @@ def _camera_input(path, audio_only=False):
     """A camera input of a relay. Deep queue: with several cameras (picture-in-picture,
     commentary from another camera) the default 8 packets blocked the start of a cut.
     A camera that only contributes sound is fetched without its video."""
-    options = ["-thread_queue_size", "512"]
+    # MediaMTX announces the tracks, so ffmpeg's default stream probing only delayed every
+    # cut by about a second (measured: new picture on air after 2.4 s, 1.2 s with this).
+    options = ["-thread_queue_size", "512", "-probesize", "500000", "-analyzeduration", "500000"]
     if audio_only:
         options += ["-allowed_media_types", "audio"]
     return options + _input(path)
@@ -735,7 +746,7 @@ def _relay_command(cam, wanted, replay=None):
     With replay, the picture comes from the recording and the live mix plays over it."""
     if replay:
         cam, tracks = None, {"video"}
-        cmd = _ffmpeg() + ["-readrate", f"{replay['speed']:g}", "-ss", f"{replay['start']:.2f}",
+        cmd = _relay_ffmpeg() + ["-readrate", f"{replay['speed']:g}", "-ss", f"{replay['start']:.2f}",
                            "-t", f"{replay['length']:.2f}", "-i", replay["source"]]
         layout = {"mode": "single"}
         inputs_by_camera = {}
@@ -743,7 +754,7 @@ def _relay_command(cam, wanted, replay=None):
         tracks = _probe(cam)
         if "video" not in tracks:
             raise ValueError(f"{cam} has no video")
-        cmd = _ffmpeg() + _camera_input(cam)
+        cmd = _relay_ffmpeg() + _camera_input(cam)
         layout = dict(_layout)
         inputs_by_camera = {cam: (0, tracks)}
     sources, missing, notes, next_input = [], set(), [], 1
@@ -847,6 +858,26 @@ def _send_command(address, command):
         sock.close()
 
 
+_retiring = None  # thread stopping the relay that was just replaced
+
+
+def _retire(proc):
+    """Stop a replaced relay in the background. It is already off air; waiting for it to
+    exit (about a second) delayed the answer to the cut and blocked the next one."""
+    global _retiring
+    if not proc:
+        return
+    _retiring = threading.Thread(target=_kill_process, args=(proc,), daemon=True, name="relay-retire")
+    _retiring.start()
+
+
+def _await_retired():
+    """Before another relay starts: the previous one must have released its control port."""
+    worker = _retiring
+    if worker and worker is not threading.current_thread():
+        worker.join(timeout=7)
+
+
 def _take_over(cmd, current):
     """Start a relay while the current one stays on air; MediaMTX hands program over to it
     when it publishes. Returns (process, None) or (None, error message)."""
@@ -875,9 +906,10 @@ SUPERSEDED = "Superseded by a newer request"
 BUSY = "A cut is already in progress"
 
 
-def switch_camera(cam_id, automatic=False, expected_stop=None):
+def switch_camera(cam_id, automatic=False, expected_stop=None, force=False):
     """Operator cuts supersede any cut in flight. Automatic (supervisor) cuts never wait
-    and never supersede an operator."""
+    and never supersede an operator. An operator cut to the camera that is already on
+    air changes nothing (a double tap must not rebuild the relay), unless force."""
     global _generation, _pending_camera
     if cam_id not in CAMERA_IDS:
         return False, "Invalid camera"
@@ -886,6 +918,9 @@ def switch_camera(cam_id, automatic=False, expected_stop=None):
             return False, SUPERSEDED
         if not get_mediamtx_running():
             return False, "MediaMTX is not ready"
+        if (not automatic and not force and _pending_camera is None
+                and cam_id == _active_camera and get_active_camera() == cam_id):
+            return True, f"Camera {cam_id} is already on air"
         if not automatic:
             _generation += 1
             _pending_camera = cam_id
@@ -925,6 +960,7 @@ def _replace_relay(cam_id, generation):
             return False, SUPERSEDED
         old, slot = _relay_proc, _spare_slot()
     # The current relay stays on air while the new one starts.
+    _await_retired()
     candidate, problem = _take_over(cmd, current)
     if candidate is None:
         if problem != SUPERSEDED:
@@ -949,7 +985,7 @@ def _replace_relay(cam_id, generation):
         _kill_process(candidate)
         return False, SUPERSEDED
     if installed:
-        _kill_process(old)
+        _retire(old)
         _cut_seconds = round(0.5 * _cut_seconds + 0.5 * (time.monotonic() - began), 2)
     if ended_replay:
         _notify_replay(False)
@@ -1022,6 +1058,7 @@ def _install_replay(generation, camera, replay):
         if not current():
             return False, SUPERSEDED
         old, slot = _relay_proc, _spare_slot()
+    _await_retired()
     candidate, problem = _take_over(cmd, current)  # live stays on air until the replay is ready
     if candidate is None:
         return False, problem
@@ -1038,7 +1075,7 @@ def _install_replay(generation, camera, replay):
     if not installed:
         _kill_process(candidate)
         return False, SUPERSEDED
-    _kill_process(old)
+    _retire(old)
     _notify_replay(True)
     threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime, replay["hold"]),
                      daemon=True, name="replay-watcher").start()
@@ -1364,11 +1401,20 @@ def _check_disk():
     return ""
 
 
+def _room_note(profile):
+    """Said when recording starts with less room than a whole match needs."""
+    minutes = recordings.minutes_left(recordings.room_left(), profile)
+    if minutes >= 120:
+        return ""
+    return f" — disk space for only about {minutes} min of recording (saving the file needs the same space again)"
+
+
 def _begin_recording(title):
     """Under _lock: open a new session; the supervisor launches the recorder."""
-    global _want_record, _recording, _rec_failures, _rec_retry_at, _record_warning
+    global _want_record, _recording, _rec_failures, _rec_retry_at, _record_warning, _disk_warning, _disk_check_at
     _recording = recordings.create_session(_profile, title)
     _want_record, _rec_failures, _rec_retry_at, _record_warning = True, 0, 0.0, ""
+    _disk_warning, _disk_check_at = "", 0.0
 
 
 def _attach(targets, record, title):
@@ -1384,7 +1430,7 @@ def _attach(targets, record, title):
         if problem:
             return False, problem
         _begin_recording(title)
-        messages.append("Recording started")
+        messages.append("Recording started" + _room_note(_profile))
     if new:
         _targets.update(new)
         _summarize_targets()
@@ -1440,7 +1486,7 @@ def _start_output(targets, profile, token, record=False, title=""):
             return False, problem
     if get_active_camera() and _relay_profile != profile:
         # Rebuild the program relay at the stream resolution before going live.
-        ok, message = switch_camera(_active_camera, expected_stop=token)
+        ok, message = switch_camera(_active_camera, expected_stop=token, force=True)
         if not ok:
             return False, message
     if not get_active_camera():
@@ -1477,10 +1523,11 @@ def _start_output(targets, profile, token, record=False, title=""):
         _retry_at, _retries = 0, 0
         if record:
             _begin_recording(title)
+        note = _room_note(_profile) if record else ""
         if not targets:
-            return True, "Recording starting"
+            return True, "Recording starting" + note
         names = ", ".join(t["label"] for t in targets.values())
-        return True, f"Going live on {names}" + (" and recording" if record else "") + "; watch the live status for confirmation"
+        return True, f"Going live on {names}" + (" and recording" if record else "") + "; watch the live status for confirmation" + note
 
 
 def stop_stream(name=None):
@@ -1615,14 +1662,19 @@ def _supervise_relay(now):
 
 def _supervise_once():
     global _camera_status, _state, _error, _started_at, _retry_at, _retries, _mediamtx_retry_at
-    global _relay_failures, _relay_retry_at
+    global _relay_failures, _relay_retry_at, _status_failures
     before = _camera_status
     try:
         paths = _paths()
         _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS}
         _camera_status["program"] = paths.get(program_path(), False)
+        _status_failures = 0
     except (requests.RequestException, ValueError, KeyError):
-        _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
+        # One missed answer from a running MediaMTX is not a camera outage: keep the last
+        # status (marking everything offline stopped the meters and rebuilt the relay on air).
+        _status_failures += 1
+        if _status_failures >= 2 or not get_mediamtx_running():
+            _camera_status = {c: False for c in CAMERA_IDS + ["program"]}
     if any(_camera_status.get(c) and not before.get(c) for c in CAMERA_IDS):
         # A camera (re)connected: put it back on air right away, not after an old backoff.
         _relay_failures, _relay_retry_at = 0, 0.0
@@ -1718,7 +1770,7 @@ def _supervise_target(name, now):
 
 def _supervise_recorder(now):
     """Keep the recorder writing; a restart continues in a new part of the same recording."""
-    global _recorder_proc, _rec_failures, _rec_retry_at, _record_warning, _disk_check_at
+    global _recorder_proc, _rec_failures, _rec_retry_at, _record_warning, _disk_check_at, _disk_warning
     with _lock:
         if not (_want_record and _recording):
             return
@@ -1737,10 +1789,19 @@ def _supervise_recorder(now):
                     _rec_failures, _record_warning = 0, ""
         if now >= _disk_check_at:
             _disk_check_at = now + 10
-            if recordings.free_bytes() < recordings.MIN_FREE_KEEP:
+            # Stop while the parts can still be joined: that needs their size once more.
+            room = recordings.room_left(session)
+            minutes = recordings.minutes_left(room, _profile)
+            if not room:
                 logger.error("Disk almost full; stopping the recording")
                 stop_recording()
-                _record_warning = "Disk almost full — recording stopped. Check Recordings: it may need more free space to save."
+                _record_warning = "Disk almost full — recording stopped; the file is being saved."
+            elif minutes < LOW_ROOM_MINUTES:
+                if not _disk_warning:
+                    logger.warning("Recording room is running out: about %d min left", minutes)
+                _disk_warning = f"Disk space for only about {max(1, minutes)} more min of recording — free up space or it stops"
+            else:
+                _disk_warning = ""
         return
     if recorder:
         _kill_process(recorder)
@@ -1784,6 +1845,7 @@ def shutdown_all():
             worker.join(timeout=20)
     with _lock:
         _stop_all(finalize=False)  # an open recording is joined at the next start
+        _await_retired()
         for key in list(_meters):
             _kill_process(_meters.pop(key))
         _kill_process(_mediamtx_proc)

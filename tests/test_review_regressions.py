@@ -89,6 +89,38 @@ class HandoverRegressions(EngineStateCase):
         self.assertEqual(cut.call_count, 2)
         cut.assert_called_with('cam1', automatic=True, expected_stop=0)
 
+    def test_cut_to_the_camera_on_air_changes_nothing(self):
+        with patch.object(m, '_replace_relay', return_value=(True, 'Camera cam1 selected')) as replace:
+            self.assertEqual(m.switch_camera('cam1'), (True, 'Camera cam1 is already on air'))
+            replace.assert_not_called()
+            m.switch_camera('cam1', force=True)      # a new stream resolution still rebuilds
+            self.assertEqual(replace.call_count, 1)
+            m._replay = {'camera': 'cam1'}           # back to live from a replay still cuts
+            m.switch_camera('cam1')
+            self.assertEqual(replace.call_count, 2)
+
+    def test_replaced_relay_is_stopped_without_delaying_the_cut(self):
+        old, candidate, release = m._relay_proc, MagicMock(), threading.Event()
+        self.kill.side_effect = lambda proc, *a: release.wait(5)
+        with patch.object(m, '_take_over', return_value=(candidate, None)):
+            ok, _ = m._replace_relay('cam2', m._generation)   # returns while the old relay still exits
+        self.assertTrue(ok)
+        self.assertIs(m._relay_proc, candidate)
+        release.set()
+        m._await_retired()
+        self.kill.assert_called_once_with(old)
+
+    def test_one_missed_status_answer_keeps_cameras_online(self):
+        import requests
+        online = {'cam1': True, 'cam2': True, 'cam3': False, 'program': True}
+        with patch.object(m, '_camera_status', dict(online)), patch.object(m, '_status_failures', 0), \
+                patch.object(m, '_paths', side_effect=requests.ConnectionError), \
+                patch.object(m, '_supervise_relay'), patch.object(m, '_supervise_meters'):
+            m._supervise_once()
+            self.assertEqual(m._camera_status, online)
+            m._supervise_once()
+            self.assertFalse(any(m._camera_status.values()))
+
 
 @unittest.skipUnless(shutil.which('ffmpeg') and shutil.which('ffprobe'), 'FFmpeg required')
 class ClipBoundaryRegressions(EngineStateCase):

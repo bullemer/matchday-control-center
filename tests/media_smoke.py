@@ -320,7 +320,7 @@ def run():
             assert probe.stdout.strip() == '1920,1080', probe.stdout
             print('PASS: 1080p profile streams a 1080p program', flush=True)
             results = []
-            cut = threading.Thread(target=lambda: results.append(m.switch_camera('cam1')))
+            cut = threading.Thread(target=lambda: results.append(m.switch_camera('cam1', force=True)))
             cut.start()
             time.sleep(.5)
             started = time.monotonic()

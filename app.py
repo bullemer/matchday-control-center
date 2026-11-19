@@ -273,6 +273,8 @@ def api_tally_status(cam_id):
     going_out = stream_active or bool((stream.get("recording") or {}).get("active"))
     in_program = bool(publishing and active_cam == cam_id and not replay)
     on_air = in_program and going_out
+    # During a replay the camera it returns to is seconds from being live again.
+    returning = bool(replay and publishing and going_out and stream.get("replay", {}).get("camera") == cam_id)
     selected = in_program and not going_out
     secondary = bool(publishing and secondary_cam == cam_id and going_out)
     return jsonify({
@@ -286,6 +288,8 @@ def api_tally_status(cam_id):
         "stream_active": stream_active,
         "stream_state": stream.get("state", "stopped"),
         "replay": replay,
+        "returning": returning,
+        "replay_hold": bool(replay and stream.get("replay", {}).get("hold")),
     })
 
 
@@ -486,9 +490,11 @@ def api_marker_add():
 @app.route("/api/recordings", methods=["GET"])
 @api_endpoint
 def api_recordings():
+    status = get_recording_status()
     return jsonify({"ok": True, "recordings": recordings.list_sessions(live_wall=time.time()),
                     "free_bytes": recordings.free_bytes(), "labels": list(recordings.LABELS),
-                    "recording": get_recording_status()})
+                    "recordable_bytes": recordings.room_left(status["session"] if status["active"] else None),
+                    "recording": status})
 
 
 @app.route("/api/recordings/<sid>/markers/<mid>", methods=["POST"])
@@ -886,6 +892,7 @@ def api_scoreboard_get():
 # Runtime services are explicit: importing the module starts no processes.
 RUNTIME_DIR = Path(__file__).resolve().parent / "data"
 MATCH_PATH = RUNTIME_DIR / "match.json"
+CLOCK_RESUME_MAX = 600  # seconds of downtime after which a running clock is not resumed
 _workers_stop = threading.Event()
 _init_lock = threading.Lock()
 _workers = []
@@ -901,6 +908,7 @@ def text_field(data, field, limit, default=""):
 def _save_match():
     with _scoreboard_lock:
         state = _get_scoreboard_state()
+        state["saved_at"] = time.time()  # lets a restart continue a running clock
         MATCH_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=MATCH_PATH.parent)
         try:
@@ -936,8 +944,17 @@ def _restore_match():
             half_length = state.get("half_length", 45)  # saved before half length existed
             if type(half_length) is not int or not 10 <= half_length <= 60:
                 half_length = 45
-            _clock.update(running=False, elapsed=float(state["clock_elapsed_secs"]),
-                          start_ts=None, half=state["half"], half_length=half_length)
+            # A clock that was running keeps running through a crash or restart: the match
+            # went on. After a long gap (the laptop was put away) it stays paused instead.
+            saved_at, gap = state.get("saved_at"), None
+            if state.get("clock_running") is True and type(saved_at) in (int, float) and math.isfinite(saved_at):
+                gap = time.time() - saved_at
+            resume = gap is not None and 0 <= gap <= CLOCK_RESUME_MAX
+            _clock.update(running=resume, elapsed=elapsed + (gap if resume else 0.0),
+                          start_ts=time.monotonic() if resume else None,
+                          half=state["half"], half_length=half_length)
+            if resume:
+                log.info("Match clock resumed at %s after a %.0f s restart", _format_clock(_clock["elapsed"]), gap)
     except (ValueError, KeyError, OSError, TypeError):
         log.exception("Cannot restore saved match")
 

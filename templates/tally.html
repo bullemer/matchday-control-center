@@ -23,6 +23,10 @@
       background-color: #2563eb !important;
       color: #ffffff !important;
     }
+    .tally-replay {
+      background-color: #7e22ce !important;
+      color: #ffffff !important;
+    }
     .tally-selected {
       background-color: #b45309 !important;
       color: #ffffff !important;
@@ -201,6 +205,13 @@
           playBeep();
         }
         lastOnAir = true;
+      } else if (data.returning) {
+        // Not a new cut: the camera goes straight back on air, so no second buzz then.
+        // A held replay ends with a director cut, which is announced like any other cut.
+        renderState('replay', '🟣 REPLAY ON AIR', data.replay_hold
+          ? 'Stay ready — the director cuts back to you.'
+          : 'You are live again in a moment — keep framing!');
+        lastOnAir = !data.replay_hold;
       } else if (data.secondary) {
         renderState('secondary', '🔵 ON AIR (PiP / 2nd)', 'Showing as inset / split screen');
         lastOnAir = false;
@@ -221,6 +232,8 @@
       box.className = 'tally-screen my-auto py-12 px-6 rounded-3xl border-4 text-center flex flex-col items-center justify-center gap-4 shadow-2xl ';
       if (state === 'on-air') {
         box.className += 'tally-on-air border-red-300 tally-pulse';
+      } else if (state === 'replay') {
+        box.className += 'tally-replay border-purple-300';
       } else if (state === 'secondary') {
         box.className += 'tally-secondary border-blue-300';
       } else if (state === 'selected') {

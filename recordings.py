@@ -28,6 +28,7 @@ GB = 1024 ** 3
 MIN_FREE_START = 3 * GB   # refuse to start recording below this
 MIN_FREE_KEEP = 1 * GB    # stop recording automatically below this
 JOIN_MARGIN = 200 * 1024 ** 2   # headroom when joining parts into the final file
+BYTES_PER_HOUR = {"720p": 2.1e9, "1080p": 2.8e9}   # what an hour of recording takes
 LABELS = ("Highlight", "Goal", "Chance", "Save", "Card", "Foul", "Other")
 CLIP_PRE, CLIP_POST = 20, 10
 _lock = threading.RLock()
@@ -65,6 +66,28 @@ def free_bytes():
     while not folder.exists() and folder != folder.parent:
         folder = folder.parent
     return shutil.disk_usage(folder).free
+
+
+def parts_bytes(sid):
+    """Size of the parts recorded so far: joining them needs this much room again."""
+    try:
+        with _lock:
+            session = _load(sid)
+        folder = _dir(sid)
+        return sum((folder / p["file"]).stat().st_size for p in session["parts"] if (folder / p["file"]).exists())
+    except (ValueError, OSError, KeyError, json.JSONDecodeError):
+        return 0
+
+
+def room_left(sid=None):
+    """Bytes that can still be recorded so that the finished recording can also be saved:
+    every recorded byte is needed twice until the parts are joined into the final file."""
+    written = parts_bytes(sid) if sid else 0
+    return max(0, int((free_bytes() - written - JOIN_MARGIN - MIN_FREE_KEEP) // 2))
+
+
+def minutes_left(room, profile):
+    return int(room / BYTES_PER_HOUR.get(profile, max(BYTES_PER_HOUR.values())) * 60)
 
 
 def _slug(text):
@@ -426,7 +449,7 @@ def finalize(sid):
         if free < needed:
             raise RuntimeError(f"not enough free space: needs {needed / GB:.1f} GB, "
                                f"{free / GB:.1f} GB free. The recording parts are safe; "
-                               "free up space and restart the app to save it")
+                               "free up space, then press Finish saving")
         listing.write_text("".join(f"file '{p['file']}'\n" for p in parts))
         _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
               "-safe", "0", "-i", str(listing), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",

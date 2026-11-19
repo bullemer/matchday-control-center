@@ -72,6 +72,21 @@ class ApiTests(unittest.TestCase):
                     'active_camera':None,'selected_camera':'cam1','replay':{'active':True},'state':'live','active':True}):
                 tally=self.client.get('/api/tally/cam1').get_json()
             self.assertEqual((tally['on_air'],tally['replay']),(False,True))
+            self.assertFalse(tally['returning'])  # the replay returns to another camera
+
+    def test_tally_tells_the_returning_camera_about_the_replay(self):
+        stream={'active_camera':None,'selected_camera':'cam1','state':'live','active':True,
+                'replay':{'active':True,'camera':'cam1','hold':False}}
+        with patch.object(a,'get_camera_status',return_value={'cam1':True,'cam2':True}),patch.object(a,'get_stream_status',return_value=stream):
+            one=self.client.get('/api/tally/cam1').get_json(); two=self.client.get('/api/tally/cam2').get_json()
+            self.assertEqual((one['on_air'],one['returning'],one['replay_hold']),(False,True,False))
+            self.assertFalse(two['returning'])
+            stream['replay']['hold']=True
+            self.assertTrue(self.client.get('/api/tally/cam1').get_json()['replay_hold'])
+            stream.update(state='stopped',active=False)  # nothing goes out: nobody is about to be live
+            self.assertFalse(self.client.get('/api/tally/cam1').get_json()['returning'])
+        page=self.client.get('/tally/cam1').get_data(as_text=True)
+        self.assertIn('data.returning',page); self.assertIn('REPLAY ON AIR',page)
         a._write_scoreboard_file()
         self.assertIn('HOME',Path(a.SCOREBOARD_PATH).read_text())
         with patch.object(a,'play_replay',return_value=(True,'Replay on air (10 s)')) as replay:
@@ -121,6 +136,30 @@ class ApiTests(unittest.TestCase):
         a._scoreboard['visible']=False
         a._restore_match()
         self.assertTrue(a._scoreboard['visible'])
+
+    def test_running_clock_continues_after_restart(self):
+        self.post('/api/scoreboard/clock',{'action':'set','seconds':600})
+        self.post('/api/scoreboard/clock',{'action':'start'})
+        state=json.loads(a.MATCH_PATH.read_text())
+        state['saved_at']-=30  # the app was down for 30 s
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._restore_match()
+        self.assertTrue(a._clock['running'])
+        self.assertAlmostEqual(a._clock_elapsed(),630,delta=2)
+        state['saved_at']-=3600  # put away for an hour: not a restart during the match
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._restore_match()
+        self.assertFalse(a._clock['running'])
+        self.assertAlmostEqual(a._clock_elapsed(),600,delta=2)
+
+    def test_paused_clock_stays_paused_after_restart(self):
+        self.post('/api/scoreboard/clock',{'action':'set','seconds':600})
+        state=json.loads(a.MATCH_PATH.read_text())
+        state['saved_at']-=30
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._restore_match()
+        self.assertFalse(a._clock['running'])
+        self.assertEqual(a._clock_elapsed(),600)
 
     def test_layout_api_validates_and_applies(self):
         with patch.object(a,'set_layout',return_value=(True,'Layout applied')) as layout:
@@ -686,11 +725,11 @@ class MediaTests(unittest.TestCase):
             cmd, channels, *_ = m._relay_command('cam3',{'cam1':0.0})
         inputs=[i for i,x in enumerate(cmd) if x=='-i']
         cam1=next(i for i in inputs if cmd[i+1].endswith('/cam1'))
-        self.assertEqual(cmd[cam1-8:cam1-4],['-thread_queue_size','512','-allowed_media_types','audio'])
+        self.assertEqual(cmd[cam1-12:cam1-4],['-thread_queue_size','512','-probesize','500000','-analyzeduration','500000','-allowed_media_types','audio'])
         for path in ('/cam3','/cam2'):  # main picture and inset keep their video, deep queues too
             i=next(i for i in inputs if cmd[i+1].endswith(path))
-            self.assertEqual(cmd[i-6:i-4],['-thread_queue_size','512'])
-            self.assertNotIn('-allowed_media_types',cmd[i-6:i])
+            self.assertEqual(cmd[i-10:i-8],['-thread_queue_size','512'])
+            self.assertNotIn('-allowed_media_types',cmd[i-10:i])
         self.assertEqual(channels,{'cam1':'m0'})
 
     def test_missing_usb_mic_degrades(self):
@@ -736,7 +775,7 @@ class MediaTests(unittest.TestCase):
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
             self.assertTrue(m.start_youtube_stream('key','1080p')[0])
-            cut.assert_called_once_with('cam1', expected_stop=m._stop_generation)
+            cut.assert_called_once_with('cam1', expected_stop=m._stop_generation, force=True)
             m.stop_youtube_stream()
 
     def test_meter_parses_levels_and_silence(self):
@@ -1045,6 +1084,53 @@ class RecordingTests(EngineStateCase):
             m._supervise_recorder(m.time.monotonic())
         self.assertFalse(m._want_record)
         self.assertIn('Disk almost full', m._record_warning)
+
+    def test_recording_stops_while_the_file_can_still_be_saved(self):
+        # 5 GB free looks plenty, but 4.5 GB is already recorded and saving needs that again.
+        self.running()
+        m._recorder_proc.poll.return_value = None
+        m._recorder_proc.healthy.return_value = True
+        m._recorder_proc.first_progress = None
+        GB = m.recordings.GB
+        with patch.object(m, '_disk_check_at', 0), patch.object(m.recordings, 'close_part'), \
+                patch.object(m.recordings, 'parts_bytes', return_value=int(4.5 * GB)), \
+                patch.object(m.recordings, 'free_bytes', return_value=5 * GB):
+            m._supervise_recorder(m.time.monotonic())
+        self.assertFalse(m._want_record)
+        self.assertIn('being saved', m._record_warning)
+
+    def test_low_recording_room_warns_before_it_stops(self):
+        self.running()
+        m._recorder_proc.poll.return_value = None
+        m._recorder_proc.healthy.return_value = True
+        m._recorder_proc.first_progress = None
+        GB = m.recordings.GB
+        with patch.object(m, '_disk_warning', ''), patch.object(m.recordings, 'parts_bytes', return_value=4 * GB):
+            with patch.object(m, '_disk_check_at', 0), patch.object(m.recordings, 'free_bytes', return_value=int(5.8 * GB)):
+                m._supervise_recorder(m.time.monotonic())
+                self.assertTrue(m._want_record)
+                self.assertIn('more min of recording', m.get_recording_status()['warning'])
+            with patch.object(m, '_disk_check_at', 0), patch.object(m.recordings, 'free_bytes', return_value=50 * GB):
+                m._supervise_recorder(m.time.monotonic())
+                self.assertEqual(m.get_recording_status()['warning'], '')
+
+    def test_room_left_counts_the_space_needed_to_save(self):
+        r = m.recordings
+        with patch.object(r, 'free_bytes', return_value=21 * r.GB), patch.object(r, 'parts_bytes', return_value=4 * r.GB):
+            idle, live = r.room_left(), r.room_left('s1')
+        self.assertEqual(idle, int((21 * r.GB - r.JOIN_MARGIN - r.MIN_FREE_KEEP) // 2))
+        self.assertEqual(idle - live, 2 * r.GB)
+        with patch.object(r, 'free_bytes', return_value=r.GB // 2):
+            self.assertEqual(r.room_left(), 0)
+
+    def test_starting_with_little_room_says_how_long_it_lasts(self):
+        self.running(key='key', record=False)
+        with patch.object(m.recordings, 'free_bytes', return_value=4 * m.recordings.GB):
+            ok, message = m.start_recording()
+        self.assertTrue(ok)
+        self.assertRegex(message, r'only about \d+ min of recording')
+        m.stop_recording()
+        self.assertNotIn('only about', m.start_recording()[1])  # 50 GB: nothing to mention
 
     def test_finalize_without_room_keeps_parts_and_says_so(self):
         with tempfile.TemporaryDirectory() as tmp, patch.object(m.recordings,'RECORDINGS_DIR',Path(tmp)):

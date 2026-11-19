@@ -397,7 +397,7 @@ def _parse_arecord_devices() -> list[dict]:
     """
     ok, output = run_cmd(["arecord", "-l"], timeout=5)
     if not ok:
-        logger.warning("arecord unavailable or failed — ALSA device list skipped.")
+        logger.debug("arecord unavailable or failed — ALSA device list skipped.")
         return []
 
     devices: list[dict] = []
@@ -497,7 +497,7 @@ def get_usb_audio_devices() -> list[dict]:
     # If no ALSA devices were found at all, try to offer a PulseAudio-only
     # fallback for any source whose name hints at a USB device.
     if not alsa_devices and pulse_sources:
-        logger.info("No ALSA devices parsed — falling back to PulseAudio sources.")
+        logger.debug("No ALSA devices parsed — falling back to PulseAudio sources.")
         for src in pulse_sources:
             name_lower = src["name"].lower()
             # Skip monitors (speaker loopbacks)
@@ -524,7 +524,7 @@ def get_usb_audio_devices() -> list[dict]:
             "Including built-in mic fallback: %s", builtin_devices[0]["name"],
         )
 
-    logger.info(
+    logger.debug(  # runs every 5 s: at INFO it buried the real warnings
         "USB audio detection complete: %d USB device(s), %d built-in fallback(s).",
         len(usb_devices),
         min(len(builtin_devices), 1),
