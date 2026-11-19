@@ -896,6 +896,11 @@
         <div class="flex flex-wrap items-center gap-2">
           <label for="quality-profile" class="text-sm text-slate-400">Quality</label>
           <select id="quality-profile" aria-label="Stream quality" onchange="renderDestinations()" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
+          <label class="flex items-center gap-1.5 text-sm text-slate-300 cursor-pointer" title="Encodes the picture on the graphics chip instead of the processor: much less CPU load, slightly softer picture. Falls back to the normal encoder if it fails.">
+            <input type="checkbox" id="hw-encode" onchange="setHardwareEncoding(this)" class="w-4 h-4 rounded">
+            Use graphics chip (less CPU)
+          </label>
+          <span id="hw-encode-note" class="hidden text-xs font-semibold text-brand-amber"></span>
         </div>
         <!-- Streaming destinations: each its own connection, all at the same time -->
         <div id="destinations" class="space-y-2" data-bitrates='{{ bitrates|tojson }}'>
@@ -1618,6 +1623,29 @@
         el.textContent = r.warning ? '⚠ ' + r.warning : '';
         el.classList.toggle('hidden', !r.warning);
       });
+    }
+
+    let hwPending = false;
+    async function setHardwareEncoding(box) {
+      hwPending = true;
+      box.disabled = true;
+      try {
+        const {ok, data} = await apiRequest('/api/encoder', {hardware: box.checked});
+        if (!ok) box.checked = !box.checked;
+        showToast(data.message || data.error || 'Could not change the encoder', ok ? 'success' : 'error');
+      } finally {
+        box.disabled = false;
+        hwPending = false;
+      }
+    }
+
+    function renderEncoder(encoder) {
+      if (!encoder) return;
+      const box = document.getElementById('hw-encode'), note = document.getElementById('hw-encode-note');
+      if (!hwPending) box.checked = !!encoder.hardware;
+      const pending = encoder.active && (encoder.active === 'hardware') !== !!encoder.hardware && !encoder.warning;
+      note.textContent = encoder.warning ? '⚠ ' + encoder.warning : pending ? 'applies from the next start' : '';
+      note.classList.toggle('hidden', !note.textContent);
     }
 
     async function startRecording() {
@@ -2658,6 +2686,7 @@
       const network = data.network || {};
       state.network = network;
       const stream = data.stream || {};
+      renderEncoder(stream.encoder);
       if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
       else if (stream.layout_warning) setBanner(stream.layout_warning, 'warning');
       else if (stream.audio_warning) setBanner('Audio: ' + stream.audio_warning, 'warning');

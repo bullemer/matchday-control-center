@@ -74,6 +74,24 @@ class ApiTests(unittest.TestCase):
             self.assertEqual((tally['on_air'],tally['replay']),(False,True))
             self.assertFalse(tally['returning'])  # the replay returns to another camera
 
+    def test_running_clock_is_written_just_after_each_second(self):
+        with patch.dict(a._clock,{'running':True,'elapsed':12.7,'start_ts':a.time.monotonic()}):
+            self.assertAlmostEqual(a._scoreboard_wait(),0.32,delta=0.03)
+        with patch.dict(a._clock,{'running':True,'elapsed':12.1,'start_ts':a.time.monotonic()}):
+            self.assertEqual(a._scoreboard_wait(),0.5)  # never longer: scores and names follow at once
+        with patch.dict(a._clock,{'running':False,'elapsed':12.7,'start_ts':None}):
+            self.assertEqual(a._scoreboard_wait(),0.5)
+
+    def test_encoder_option_api(self):
+        self.assertEqual(self.post('/api/encoder',{'hardware':'yes'}).status_code,400)
+        with patch.object(a,'set_hardware_encoding',return_value=(False,'cannot')) as choose:
+            self.assertEqual(self.post('/api/encoder',{'hardware':True}).status_code,409)
+            choose.assert_called_once_with(True)
+        with patch.object(a,'set_hardware_encoding',return_value=(True,'Hardware encoding on')):
+            r=self.post('/api/encoder',{'hardware':True})
+            self.assertEqual((r.status_code,r.get_json()['message']),(200,'Hardware encoding on'))
+        self.assertIn('encoder',self.client.get('/api/status',headers=self.headers).get_json()['stream'])
+
     def test_tally_tells_the_returning_camera_about_the_replay(self):
         stream={'active_camera':None,'selected_camera':'cam1','state':'live','active':True,
                 'replay':{'active':True,'camera':'cam1','hold':False}}
@@ -772,6 +790,43 @@ class MediaTests(unittest.TestCase):
             self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
             self.assertEqual(enc[-1], m.RTSP_BASE+'/final')  # YouTube and the recorder copy this
 
+    def test_hardware_encoder_command_and_software_default(self):
+        with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_encoder_proc',None),patch.object(m,'_encoder_hw',False):
+            m._launch_encoder()
+            soft=proc.call_args.args[0]
+            self.assertIn('libx264',soft); self.assertNotIn('-vaapi_device',soft); self.assertFalse(m._encoder_hw)
+            with patch.object(m,'_hw_wanted',True),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning',''):
+                m._launch_encoder()
+                hard=proc.call_args.args[0]
+                self.assertTrue(m._encoder_hw)
+                self.assertEqual(m.get_encoder_status(),{'hardware':True,'warning':'','active':'hardware'})
+            self.assertEqual(hard[hard.index('-vaapi_device')+1],'/dev/dri/renderD128')
+            self.assertLess(hard.index('-vaapi_device'),hard.index('-i'))
+            self.assertEqual(hard[hard.index('-c:v')+1],'h264_vaapi'); self.assertNotIn('libx264',hard); self.assertNotIn('-pix_fmt',hard)
+            self.assertTrue(hard[hard.index('-filter_complex')+1].endswith('format=nv12,hwupload[vout]'))
+            self.assertEqual((hard[hard.index('-b:v')+1],hard[hard.index('-g')+1],hard[-1]),('4000k','60',m.RTSP_BASE+'/final'))
+            # a failed hardware encoder is not tried again in this broadcast
+            with patch.object(m,'_hw_wanted',True),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning','failed'):
+                m._launch_encoder()
+            self.assertIn('libx264',proc.call_args.args[0])
+
+    def test_hardware_encoding_is_refused_when_the_test_encode_fails(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(m,'ENCODER_SETTING',Path(tmp)/'encoder.json'),\
+                patch.object(m,'_hw_wanted',False),patch.object(m,'_hw_device',None),patch.object(m,'_hw_warning',''):
+            with patch.object(m,'_find_hw_device',return_value=None):
+                ok,message=m.set_hardware_encoding(True)
+                self.assertFalse(ok); self.assertIn('software encoder',message); self.assertFalse(m._hw_wanted)
+                self.assertFalse(m.ENCODER_SETTING.exists())
+            with patch.object(m,'_find_hw_device',return_value='/dev/dri/renderD129'):
+                self.assertEqual(m.set_hardware_encoding(True),(True,'Hardware encoding on'))
+                self.assertEqual((m._hw_wanted,m._hw_device),(True,'/dev/dri/renderD129'))
+                m._hw_wanted=False
+                m.load_encoder_setting()  # the saved choice comes back after a restart
+                self.assertTrue(m._hw_wanted)
+                with patch.object(m,'_want_stream',True):
+                    self.assertIn('next start',m.set_hardware_encoding(False)[1])
+                self.assertFalse(m._hw_wanted)
+
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
             self.assertTrue(m.start_youtube_stream('key','1080p')[0])
@@ -886,6 +941,7 @@ class ConcurrencyRegressionTests(unittest.TestCase):
                       _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _audio_warning='', _generation=0, _stop_generation=0,
                       _pending_camera=None, _follow=False, _profile='720p', _relay_profile='720p',
+                      _errors={}, _error_since={}, _hw_wanted=False, _hw_device=None, _hw_warning='', _encoder_hw=False,
                       _mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS})
         for key, value in values.items():
             self.stack.enter_context(patch.object(m, key, value))
@@ -980,6 +1036,42 @@ class ConcurrencyRegressionTests(unittest.TestCase):
             self.assertEqual(m._pending_camera,'cam3')
             replace.assert_called_once_with('cam1',12)
 
+    def test_failed_hardware_encoder_falls_back_to_software_at_once(self):
+        m._want_stream=True
+        dead=MagicMock(); dead.healthy.return_value=False; dead.poll.return_value=1; dead.error='vaapi: no device'
+        with patch.object(m,'_encoder_proc',dead),patch.object(m,'_encoder_hw',True),patch.object(m,'_hw_wanted',True),\
+                patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_kill_process'),\
+                patch.object(m,'_retry_at',m.time.monotonic()+60),patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'):
+            m._supervise_encoder()
+            self.assertIn('libx264',proc.call_args.args[0])  # relaunched without waiting for the backoff
+            self.assertIn('software encoder',m.get_stream_status()['encoder']['warning'])
+
+    def test_one_part_error_does_not_hide_or_clear_another(self):
+        m._set_error('encoder','Encoder stopped producing frames')
+        m._targets['twitch']=dict(m.make_target('twitch','key'),error='Connection refused')
+        m._summarize_targets()
+        self.assertEqual(m.get_stream_status()['error'],'Encoder stopped producing frames; Twitch: Connection refused')
+        m._targets['twitch']['error']=''
+        m._summarize_targets()  # the destination recovered: the encoder problem is still shown
+        self.assertEqual(m.get_stream_status()['error'],'Encoder stopped producing frames')
+        m._want_stream=True
+        m._encoder_proc=MagicMock(); m._encoder_proc.healthy.return_value=True
+        with patch.object(m,'_supervise_pusher'),patch.object(m,'_supervise_recorder'):
+            m._supervise_encoder()
+        self.assertEqual(m.get_stream_status()['error'],'')
+
+    def test_old_failed_cut_message_clears_while_the_picture_is_fine(self):
+        m._relay_proc=MagicMock(); m._relay_proc.poll.return_value=None; m._relay_proc.healthy.return_value=True
+        m._relay_proc.last_progress=None
+        m._active_camera='cam1'
+        m._set_error('relay','cam3 is not publishing')
+        now=m.time.monotonic()
+        with patch.object(m,'_camera_status',{'cam1':True}),patch.object(m,'_restore_check_at',now+999),patch.object(m,'_replay',None),patch.object(m,'_relay_sources',{}):
+            m._supervise_relay(now+5)
+            self.assertIn('cam3',m._error_text())
+            m._supervise_relay(now+11)
+            self.assertEqual(m._error_text(),'')
+
     def test_encoder_recovery_does_not_run_relay_probes(self):
         m._want_stream=True
         with patch.object(m,'_relay_command',side_effect=AssertionError('slow probe')), patch.object(m,'_launch_encoder') as launch, patch.object(m,'_retry_at',0):
@@ -999,7 +1091,8 @@ class EngineStateCase(unittest.TestCase):
                       _targets={}, _encoder_proc=None, _recorder_proc=None, _want_record=False,
                       _recording=None, _started_at=None, _generation=0,
                       _stop_generation=0, _pending_camera=None, _relay_channels={}, _relay_muted=set(),
-                      _relay_missing=set(), _profile='720p', _relay_profile='720p', _record_warning='')
+                      _relay_missing=set(), _profile='720p', _relay_profile='720p', _record_warning='',
+                      _errors={}, _error_since={}, _hw_wanted=False, _hw_device=None, _hw_warning='', _encoder_hw=False)
         for key, value in values.items():
             self.stack.enter_context(patch.object(m, key, value))
         self.kill = self.stack.enter_context(patch.object(m, '_kill_process'))
@@ -1263,7 +1356,7 @@ class DestinationTests(EngineStateCase):
         self.assertIs(m._targets['twitch']['proc'], proc.return_value)  # first retry at once
         self.assertEqual(proc.call_args.args[0][-1], 'rtmps://ingest.global-contribute.live-video.net/app/key-twitch')
         self.assertEqual(m._state, 'live')  # header stays ON AIR while any platform is live
-        self.assertIn('Twitch: Connection refused', m._error)
+        self.assertIn('Twitch: Connection refused', m._error_text())
         status = m.get_stream_status()['destinations']
         self.assertEqual({n: d['state'] for n, d in status.items()}, {'youtube': 'live', 'twitch': 'reconnecting'})
         self.assertNotIn('key-', json.dumps(status))  # keys never reach the dashboard

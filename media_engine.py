@@ -110,7 +110,10 @@ REPLAY_SPEEDS = (1.0, 0.5)
 REPLAY_LEAD = 1.5         # start the return-to-live relay at least this long before the clip ends
 _cut_seconds = 3.0        # how long a cut takes here (moving average); the return starts that early
 _state = "stopped"
-_error = ""
+# One message per part of the pipeline, so one part's error neither hides nor clears another's.
+ERROR_PARTS = ("server", "relay", "encoder", "destinations")
+_errors = {}
+_error_since = {}
 _started_at = None
 _retry_at = 0.0
 _retries = 0
@@ -462,7 +465,7 @@ def _paths():
 
 
 def start_mediamtx():
-    global _mediamtx_proc, _error, _thread, _encoder_thread
+    global _mediamtx_proc, _thread, _encoder_thread
     with _lock:
         if get_mediamtx_running():
             return True
@@ -472,7 +475,7 @@ def start_mediamtx():
             except requests.RequestException:
                 pass
             else:
-                _error = "MediaMTX API port is already in use by another server"
+                _set_error("server", "MediaMTX API port is already in use by another server")
                 return False
             generate_mediamtx_config()
             _mediamtx_proc = Process([MEDIAMTX_BIN, MEDIAMTX_CONFIG], cwd=Path(MEDIAMTX_CONFIG).parent)
@@ -487,12 +490,13 @@ def start_mediamtx():
                     if _encoder_thread is None or not _encoder_thread.is_alive():
                         _encoder_thread = threading.Thread(target=_watch_encoder, daemon=True, name="encoder-supervisor")
                         _encoder_thread.start()
+                    _set_error("server")
                     return True
                 except requests.RequestException:
                     time.sleep(.1)
             raise RuntimeError(_mediamtx_proc.error or "MediaMTX did not become ready")
         except Exception as exc:
-            _error = str(exc)
+            _set_error("server", str(exc))
             _kill_process(_mediamtx_proc)
             return False
 
@@ -569,6 +573,25 @@ def get_destinations():
             for name, t in list(_targets.items())}
 
 
+def _set_error(part, message=""):
+    if message:
+        if _errors.get(part) != message:
+            _error_since[part] = time.monotonic()
+        _errors[part] = message
+    else:
+        _errors.pop(part, None)
+        _error_since.pop(part, None)
+
+
+def _clear_errors(*parts):
+    for part in parts or ERROR_PARTS:
+        _set_error(part)
+
+
+def _error_text():
+    return "; ".join(_errors[part] for part in ERROR_PARTS if _errors.get(part))
+
+
 def get_stream_status():
     # Status must remain responsive while a control operation awaits readiness.
     active = get_youtube_running()
@@ -583,7 +606,7 @@ def get_stream_status():
             "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
             "audio_warning": _audio_warning if _relay_proc else "",
             "started_at": _started_at, "destinations": get_destinations(), "program_path": program_path(),
-            "error": _error, "profile": _profile, "fallback": get_active_camera() is None and not _replay,
+            "error": _error_text(), "encoder": get_encoder_status(), "profile": _profile, "fallback": get_active_camera() is None and not _replay,
             "recording": get_recording_status(), "replay": get_replay_status()}
 
 
@@ -937,7 +960,7 @@ def switch_camera(cam_id, automatic=False, expected_stop=None, force=False):
 
 
 def _replace_relay(cam_id, generation):
-    global _relay_proc, _active_camera, _error, _relay_channels, _relay_missing, _audio_warning
+    global _relay_proc, _active_camera, _relay_channels, _relay_missing, _audio_warning
     global _relay_failures, _relay_profile, _relay_muted, _relay_secondary, _layout_warning, _layout, _replay
     global _relay_sources
     global _relay_zmq, _relay_slot
@@ -953,7 +976,7 @@ def _replace_relay(cam_id, generation):
         cmd, channels, missing, warning, secondary, video_warning = _relay_command(cam_id, wanted)
     except Exception as exc:
         if current():
-            _error = str(exc)
+            _set_error("relay", str(exc))
         return False, str(exc)
     with _lock:
         if not current():
@@ -964,7 +987,7 @@ def _replace_relay(cam_id, generation):
     candidate, problem = _take_over(cmd, current)
     if candidate is None:
         if problem != SUPERSEDED:
-            _error = problem
+            _set_error("relay", problem)
         return False, problem
     with _lock:
         installed = current()
@@ -980,7 +1003,8 @@ def _replace_relay(cam_id, generation):
             _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
             _layout = {**_layout, "main": cam_id}
-            _error, _relay_failures = "", 0
+            _relay_failures = 0
+            _set_error("relay")
     if not installed:
         _kill_process(candidate)
         return False, SUPERSEDED
@@ -1045,7 +1069,7 @@ def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0, start=Non
 
 def _install_replay(generation, camera, replay):
     global _relay_proc, _relay_channels, _relay_missing, _relay_muted, _audio_warning
-    global _relay_secondary, _error, _replay, _relay_zmq, _relay_slot
+    global _relay_secondary, _replay, _relay_zmq, _relay_slot
     current = lambda: generation == _generation
     if not current():
         return False, SUPERSEDED
@@ -1299,8 +1323,68 @@ def set_mute(muted):
     return ok, message.replace("Mixer updated", "Audio muted" if muted else "Audio unmuted")
 
 
+# Hardware (VAAPI) encoding of the final picture is an option; x264 stays the default and
+# the fallback. The choice applies when the encoder starts.
+ENCODER_SETTING = BASE / "data/encoder.json"
+_hw_wanted = False       # the operator's choice
+_hw_device = None        # render node that passed the test encode
+_hw_warning = ""         # why the software encoder runs although hardware is chosen
+_encoder_hw = False      # the running encoder uses the graphics chip
+
+
+def _test_vaapi(device):
+    try:
+        return subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-vaapi_device", device,
+             "-f", "lavfi", "-i", "testsrc2=s=1920x1080:r=30", "-t", "0.5", "-vf", "format=nv12,hwupload",
+             "-c:v", "h264_vaapi", "-bf", "0", "-b:v", "6000k", "-maxrate", "6000k", "-f", "null", "-"],
+            capture_output=True, timeout=15).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _find_hw_device():
+    return next((str(d) for d in sorted(Path("/dev/dri").glob("renderD*")) if _test_vaapi(str(d))), None)
+
+
+def set_hardware_encoding(enabled, save=True):
+    """Choose the graphics chip (far less CPU) or the software encoder for the final picture."""
+    global _hw_wanted, _hw_device, _hw_warning
+    device = _find_hw_device() if enabled else None
+    if enabled and not device:
+        return False, "The graphics chip of this laptop cannot encode the stream; staying on the software encoder"
+    with _lock:
+        _hw_wanted, _hw_device, _hw_warning = bool(enabled), device, ""
+        running = _want_stream
+    if save:
+        try:
+            ENCODER_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            ENCODER_SETTING.write_text(json.dumps({"hardware": bool(enabled)}))
+        except OSError:
+            logger.exception("Cannot save the encoder setting")
+    return True, ("Hardware encoding on" if enabled else "Software encoding on") + (
+        "; it applies from the next start" if running else "")
+
+
+def load_encoder_setting():
+    """At startup: restore the saved choice if the graphics chip still passes the test."""
+    try:
+        wanted = bool(json.loads(ENCODER_SETTING.read_text()).get("hardware"))
+    except (OSError, ValueError, AttributeError):
+        return
+    if wanted:
+        ok, message = set_hardware_encoding(True, save=False)
+        if not ok:
+            logger.warning(message)
+
+
+def get_encoder_status():
+    return {"hardware": _hw_wanted, "warning": _hw_warning if _hw_wanted else "",
+            "active": ("hardware" if _encoder_hw else "software") if _encoder_proc else None}
+
+
 def _launch_encoder():
-    global _encoder_proc
+    global _encoder_proc, _encoder_hw
     width, height, bitrate, _ = PROFILES[_profile]
     font = round(height / 26)  # same on-screen size at every resolution
     # Disable drawtext expansion: team names are literal text, including percent signs.
@@ -1312,16 +1396,22 @@ def _launch_encoder():
     # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
     # Keep composition in the encoder's YUV420 format and bound worker counts:
     # auto-threading added substantial CPU overhead in real-time 1080p/PiP tests.
-    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420[vout]"
+    hardware = bool(_hw_wanted and _hw_device and not _hw_warning)
+    upload = ",format=nv12,hwupload" if hardware else ""
+    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420{upload}[vout]"
+    if hardware:  # no B-frames, like x264's zerolatency
+        codec = ["-c:v", "h264_vaapi", "-bf", "0"]
+    else:
+        codec = ["-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
     # A deep input queue: the reader must keep draining while the graph is busy.
-    cmd = _ffmpeg() + ["-filter_complex_threads", "2", "-thread_queue_size", "1024"] + _input("program") + [
+    cmd = _ffmpeg() + (["-vaapi_device", _hw_device] if hardware else []) + [
+        "-filter_complex_threads", "2", "-thread_queue_size", "1024"] + _input("program") + [
         "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
-        "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0",
-        "-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency",
+        "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0", *codec,
         "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
-        "-r", "30", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k",
+        "-r", "30", "-c:a", "aac", "-b:a", "128k",
         "-ar", "48000", "-ac", "2", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/final"]
-    _encoder_proc = Process(cmd)
+    _encoder_proc, _encoder_hw = Process(cmd), hardware
 
 
 def _launch_pusher(target):
@@ -1351,7 +1441,7 @@ def make_target(name, key="", server=None):
 
 def _summarize_targets():
     """Under _lock: the overall stream state shown in the header (any platform live = live)."""
-    global _state, _error, _started_at
+    global _state, _started_at
     states = [t["state"] for t in _targets.values()]
     for state in ("live", "reconnecting", "starting", "failed"):
         if state in states:
@@ -1359,7 +1449,7 @@ def _summarize_targets():
             break
     else:
         _state = "stopped"
-    _error = "; ".join(f"{t['label']}: {t['error']}" for t in _targets.values() if t["error"])
+    _set_error("destinations", "; ".join(f"{t['label']}: {t['error']}" for t in _targets.values() if t["error"]))
     started = [t["started_at"] for t in _targets.values() if t["started_at"]]
     _started_at = min(started) if started else None
 
@@ -1469,7 +1559,7 @@ def _start(targets, profile, record, title):
 
 def _start_output(targets, profile, token, record=False, title=""):
     """Start relay + encoder (and the requested destinations / recording) from cold."""
-    global _want_stream, _state, _error, _profile, _retry_at, _retries
+    global _want_stream, _state, _profile, _retry_at, _retries, _hw_warning
     if profile not in PROFILES:
         return False, "Invalid quality profile"
     if _want_stream:
@@ -1512,11 +1602,13 @@ def _start_output(targets, profile, token, record=False, title=""):
             return False, SUPERSEDED
         if _want_stream:
             return False, "Stream is already starting or running; stop before changing settings"
+        _hw_warning = ""  # every broadcast tries the chosen encoder afresh
         try:
             _launch_encoder()
         except OSError:
             return False, "Unable to launch encoder"
-        _want_stream, _error = True, ""
+        _want_stream = True
+        _clear_errors("relay", "encoder", "destinations")
         _targets.clear()
         _targets.update(targets)  # the supervisor connects them once the encoder runs
         _summarize_targets()
@@ -1576,7 +1668,7 @@ def stop_recording():
 
 def _stop_all(finalize=True):
     global _want_stream, _relay_proc, _active_camera, _generation
-    global _state, _error, _started_at, _pending_camera, _encoder_proc
+    global _state, _started_at, _pending_camera, _encoder_proc
     global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
     global _recorder_proc, _want_record, _recording, _record_warning, _replay, _relay_zmq
     with _lock:
@@ -1589,7 +1681,8 @@ def _stop_all(finalize=True):
         _recorder_proc = _encoder_proc = _relay_proc = None
         _active_camera = _started_at = _pending_camera = None
         _relay_channels, _relay_missing, _relay_muted = {}, set(), set()
-        _state, _error = "stopped", ""
+        _state = "stopped"
+        _clear_errors("relay", "encoder", "destinations")
         _relay_secondary, _layout_warning = None, ""
         session, _recording, _want_record, _record_warning = _recording, None, False, ""
         _relay_zmq = None
@@ -1627,6 +1720,9 @@ def _supervise_relay(now):
         relay = None
     if not camera:
         return
+    if (relay is not None and relay.healthy() and _pending_camera is None
+            and now - _error_since.get("relay", now) > 10):
+        _set_error("relay")  # a cut that failed a while ago; the picture on air is fine
     reconnected = sorted(c for c, session in sources.items() if session and _camera_status.get(c)
                          and _camera_source.get(c) and _camera_source[c] != session)
     if relay is None:
@@ -1661,7 +1757,7 @@ def _supervise_relay(now):
 
 
 def _supervise_once():
-    global _camera_status, _state, _error, _started_at, _retry_at, _retries, _mediamtx_retry_at
+    global _camera_status, _state, _started_at, _retry_at, _retries, _mediamtx_retry_at
     global _relay_failures, _relay_retry_at, _status_failures
     before = _camera_status
     try:
@@ -1692,7 +1788,7 @@ def _supervise_once():
 
 
 def _supervise_encoder():
-    global _encoder_proc, _state, _error, _retry_at, _retries
+    global _encoder_proc, _state, _retry_at, _retries, _hw_warning
     now = time.monotonic()
     with _lock:
         if not _want_stream:
@@ -1701,11 +1797,17 @@ def _supervise_encoder():
         if encoder and encoder.healthy():
             _retries = 0
             healthy = True
+            _set_error("encoder")
         elif encoder and encoder.poll() is None and now - encoder.launched < 20:
             return
         else:
             healthy = False
-            _error = (encoder.error if encoder else "") or "Encoder stopped producing frames"
+            _set_error("encoder", (encoder.error if encoder else "") or "Encoder stopped producing frames")
+            if _encoder_hw and not _hw_warning:
+                # Whatever the reason, continue with the encoder that is known to work.
+                _hw_warning = "Hardware encoder failed; using the software encoder"
+                logger.warning("%s: %s", _hw_warning, encoder.error if encoder else "")
+                _retry_at = 0
             if _targets:
                 _state = "reconnecting"
             token = _stop_generation
@@ -1725,7 +1827,8 @@ def _supervise_encoder():
             try:
                 _launch_encoder()
             except OSError:
-                _state, _error = "failed", "Cannot restart encoder"
+                _state = "failed"
+                _set_error("encoder", "Cannot restart encoder")
 
 
 def _supervise_pusher(now):

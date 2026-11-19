@@ -44,7 +44,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
                           get_recording_status, play_replay, stop_replay, get_replay_status,
-                          add_replay_listener, REPLAY_MARGIN)
+                          add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -890,6 +890,18 @@ def api_scoreboard_get():
 
 
 # Runtime services are explicit: importing the module starts no processes.
+@app.route("/api/encoder", methods=["POST"])
+@api_endpoint
+def api_encoder():
+    """{"hardware": bool}: encode the final picture on the graphics chip or in software."""
+    data = request.get_json(force=True, silent=True) or {}
+    if type(data.get("hardware")) is not bool:
+        raise ValueError("hardware must be true or false")
+    log.info("%s encoding requested", "Hardware" if data["hardware"] else "Software")
+    success, msg = set_hardware_encoding(data["hardware"])
+    return jsonify({"ok": success, "message": msg, "encoder": get_stream_status()["encoder"]}), 200 if success else 409
+
+
 RUNTIME_DIR = Path(__file__).resolve().parent / "data"
 MATCH_PATH = RUNTIME_DIR / "match.json"
 CLOCK_RESUME_MAX = 600  # seconds of downtime after which a running clock is not resumed
@@ -958,13 +970,22 @@ def _restore_match():
     except (ValueError, KeyError, OSError, TypeError):
         log.exception("Cannot restore saved match")
 
+def _scoreboard_wait():
+    """Seconds until the scoreboard text is written again. A running clock is written just
+    after each of its seconds begins, so every second stays on screen equally long."""
+    with _clock_lock:
+        if not _clock["running"]:
+            return .5
+        return min(.5, 1 - _clock_elapsed() % 1 + .02)
+
+
 def _overlay_worker():
-    ticks = 0
-    while not _workers_stop.wait(.5):
+    saved = time.monotonic()
+    while not _workers_stop.wait(_scoreboard_wait()):
         try:
             _write_scoreboard_file()
-            ticks += 1
-            if ticks % 10 == 0:
+            if time.monotonic() - saved >= 5:
+                saved = time.monotonic()
                 _save_match()
         except OSError:
             log.exception("Cannot update scoreboard")
@@ -1015,6 +1036,7 @@ def initialize():
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     _restore_match()
+    threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()
     browser_overlay.start()
     browser_overlay.configure(_scoreboard["source"], _scoreboard["visible"], _scoreboard["overlay_url"])

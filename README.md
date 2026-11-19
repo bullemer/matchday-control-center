@@ -139,6 +139,11 @@ of Facebook's and YouTube's recommended 720p range. With Facebook, depending on 
 key was created, the broadcast may only become public after **Go live** in Live Producer.
 Upload is the limit: three platforms at 720p need about 12.4 Mbps of steady upload.
 
+*Use graphics chip (less CPU)* next to the quality setting encodes on the laptop's graphics
+chip (Intel/AMD, VAAPI) instead of the processor: about a third of the encoder's CPU load,
+a slightly softer picture at the same bitrate. It is tested when you tick it, applies from
+the next start, and a failing chip falls back to the normal encoder automatically.
+
 The final encoder uses two filter threads, six H.264 encoder threads, and explicit
 YUV420 overlay composition to reduce CPU overhead. Resolution, bitrate, the
 `veryfast` preset and the 30 fps target are unchanged. Short synthetic 1080p PiP
@@ -307,6 +312,7 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/network/hotspot-start` | Start/update owned hotspot with `ssid`, `password` |
 | POST | `/api/network/hotspot-stop` | Stop owned hotspot only |
 | POST | `/api/stream/start` | `destinations`: `{youtube\|facebook\|twitch\|custom: {key, server?}}` (or legacy `stream_key` = YouTube), optional `profile`: `1080p`, `720p` or `480p`, `record`: also record. While live, adds platforms not yet running |
+| POST | `/api/encoder` | `hardware`: true or false — encode the final picture on the graphics chip (VAAPI) or in software (default). Applies from the next start; falls back to software if the chip fails |
 | POST | `/api/stream/stop` | Stop all platforms, or one with `destination` (a recording continues) |
 | POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
 | POST | `/api/recording/stop` | Stop recording and save the MP4 (streaming continues) |

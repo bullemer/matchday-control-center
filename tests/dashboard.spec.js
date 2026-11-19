@@ -688,3 +688,18 @@ test('CAM REPLAY: scrub the recording, play from a moment and stay on air until 
   page.once('dialog', dialog => dialog.accept());
   await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
 });
+
+test('graphics chip option asks the server and undoes the tick when it is refused', async ({page}) => {
+  await page.goto('/');
+  const box = page.locator('#hw-encode');
+  await expect(box).not.toBeChecked();
+  let asked = null;
+  await page.route('**/api/encoder', route => {
+    asked = route.request().postDataJSON();
+    route.fulfill({status: 409, json: {ok: false, message: 'The graphics chip of this laptop cannot encode the stream; staying on the software encoder'}});
+  });
+  await box.click();
+  await expect(page.locator('body')).toContainText('cannot encode the stream');
+  expect(asked).toEqual({hardware: true});
+  await expect(box).not.toBeChecked();
+});
