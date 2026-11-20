@@ -37,7 +37,7 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 from werkzeug.exceptions import HTTPException
 from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
-                             stop_hotspot, get_usb_audio_devices, get_firewall_status)
+                             stop_hotspot, get_usb_audio_devices, get_firewall_status, UPLINK_CONFLICT)
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CAMERA_USER, camera_password,
                           get_mediamtx_running, get_stream_status, start_stream, stop_stream,
                           make_target, DESTINATIONS, PROFILES, switch_camera, set_audio_source, shutdown_all,
@@ -165,8 +165,9 @@ def _write_scoreboard_locked():
     with _clock_lock:
         clock_str = _format_clock(_clock_elapsed())
 
-    # During an instant replay the recording's own scoreboard is in the picture.
-    shown = _scoreboard["visible"] and _scoreboard["source"] == "builtin" and not get_replay_status()["active"]
+    # Only live relays draw this file: a replay shows the recording's own scoreboard, and
+    # the live one returns together with the live picture.
+    shown = _scoreboard["visible"] and _scoreboard["source"] == "builtin"
     text = f" {home}  {hs} - {aws}  {away}   |   {clock_str} " if shown else ""
 
     try:
@@ -351,8 +352,13 @@ def api_hotspot_start():
     if not isinstance(password, str) or (password and not 8 <= len(password) <= 63):
         return jsonify({"ok": False, "error": "Password must be 8–63 characters"}), 400
 
-    log.info("Hotspot start requested: ssid=%s", ssid)
-    success, msg = start_hotspot(ssid, password)
+    force = data.get("force", False)
+    if type(force) is not bool:
+        return jsonify({"ok": False, "error": "force must be true or false"}), 400
+    log.info("Hotspot start requested: ssid=%s%s", ssid, " (taking over the internet Wi-Fi)" if force else "")
+    success, msg = start_hotspot(ssid, password, force=force)
+    if msg == UPLINK_CONFLICT:  # the dashboard asks the operator, then retries with force
+        return jsonify({"ok": False, "confirm": True, "message": msg}), 409
     _refresh_network()
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
@@ -405,14 +411,69 @@ def api_stream_start():
         if not isinstance(settings, dict):
             raise ValueError("Each destination needs a key and optional server")
         targets[name] = make_target(name, text_field(settings, "key", 300), text_field(settings, "server", 300) or None)
-    record = data.get("record", False)
+    record, remember = data.get("record", False), data.get("remember")
     if type(record) is not bool:
         raise ValueError("record must be true or false")
+    if remember is not None and type(remember) is not bool:
+        raise ValueError("remember must be true or false")
     log.info("Stream start requested (%s, record=%s)", ", ".join(targets), record)
     success, msg = start_stream(targets, text_field(data, "profile", 10, "720p"),
                                 record=record, title=_match_title())
+    if success and remember:
+        _remember_keys({name: settings["key"] for name, settings in destinations.items() if settings.get("key")})
+    elif remember is False:
+        _forget_keys()
     status_code = 200 if success else 502
     return jsonify({"ok": success, "message": msg}), status_code
+
+
+# Stream keys are kept on this laptop (data/ is private, owner-only file) so the operator
+# does not paste them again every match; only the logged-in dashboard can read them.
+def _keys_path():
+    return RUNTIME_DIR / "stream-keys.json"
+
+
+def _stored_keys():
+    try:
+        keys = json.loads(_keys_path().read_text())
+        return {k: v for k, v in keys.items() if isinstance(v, str)} if isinstance(keys, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _remember_keys(keys):
+    if not keys:
+        return
+    stored = {**_stored_keys(), **keys}
+    path = _keys_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")  # created 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(stored, f)
+        os.replace(tmp, path)
+    except OSError:
+        Path(tmp).unlink(missing_ok=True)
+        log.exception("Cannot save the stream keys")
+
+
+def _forget_keys():
+    _keys_path().unlink(missing_ok=True)
+
+
+@app.route("/api/stream/keys", methods=["GET"])
+@api_endpoint
+def api_stream_keys():
+    keys = _stored_keys()
+    return jsonify({"ok": True, "remembered": bool(keys), "keys": keys})
+
+
+@app.route("/api/stream/keys/forget", methods=["POST"])
+@api_endpoint
+def api_stream_keys_forget():
+    _forget_keys()
+    log.info("Saved stream keys removed")
+    return jsonify({"ok": True, "message": "Saved stream keys removed from this laptop"})
 
 
 @app.route("/api/stream/stop", methods=["POST"])
@@ -613,12 +674,9 @@ def api_replay_stop():
 
 
 def _replay_changed(active):
-    """Hide the live scoreboard while a replay (with its own scoreboard) is on air."""
+    """Hide the Score67 overlay while a replay (with its own scoreboard) is on air. The
+    built-in scoreboard needs nothing: replay relays do not draw it."""
     browser_overlay.suspend(active)
-    try:
-        _write_scoreboard_file()
-    except OSError:
-        log.exception("Cannot update scoreboard")
 
 
 add_replay_listener(_replay_changed)

@@ -637,11 +637,19 @@ test('stream to several platforms at once, each with its own key, status and sto
   await row('facebook').getByRole('button', {name: '⏹ Stop'}).click();
   await expect(row('facebook').locator('[data-dest-state]')).toBeHidden();
   await expect(row('youtube').locator('[data-dest-state]')).toHaveText('LIVE');
-  // Choices and servers survive a reload; stream keys never do.
+  // Choices and servers survive a reload; the keys used to go live are saved on the laptop.
   await page.reload();
   await expect(row('twitch').locator('[data-dest-enabled]')).toBeChecked();
   await expect(row('custom').locator('[data-dest-server]')).toHaveValue('rtmp://10.0.0.2/live');
+  await expect(row('youtube').locator('[data-dest-key]')).toHaveValue('yt-key');
+  await expect(row('twitch').locator('[data-dest-key]')).toHaveValue('live_42_abc');
+  // Switching "remember" off forgets them on the laptop.
+  await page.locator('#remember-keys').uncheck();
+  await expect(page.locator('#toast-container')).toContainText('Saved stream keys removed');
+  await page.reload();
+  await expect(page.locator('#remember-keys')).not.toBeChecked();
   await expect(row('youtube').locator('[data-dest-key]')).toHaveValue('');
+  await page.locator('#remember-keys').check();
   calls = await (await page.request.get('/test/stream-calls')).json();
   expect(calls.stops).toEqual(['facebook']);
   await page.request.post('/api/stream/stop', {data: {}});

@@ -1,0 +1,13 @@
+[Unit]
+Description=Matchday: hotspot camera phones may reach the internet past Docker's FORWARD DROP
+After=docker.service network-online.target
+PartOf=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/matchday-hotspot-forward
+
+[Install]
+WantedBy=multi-user.target docker.service

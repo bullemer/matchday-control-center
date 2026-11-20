@@ -34,6 +34,28 @@ class ApiTests(unittest.TestCase):
     def post(self,url,body):
         return self.client.post(url,json=body,headers=self.headers)
 
+    def test_stream_keys_are_remembered_after_going_live(self):
+        keys=Path(self.tmp.name)/'stream-keys.json'
+        with patch.object(a,'_keys_path',return_value=keys):
+            self.assertEqual(self.client.get('/api/stream/keys',headers=self.headers).get_json()['keys'],{})
+            self.assertEqual(self.client.get('/api/stream/keys').status_code,401)  # login only
+            body={'destinations':{'youtube':{'key':'yt-1'},'twitch':{'key':'tw-2'}},'remember':True}
+            with patch.object(a,'start_stream',return_value=(False,'nope')):
+                self.post('/api/stream/start',body)
+            self.assertFalse(keys.exists())  # a failed start saves nothing
+            with patch.object(a,'start_stream',return_value=(True,'ok')):
+                self.assertEqual(self.post('/api/stream/start',body).status_code,200)
+                self.post('/api/stream/start',{'destinations':{'youtube':{'key':'yt-new'}},'remember':True})
+                self.assertEqual(self.post('/api/stream/start',{'destinations':{'youtube':{'key':'x'}},'remember':'yes'}).status_code,400)
+            self.assertEqual(keys.stat().st_mode & 0o777,0o600)
+            result=self.client.get('/api/stream/keys',headers=self.headers).get_json()
+            self.assertEqual((result['remembered'],result['keys']),(True,{'youtube':'yt-new','twitch':'tw-2'}))
+            self.assertTrue(self.post('/api/stream/keys/forget',{}).get_json()['ok'])
+            self.assertFalse(keys.exists())
+            with patch.object(a,'start_stream',return_value=(True,'ok')):
+                self.post('/api/stream/start',{**body,'remember':False})
+            self.assertFalse(keys.exists())
+
     def test_mute_endpoint_validates(self):
         self.assertEqual(self.post('/api/audio/mute',{'muted':'yes'}).status_code,400)
         with patch.object(a,'set_mute',return_value=(True,'Audio muted')) as mute:
@@ -64,10 +86,10 @@ class ApiTests(unittest.TestCase):
             self.assertEqual(self.client.get('/recordings/'+sid+'/session.json',headers=self.headers).status_code,404)
             self.assertEqual(self.client.get('/recordings/'+sid+'/x.mp4').status_code,401)
 
-    def test_replay_hides_live_scoreboard_and_tally(self):
+    def test_replay_keeps_scoreboard_file_and_tally(self):
         with patch.object(a,'get_replay_status',return_value={'active':True,'available':True}):
-            a._write_scoreboard_file()
-            self.assertEqual(Path(a.SCOREBOARD_PATH).read_text(),'')
+            a._write_scoreboard_file()  # replay relays do not draw it; live returns with its score
+            self.assertIn(' - ',Path(a.SCOREBOARD_PATH).read_text())
             with patch.object(a,'get_camera_status',return_value={'cam1':True}),patch.object(a,'get_stream_status',return_value={
                     'active_camera':None,'selected_camera':'cam1','replay':{'active':True},'state':'live','active':True}):
                 tally=self.client.get('/api/tally/cam1').get_json()
@@ -296,7 +318,7 @@ class ApiTests(unittest.TestCase):
     def test_hotspot_start_accepts_empty_password(self):
         with patch.object(a,'start_hotspot',return_value=(True,'ok')) as start,patch.object(a,'_refresh_network'):
             self.assertEqual(self.post('/api/network/hotspot-start',{'ssid':'Net','password':''}).status_code,200)
-            start.assert_called_once_with('Net','')
+            start.assert_called_once_with('Net','',force=False)
         self.assertEqual(self.post('/api/network/hotspot-start',{'ssid':'Net','password':'short'}).status_code,400)
 
     def test_audio_levels_endpoint(self):
@@ -455,9 +477,44 @@ class NetworkTests(unittest.TestCase):
     def test_empty_password_reuses_saved(self):
         with patch.object(n,'_owned_uuid',return_value='owned'),patch.object(n,'get_hotspot_config',return_value={'ssid':'Net','password':'secret123','saved':True}),patch.object(n,'_hotspot_active',return_value=False),patch.object(n,'run_cmd',return_value=(True,'')) as run:
             self.assertTrue(n.start_hotspot('Net','')[0])
-            modify=run.call_args_list[0].args[0]
+            modify=next(c.args[0] for c in run.call_args_list if 'wifi-sec.psk' in c.args[0])
             self.assertEqual(modify[modify.index('wifi-sec.psk')+1],'secret123')
             self.assertIn('rsn',modify)
+
+    def test_hotspot_never_cuts_the_internet_wifi_by_surprise(self):
+        def fake(adapters, uplink, bound='wlan0'):
+            calls=[]
+            def run(cmd, timeout=10):
+                calls.append(cmd)
+                if cmd[:2]==['ip','-4']:
+                    return True, f'8.8.8.8 via 192.168.1.1 dev {uplink} src 192.168.1.50'
+                if cmd[:5]==['nmcli','-t','-f','DEVICE,TYPE','device']:
+                    return True, '\n'.join(f'{d}:wifi' for d in adapters)
+                if 'WIFI-PROPERTIES.AP' in cmd:
+                    return True, 'yes'
+                if cmd[:3]==['nmcli','-g','connection.interface-name']:
+                    return True, bound
+                return True, ''
+            return run, calls
+        saved={'ssid':'Net','password':'secret123','saved':True}
+        with patch.object(n,'_owned_uuid',return_value='owned'),patch.object(n,'get_hotspot_config',return_value=saved),patch.object(n,'_hotspot_active',return_value=False):
+            run, calls = fake(['wlan0'], 'wlan0')
+            with patch.object(n,'run_cmd',side_effect=run):
+                self.assertEqual(n.start_hotspot('Net',''),(False,n.UPLINK_CONFLICT))
+                self.assertFalse(any('up' in c for c in calls))
+                self.assertTrue(n.start_hotspot('Net','',force=True)[0])  # the operator confirmed
+            run, calls = fake(['wlan0'], 'enx0')  # internet over the USB tether: nothing to ask
+            with patch.object(n,'run_cmd',side_effect=run):
+                self.assertTrue(n.start_hotspot('Net','')[0])
+            run, calls = fake(['wlan0','wlan1'], 'wlan0')  # a second adapter takes the hotspot
+            with patch.object(n,'run_cmd',side_effect=run):
+                self.assertTrue(n.start_hotspot('Net','')[0])
+                self.assertIn(['nmcli','connection','modify','uuid','owned','connection.interface-name','wlan1'],calls)
+        with patch.object(a,'start_hotspot',return_value=(False,n.UPLINK_CONFLICT)),patch.object(a,'_refresh_network'):
+            api=ApiTests('test_mute_endpoint_validates'); api.setUp()
+            r=api.post('/api/network/hotspot-start',{'ssid':'Net','password':''})
+            self.assertEqual((r.status_code,r.json['confirm']),(409,True))
+            self.assertEqual(api.post('/api/network/hotspot-start',{'ssid':'Net','force':'yes'}).status_code,400)
 
     def test_new_hotspot_requires_password(self):
         with patch.object(n,'_owned_uuid',return_value=None),patch.object(n,'run_cmd') as run:
@@ -780,13 +837,14 @@ class MediaTests(unittest.TestCase):
         with patch.object(m,'_profile','1080p'),patch.object(m,'_probe',return_value={'video','audio'}):
             cmd,_,_,_,_,_=m._relay_command('cam2',{'cam2':0.0})
             self.assertIn('scale=1920:1080',' '.join(cmd))
+            self.assertIn('fontsize=42',' '.join(cmd))  # the live relay draws the scoreboard
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
             with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_encoder_proc',None):
                 m._launch_encoder()
             enc=proc.call_args.args[0]
             self.assertEqual(enc[enc.index('-f')+1], 'image2')
             vf=enc[enc.index('-filter_complex')+1]
-            self.assertIn('scale=1920:1080',vf); self.assertIn('fontsize=42',vf)
+            self.assertIn('scale=1920:1080',vf); self.assertNotIn('textfile=',vf)
             self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
             self.assertEqual(enc[-1], m.RTSP_BASE+'/final')  # YouTube and the recorder copy this
 
@@ -1536,6 +1594,7 @@ class ReplayTests(EngineStateCase):
         self.assertIn("setpts=(PTS-STARTPTS)/0.5", graph)
         self.assertIn("text='SLOW-MO REPLAY'", graph)
         self.assertIn('tpad=stop=-1:stop_mode=clone,realtime', graph)  # held, at real-time pace, until live takes over
+        self.assertNotIn('textfile=', graph)  # the recording's scoreboard is already in the picture
 
     def test_relays_alternate_control_ports(self):
         with patch.object(m, '_relay_slot', 0):

@@ -184,9 +184,36 @@ def get_hotspot_config():
             "password": psk if ok else "", "saved": True}
 
 
-def start_hotspot(ssid, password=""):
+UPLINK_CONFLICT = ("This laptop's internet comes over Wi-Fi on the same adapter the hotspot needs: "
+                   "starting it disconnects the venue Wi-Fi and the stream loses its internet. "
+                   "Connect the phone's USB tether first, or start the hotspot anyway.")
+
+
+def _route_device():
+    """The interface the laptop's internet goes out on, or None."""
+    ok, route = run_cmd(["ip", "-4", "-o", "route", "get", "8.8.8.8"], timeout=2)
+    match = re.search(r"\bdev (\S+)", route) if ok else None
+    return match.group(1) if match else None
+
+
+def _ap_devices():
+    """Wi-Fi adapters that can run an access point."""
+    ok, devices = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"])
+    found = []
+    for line in devices.splitlines() if ok else []:
+        dev, _, kind = line.partition(":")
+        if kind == "wifi":
+            capable, ap = run_cmd(["nmcli", "-g", "WIFI-PROPERTIES.AP", "device", "show", dev])
+            if capable and ap.strip() == "yes":
+                found.append(dev)
+    return found
+
+
+def start_hotspot(ssid, password="", force=False):
     """Start the hotspot. An empty password keeps the saved one. If it is already running
-    with these settings nothing is restarted, so connected phones are not dropped."""
+    with these settings nothing is restarted, so connected phones are not dropped.
+    A Wi-Fi adapter that carries the internet is only taken over with force (it returns
+    (False, UPLINK_CONFLICT) otherwise); a second AP-capable adapter is preferred."""
     if not isinstance(ssid, str) or not 1 <= len(ssid.encode()) <= 32:
         return False, "SSID must be 1–32 bytes"
     if not isinstance(password, str) or (password and not 8 <= len(password) <= 63):
@@ -199,8 +226,19 @@ def start_hotspot(ssid, password=""):
             if not password:
                 return False, "Enter a hotspot password (8–63 characters)"
             unchanged = saved["ssid"] == ssid and saved["password"] == password
-            if unchanged and _hotspot_active(uuid):
+            active = _hotspot_active(uuid)
+            if unchanged and active:
                 return True, "Hotspot is already running"
+            device = _field(uuid, "connection.interface-name")
+            uplink = _route_device()
+            if not active and not force and uplink:
+                # Move to a free adapter when there is one, rather than cutting the internet.
+                free = [d for d in _ap_devices() if d != uplink]
+                if device == uplink and free:
+                    device = free[0]
+                    run_cmd(["nmcli", "connection", "modify", "uuid", uuid, "connection.interface-name", device])
+                elif device == uplink:
+                    return False, UPLINK_CONFLICT
             ok, out = run_cmd(["nmcli", "connection", "modify", "uuid", uuid,
                                "802-11-wireless.ssid", ssid, "wifi-sec.psk", password, *HOTSPOT_RADIO])
             if ok:
@@ -208,19 +246,14 @@ def start_hotspot(ssid, password=""):
             return ok, "Hotspot started" if ok else "Could not activate hotspot; check NetworkManager permissions"
         if not password:
             return False, "Enter a hotspot password (8–63 characters)"
-        ok, devices = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE", "device"])
-        if not ok:
-            return False, devices
-        device = None
-        for line in devices.splitlines():
-            dev, _, kind = line.partition(":")
-            if kind == "wifi":
-                capable, ap = run_cmd(["nmcli", "-g", "WIFI-PROPERTIES.AP", "device", "show", dev])
-                if capable and ap.strip() == "yes":
-                    device = dev
-                    break
-        if not device:
+        adapters = _ap_devices()
+        if not adapters:
             return False, "No Wi-Fi adapter with access-point support found"
+        uplink = _route_device()
+        free = [d for d in adapters if d != uplink]
+        if not free and not force:
+            return False, UPLINK_CONFLICT
+        device = (free or adapters)[0]
         # Create an identifiable profile before activation; persist its UUID immediately.
         import uuid as uuid_module
         uuid = str(uuid_module.uuid4())

@@ -750,6 +750,18 @@ def _video_filters(width, height, secondary_index, layout):
             f"[main][inset]overlay=x={x}:y={y}:eof_action=pass:repeatlast=0[vout]"]
 
 
+def _scoreboard_filter(width, height):
+    """The built-in scoreboard, drawn by the live relay so it travels with the live picture:
+    drawn in the encoder, it switched off (and back on) seconds before (after) a replay's
+    picture, so live play aired without a score and replay frames got two scoreboards."""
+    font = round(height / 26)  # same on-screen size at every resolution
+    # Disable drawtext expansion: team names are literal text, including percent signs.
+    escaped = SCOREBOARD_PATH.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
+    return (f"drawtext=textfile='{escaped}':reload=1:expansion=none:"
+            f"fontcolor=white:fontsize={font}:box=1:boxcolor=black@0.6:boxborderw={font // 3}:"
+            f"x={font * 2 // 3}:y=h-th-{font * 2 // 3}")
+
+
 def _replay_filter(width, height, replay):
     """Replay picture, slowed for slow motion, with a REPLAY label (top left: the
     scoreboard burned into the recording stays visible at the bottom)."""
@@ -856,7 +868,12 @@ def _relay_command(cam, wanted, replay=None):
                  f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0,"
                  f"azmq=bind_address={address}[aout]")
     width, height, _, bitrate = PROFILES[_profile]
-    parts += [_replay_filter(width, height, replay)] if replay else _video_filters(width, height, secondary_index, layout)
+    if replay:  # the recording's own scoreboard is in the replay picture
+        parts.append(_replay_filter(width, height, replay))
+    else:
+        video = _video_filters(width, height, secondary_index, layout)
+        video[-1] = video[-1][:-len("[vout]")] + f"[live];[live]{_scoreboard_filter(width, height)}[vout]"
+        parts += video
     return cmd + ["-filter_complex", ";".join(parts), "-map", "[vout]", "-map", "[aout]",
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
@@ -1460,12 +1477,7 @@ def get_encoder_status():
 def _launch_encoder():
     global _encoder_proc, _encoder_hw
     width, height, bitrate, _ = PROFILES[_profile]
-    font = round(height / 26)  # same on-screen size at every resolution
-    # Disable drawtext expansion: team names are literal text, including percent signs.
-    escaped = SCOREBOARD_PATH.replace("\\", "\\\\").replace(":", "\\:").replace("'", "'\\''")
-    vf = (f"scale={width}:{height},drawtext=textfile='{escaped}':reload=1:expansion=none:"
-          f"fontcolor=white:fontsize={font}:box=1:boxcolor=black@0.6:boxborderw={font // 3}:"
-          f"x={font * 2 // 3}:y=h-th-{font * 2 // 3}")
+    vf = f"scale={width}:{height}"  # the live relay draws the built-in scoreboard
     ensure_frame(FRAME_PATH)
     # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
     # Keep composition in the encoder's YUV420 format and bound worker counts:

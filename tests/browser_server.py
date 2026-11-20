@@ -59,7 +59,7 @@ a.set_audio_source=lambda mode: (True,'Audio updated')
 # Hotspot controls must never touch the real NetworkManager from tests.
 hotspot_calls=[]
 a.get_hotspot_config=lambda: {'ssid':'MatchdayLive','password':'saved-secret','saved':True}
-a.start_hotspot=lambda ssid,password: (hotspot_calls.append(('start',ssid,password)) or True,'Hotspot started')
+a.start_hotspot=lambda ssid,password,force=False: (hotspot_calls.append(('start',ssid,password)) or True,'Hotspot started')
 a.stop_hotspot=lambda: (hotspot_calls.append(('stop',)) or True,'Hotspot stopped')
 a._refresh_network=lambda: None
 a.get_audio_levels=lambda: {'cam1':{'peak':-12.0,'rms':-20.0},'cam2':'no audio',
@@ -91,4 +91,5 @@ if True:
     a.SCOREBOARD_DIR=tmp
     a.SCOREBOARD_PATH=tmp+'/scoreboard.txt'
     a.MATCH_PATH=Path(tmp)/'match.json'
+    a._keys_path=lambda: Path(tmp)/'stream-keys.json'  # never the real saved keys
     a.app.run(host='127.0.0.1',port=25000,threaded=True)

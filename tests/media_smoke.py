@@ -136,6 +136,9 @@ def run():
             runs = dark_runs(frames)
             assert len(frames) > 250 and max(runs, default=0) <= 2, (len(frames), runs)
             print(f'PASS: cut red→blue in {cut_time:.1f} s with the old picture on air until the switch ({len(frames)} frames; handover blips: {runs or "none"})', flush=True)
+            px = program_pixels()  # the live relay draws the scoreboard box (bottom left) itself
+            assert px(80, 45)[2] > 200 and px(4, 85)[2] < 160, (px(80, 45), px(4, 85))
+            print('PASS: the live relay draws the scoreboard into the live picture', flush=True)
             time.sleep(9)  # blue footage in the recording
             assert m.switch_camera('cam1')[0]  # live is red again
             recorder_pid = m._recorder_proc.proc.pid

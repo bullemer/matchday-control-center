@@ -959,6 +959,10 @@
                  onchange="storeSet('mcc-record-with-live', this.checked ? 'on' : 'off')">
           ⏺ Also record to this laptop when going live
         </label>
+        <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer">
+          <input id="remember-keys" type="checkbox" role="switch" checked class="overlay-switch" onchange="rememberKeysToggled(this)">
+          🔑 Remember stream keys on this laptop
+        </label>
         <!-- Recording -->
         <div class="bg-slate-900 rounded-lg p-3 border border-slate-700 space-y-2">
           <div class="flex flex-wrap items-center gap-2">
@@ -1370,9 +1374,16 @@
           && !confirm(`Start the hotspot? The laptop will leave Wi-Fi “${net.lan_name}”; phones then use the hotspot and the dashboard at http://10.42.0.1:5000.`)) return;
       hotspot.pending = 'start';
       renderHotspotControls();
-      const result = await apiPost('/api/network/hotspot-start', {ssid, password});
+      let {ok, data} = await apiRequest('/api/network/hotspot-start', {ssid, password});
+      // The hotspot would take the adapter that carries the internet: only on purpose.
+      if (!ok && data.confirm && confirm(data.message + '\n\nStart the hotspot anyway?')) {
+        ({ok, data} = await apiRequest('/api/network/hotspot-start', {ssid, password, force: true}));
+      } else if (!ok && data.confirm) {
+        data = {message: 'Hotspot not started: the internet stays on Wi-Fi'};
+      }
+      showToast(data.message || data.error || 'Hotspot start failed', ok ? 'success' : 'warning');
       hotspot.pending = null;
-      if (result) hotspot.active = true;
+      if (ok) hotspot.active = true;
       await loadHotspotConfig();
       pollStatus();
     }
@@ -2069,7 +2080,7 @@
               server: row.querySelector('[data-dest-server]').value.trim()};
     }
     function saveDestinations() {
-      // Choices and servers are remembered on this device; stream keys never are.
+      // Choices and servers are remembered on this device; stream keys on the laptop (server side).
       DESTINATIONS.forEach(name => {
         const {enabled, server} = destSettings(name);
         storeSet('mcc-dest-' + name, JSON.stringify({enabled, server}));
@@ -2084,6 +2095,26 @@
         if (saved && saved.server) row.querySelector('[data-dest-server]').value = saved.server;
       });
       renderDestinations();
+    }
+    // Stream keys saved on the laptop after a successful GO LIVE fill empty key fields.
+    async function loadStreamKeys() {
+      try {
+        const response = await fetch('/api/stream/keys', {cache: 'no-store'});
+        if (!response.ok) return;
+        const data = await response.json();
+        Object.entries(data.keys || {}).forEach(([name, key]) => {
+          const row = destRow(name);
+          const input = row && row.querySelector('[data-dest-key]');
+          if (input && !input.value) input.value = key;
+        });
+        renderDestinations();
+      } catch {}
+    }
+    async function rememberKeysToggled(box) {
+      storeSet('mcc-remember-keys', box.checked ? 'on' : 'off');
+      if (box.checked) { showToast('Stream keys are saved on this laptop when you go live', 'info'); return; }
+      const {ok, data} = await apiRequest('/api/stream/keys/forget', {});
+      showToast(ok ? data.message : (data.error || 'Could not remove the saved keys'), ok ? 'success' : 'error');
     }
     function destinationToggled() {
       saveDestinations();
@@ -2139,7 +2170,8 @@
     async function startDestination(name) {
       const {chosen, missing} = chosenDestinations([name]);
       if (!chosen[name]) { showToast(`Enter the ${missing[0] || name} stream key first`, 'warning'); return; }
-      await apiPost('/api/stream/start', {destinations: chosen, profile: document.getElementById('quality-profile').value});
+      await apiPost('/api/stream/start', {destinations: chosen, profile: document.getElementById('quality-profile').value,
+                                          remember: document.getElementById('remember-keys').checked});
       await pollStatus();
     }
     async function stopDestination(name) {
@@ -2186,7 +2218,8 @@
       renderStreamControls();
       try {
         const {ok, data} = await apiRequest('/api/stream/start', {destinations: chosen, profile: document.getElementById('quality-profile').value,
-                                                                 record: document.getElementById('record-with-live').checked});
+                                                                 record: document.getElementById('record-with-live').checked,
+                                                                 remember: document.getElementById('remember-keys').checked});
         if (sequence === streamSequence) showToast(data.message || data.error || 'Start failed', ok ? 'success' : 'error');
       } finally {
         startPending = false;
@@ -2917,6 +2950,8 @@
     const savedReplaySeconds = storeGet('mcc-replay-seconds');
     if (['6', '10', '15', '20'].includes(savedReplaySeconds)) document.getElementById('replay-seconds').value = savedReplaySeconds;
     loadDestinations();
+    document.getElementById('remember-keys').checked = storeGet('mcc-remember-keys') !== 'off';
+    loadStreamKeys();
     selectTab(storeGet('mcc-tab'));
     applyMode();
     applyOutdoorMode();
