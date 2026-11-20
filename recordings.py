@@ -5,6 +5,11 @@ writes the final program (with scoreboard) as MPEG-TS parts, one per recorder pr
 so a crash or encoder restart loses seconds, not the match. Stopping joins the parts
 into one MP4. Markers carry their offset on the recording timeline (seconds from the
 start of the joined file), so clips can be cut from the parts or from the MP4 alike.
+
+While a replay is on air the program shows the replay, so the recording holds the replay,
+not the live game. The live camera is then also recorded (copy only) into live/: each
+"live window" knows where it sits on the recording timeline, and a highlight marked
+inside one is cut from it.
 """
 from __future__ import annotations
 
@@ -210,6 +215,78 @@ def written_duration(sid):
     return total
 
 
+def new_live_window(sid, camera):
+    """Register a recording of the live camera while a replay covers it; returns its path."""
+    with _lock:
+        session = _load(sid)
+        windows = session.setdefault("live", [])
+        number = len(windows) + 1
+        name = f"live/live-{number:02d}-{camera}.ts"
+        (_dir(sid) / "live").mkdir(exist_ok=True)
+        windows.append({"id": f"l{number}", "file": name, "camera": camera, "offset": None,
+                        "duration": None, "mp4": None})
+        _save(session)
+        return str(_dir(sid) / name)
+
+
+def _remux_live(sid, window):
+    """The live window as MP4 (copy only); keeps the .ts when that fails."""
+    folder = _dir(sid)
+    source = folder / window["file"]
+    name = window["file"][:-3] + ".mp4"
+    tmp = folder / (window["file"][:-3] + ".part.mp4")
+    try:
+        _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-i", str(source),
+              "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-movflags", "+faststart", str(tmp)])
+        os.replace(tmp, folder / name)
+    except Exception as exc:
+        tmp.unlink(missing_ok=True)
+        logger.warning("Live window %s of %s stays MPEG-TS: %s", window["file"], sid, exc)
+        return None
+    source.unlink(missing_ok=True)
+    return name
+
+
+def close_live_window(sid, path, aired=True, wall_end=None):
+    """The live camera recording ended: place it on the recording timeline, or drop it
+    when no replay was actually on air (a replay that failed to start)."""
+    folder = _dir(sid)
+    with _lock:
+        session = _load(sid)
+        window = next((w for w in session.get("live", []) if str(folder / w["file"]) == path), None)
+    if window is None or window["duration"] is not None:
+        return None
+    file = folder / window["file"]
+    duration = _probe_duration(file) if aired and file.exists() and file.stat().st_size else 0.0
+    if not duration:
+        file.unlink(missing_ok=True)
+        with _lock:
+            session = _load(sid)
+            session["live"] = [w for w in session.get("live", []) if w["id"] != window["id"]]
+            _save(session)
+        return None
+    # It ends now: where it began on the recording timeline follows from its length.
+    begin = (wall_end or _now()) - duration
+    window.update(duration=round(duration, 3), offset=round(_position(session, begin), 2))
+    window["mp4"] = _remux_live(sid, window)
+    with _lock:
+        session = _load(sid)
+        for i, w in enumerate(session.get("live", [])):
+            if w["id"] == window["id"]:
+                session["live"][i] = window
+        _save(session)
+    return window
+
+
+def _live_window_at(session, offset):
+    """The finished live window covering a timeline offset, if any."""
+    for window in session.get("live", []):
+        if window["duration"] and window["offset"] is not None \
+                and window["offset"] <= offset <= window["offset"] + window["duration"]:
+            return window
+    return None
+
+
 def add_marker(sid, label="Highlight", clock="", score="", wall=None, auto=None):
     """auto names the team for a goal marked by the scoreboard, so a quick correction
     (the -1 button) can withdraw it again."""
@@ -312,10 +389,14 @@ def _run(cmd, timeout=120):
 
 
 def export_clip(sid, mid, pre=CLIP_PRE, post=CLIP_POST):
-    """Cut a highlight around its marker without re-encoding (starts on a keyframe)."""
+    """Cut a highlight around its marker without re-encoding (starts on a keyframe).
+    A highlight marked while a replay was on air is cut from the live camera instead."""
     with _lock:
         session = _load(sid)
         marker = dict(_marker(session, mid))
+    window = _live_window_at(session, marker["offset"])
+    if window:
+        return _export_live_clip(sid, session, marker, window, pre, post)
     start = max(0.0, marker["offset"] - pre)
     length = marker["offset"] - start + post
     folder = _dir(sid)
@@ -378,9 +459,58 @@ def export_clip(sid, mid, pre=CLIP_PRE, post=CLIP_POST):
             listing.unlink(missing_ok=True)
     with _lock:
         session = _load(sid)
-        _marker(session, mid)["clip"] = name
+        found = _marker(session, mid)
+        found["clip"], found["clip_live"] = name, False
         _save(session)
     return name
+
+
+CLIP_SIZES = {"720p": (1280, 720), "1080p": (1920, 1080)}
+
+
+def _export_live_clip(sid, session, marker, window, pre, post):
+    """Clip from the live camera recording (the program showed a replay then). Encoded to
+    the recording's size and frame rate, so it plays and joins like the other clips."""
+    folder = _dir(sid)
+    source = folder / (window["mp4"] or window["file"])
+    if not source.exists():
+        raise ValueError("Live recording file is missing")
+    inner = marker["offset"] - window["offset"]
+    start = max(0.0, inner - pre)
+    length = min(window["duration"], inner + post) - start
+    width, height = CLIP_SIZES.get(session.get("profile"), CLIP_SIZES["720p"])
+    name = f"clips/{marker['id']}.mp4"
+    target = folder / name
+    target.parent.mkdir(exist_ok=True)
+    tmp = target.with_suffix(".part.mp4")
+    try:
+        _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-ss", f"{start:.2f}",
+              "-i", str(source), "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo",
+              "-t", f"{length:.2f}", "-map", "0:v:0", "-map", "0:a:0?" if _has_audio(source) else "1:a:0",
+              "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+                     f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=30",
+              "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+              "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-ac", "2", "-shortest",
+              "-movflags", "+faststart", str(tmp)], timeout=300)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    with _lock:
+        session = _load(sid)
+        found = _marker(session, marker["id"])
+        found["clip"], found["clip_live"] = name, True
+        _save(session)
+    return name
+
+
+def _has_audio(path):
+    try:
+        result = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+                                 "stream=index", "-of", "csv=p=0", str(path)],
+                                capture_output=True, text=True, timeout=30)
+        return bool(result.stdout.strip())
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 def build_reel(sid):
@@ -393,13 +523,19 @@ def build_reel(sid):
     for marker in markers:
         name = marker["clip"] if marker.get("clip") and (_dir(sid) / marker["clip"]).exists() else export_clip(sid, marker["id"])
         clips.append(_dir(sid) / name)
+    with _lock:
+        mixed = len({bool(m.get("clip_live")) for m in _load(sid)["markers"]}) > 1
     folder = _dir(sid)
     listing = folder / "reel.txt"
     listing.write_text("".join(f"file '{p.relative_to(folder)}'\n" for p in clips))
     tmp = folder / "reel.part.mp4"
     try:
         _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
-              "-safe", "0", "-i", str(listing), "-c", "copy", "-movflags", "+faststart", str(tmp)], timeout=300)
+              "-safe", "0", "-i", str(listing),
+              # Clips from the live camera come from another encoder: join by re-encoding.
+              *(["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-b:a", "160k"] if mixed else ["-c", "copy"]),
+              "-movflags", "+faststart", str(tmp)], timeout=900 if mixed else 300)
         os.replace(tmp, folder / "highlights.mp4")
     finally:
         listing.unlink(missing_ok=True)
@@ -464,6 +600,7 @@ def finalize(sid):
             _save(session)
         for part in parts:
             (folder / part["file"]).unlink(missing_ok=True)
+        _finish_live_windows(sid)
         logger.info("Recording %s saved as %s", sid, name)
         return True, name
     except Exception as exc:
@@ -478,6 +615,29 @@ def finalize(sid):
         listing.unlink(missing_ok=True)
         with _lock:
             _finalizing.discard(sid)
+
+
+def _finish_live_windows(sid):
+    """Live windows the app could not finish (it stopped during a replay): measure them,
+    place them by their file times and save them as MP4."""
+    folder = _dir(sid)
+    with _lock:
+        session = _load(sid)
+    changed = False
+    for window in session.get("live", []):
+        file = folder / window["file"]
+        if window["duration"] is None and file.exists():
+            window["duration"] = round(_probe_duration(file) or 0.0, 3)
+            window["offset"] = round(_position(session, file.stat().st_mtime - window["duration"]), 2)
+            changed = True
+        if not window.get("mp4") and file.exists() and window["duration"]:
+            window["mp4"] = _remux_live(sid, window)
+            changed = True
+    if changed:
+        with _lock:
+            fresh = _load(sid)
+            fresh["live"] = [w for w in session["live"] if w["duration"]]
+            _save(fresh)
 
 
 def finalize_async(sid):
@@ -535,6 +695,9 @@ def describe(session, live_wall=None):
             "file": session.get("file"), "duration": round(duration or 0.0, 1),
             "bytes": _size(folder), "markers": markers,
             "reel": "highlights.mp4" if (folder / "highlights.mp4").exists() else None,
+            "live": [{"id": w["id"], "camera": w["camera"], "time": _timestamp(w["offset"]),
+                      "offset": w["offset"], "duration": w["duration"], "file": w["mp4"] or w["file"]}
+                     for w in session.get("live", []) if w["duration"] and (folder / (w["mp4"] or w["file"])).exists()],
             "chapters": chapters(session)}
 
 

@@ -971,7 +971,7 @@
             <button data-when-recording onclick="stopRecording()" class="rec-btn hidden">⏹ Stop recording</button>
             <button data-when-recording onclick="markHighlight()" class="mark-btn hidden">⭐ Mark highlight</button>
           </div>
-          <p class="text-xs text-slate-500">Records the broadcast picture with scoreboard. Goals are marked automatically; recordings, clips and chapters are in the 🎬 Recordings tab.</p>
+          <p class="text-xs text-slate-500">Records the broadcast picture with scoreboard. During a replay the live camera is recorded separately. Goals are marked automatically; recordings, clips and chapters are in the 🎬 Recordings tab.</p>
         </div>
         <!-- Duration Timer -->
         <div id="yt-timer-row" class="hidden flex items-center gap-3 bg-slate-900 rounded-lg p-3 border border-red-900">
@@ -1804,6 +1804,21 @@
       </li>`;
     }
 
+    function liveWindows(rec) {
+      // During a replay the recording shows the replay; the live game was recorded here.
+      if (!(rec.live || []).length) return '';
+      const rows = rec.live.map(w => `<li class="marker-row">
+          <span class="font-mono text-sm text-white">${esc(w.time)}</span>
+          <span class="text-xs text-slate-400">${esc(w.camera.replace('cam', 'Cam '))} · ${fmtDuration(w.duration)}</span>
+          <span class="ml-auto flex gap-1">
+            <button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, w.file))}')" aria-label="Play live footage">▶</button>
+            <a class="rec-action" href="${esc(recordingUrl(rec.id, w.file, true))}" aria-label="Download live footage">⬇</a></span>
+        </li>`).join('');
+      return `<h4 class="text-sm font-semibold text-slate-300">📹 Live during replays</h4>
+        <p class="text-xs text-slate-400">The recording shows the replays at these times; this is what the camera filmed meanwhile. Highlights marked during a replay are cut from it.</p>
+        <ul class="space-y-1">${rows}</ul>`;
+    }
+
     function recordingCard(rec) {
       const [chipText, chipClass] = recordingChips[rec.state] || [rec.state, 'chip chip-slate'];
       const busy = ['recording', 'finalizing'].includes(rec.state);
@@ -1834,7 +1849,7 @@
         ${actions ? `<div class="flex flex-wrap gap-2">${actions}</div>` : ''}
         <div data-player></div>
         <h4 class="text-sm font-semibold text-slate-300">⭐ Highlights</h4>
-        ${markers}${chapters}`;
+        ${markers}${chapters}${liveWindows(rec)}`;
     }
 
     let recordingsBusy = false;

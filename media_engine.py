@@ -109,6 +109,10 @@ REPLAY_MARGIN = 1.5       # seconds behind the recording's write position
 REPLAY_SPEEDS = (1.0, 0.5)
 REPLAY_LEAD = 1.5         # start the return-to-live relay at least this long before the clip ends
 _cut_seconds = 3.0        # how long a cut takes here (moving average); the return starts that early
+# While a replay is on air the recording holds the replay: the live camera is recorded
+# (copy only) next to it, from the replay request until LIVE_TAIL after live is back.
+_live_capture = None      # {"proc", "camera", "session", "path", "aired", "idle_since"}
+LIVE_TAIL = 3.0
 _state = "stopped"
 # One message per part of the pipeline, so one part's error neither hides nor clears another's.
 ERROR_PARTS = ("server", "relay", "encoder", "destinations")
@@ -1057,6 +1061,7 @@ def play_replay(seconds=10, speed=1.0, marker=None, pre=8.0, post=4.0, start=Non
         source, offset = recordings.source_at(session, start)
     except ValueError as exc:
         return False, str(exc)
+    _start_live_capture(camera, session)  # before the replay covers the live game
     with _lock:
         _generation += 1
         _pending_camera = None
@@ -1157,6 +1162,75 @@ def _watch_replay(proc, generation, camera, airtime, hold=False):
     if ended:
         _kill_process(proc)
         _notify_replay(False)
+
+
+def _start_live_capture(camera, session):
+    """Record the live camera while a replay covers it on the program (and therefore in
+    the recording). Copy only: no measurable CPU. A replay over a replay keeps it."""
+    global _live_capture
+    with _lock:
+        capture = _live_capture
+        if (capture and capture["camera"] == camera and capture["session"] == session
+                and capture["proc"].poll() is None):
+            capture["idle_since"] = None
+            return
+    if capture:
+        _end_live_capture()
+    if not camera or not _camera_status.get(camera):
+        return
+    try:
+        path = recordings.new_live_window(session, camera)
+        proc = Process(_ffmpeg() + _camera_input(camera) + [
+            "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", path], copy=True)
+    except (OSError, ValueError) as exc:
+        logger.warning("Cannot record the live camera during the replay: %s", exc)
+        return
+    with _lock:
+        _live_capture = {"proc": proc, "camera": camera, "session": session, "path": path,
+                         "aired": False, "idle_since": None}
+
+
+def _end_live_capture(background=True):
+    global _live_capture
+    with _lock:
+        capture, _live_capture = _live_capture, None
+    if not capture:
+        return
+    _kill_process(capture["proc"])
+    ended = time.time()
+    close = lambda: recordings.close_live_window(capture["session"], capture["path"], capture["aired"], ended)
+    if background:
+        threading.Thread(target=close, daemon=True, name="live-window").start()
+    else:
+        close()
+
+
+def _supervise_live_capture(now):
+    """End the live camera recording a little after the replay; restart it if it died."""
+    with _lock:
+        capture, replay = _live_capture, _replay
+        if not capture:
+            return
+        if capture["session"] != _recording:
+            finished = True
+        elif replay:
+            capture["aired"], capture["idle_since"] = True, None
+            finished = False
+        else:
+            capture["idle_since"] = capture["idle_since"] or now
+            finished = now - capture["idle_since"] >= LIVE_TAIL
+        died = not finished and capture["proc"].poll() is not None
+    if finished:
+        _end_live_capture()
+    elif died:
+        logger.warning("Live camera recording during the replay stopped: %s", capture["proc"].error)
+        aired = capture["aired"]
+        _end_live_capture()
+        if replay:
+            _start_live_capture(capture["camera"], capture["session"])
+            with _lock:
+                if _live_capture:
+                    _live_capture["aired"] = aired
 
 
 def stop_replay():
@@ -1661,6 +1735,7 @@ def stop_recording():
         _stop_all()
         return True, "Recording stopped; saving the file"
     _kill_process(recorder)
+    _end_live_capture(background=False)
     recordings.close_part(session)
     recordings.finalize_async(session)
     return True, "Recording stopped; saving the file"
@@ -1688,6 +1763,7 @@ def _stop_all(finalize=True):
         _relay_zmq = None
     for proc in processes:
         _kill_process(proc)
+    _end_live_capture(background=False)  # placed before the session is joined
     if ended_replay:
         _notify_replay(False)
     if session:
@@ -1928,6 +2004,7 @@ def _watch_encoder():
     while not _stop.wait(.5):
         try:
             _supervise_encoder()
+            _supervise_live_capture(time.monotonic())
         except Exception:
             logger.exception("Encoder supervisor failed")
 

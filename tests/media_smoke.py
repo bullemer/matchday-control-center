@@ -299,6 +299,15 @@ def run():
             assert abs(clip_len - expected) < 3, (clip_len, expected)  # copy cuts start on a keyframe
             assert m.recordings.build_reel(session) == 'highlights.mp4'
             print(f"PASS: stop recording keeps YouTube live; {info['file']} {parts_total:.0f}s, clip {clip_len:.1f}s, reel", flush=True)
+            # The replays covered the live game in the recording: the live camera was kept.
+            live = info['live']
+            assert live and live[0]['camera'] == 'cam1' and live[0]['file'].endswith('.mp4'), live
+            first = m.recordings.RECORDINGS_DIR / session / live[0]['file']
+            assert live[0]['duration'] >= 15 and abs(m.recordings._probe_duration(first) - live[0]['duration']) < 2, live
+            red = subprocess.run(['ffmpeg', '-v', 'error', '-ss', '3', '-i', str(first), '-frames:v', '1', '-vf', 'scale=1:1',
+                                  '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-'], capture_output=True).stdout
+            assert red[0] > 150 and red[2] < 80, red  # cam1 is red: the live game, not the blue replay
+            print(f"PASS: live camera kept during replays: {len(live)} window(s), first {live[0]['duration']:.0f}s at {live[0]['time']}", flush=True)
             assert m.stop_youtube_stream()[0]
             assert m.start_recording('480p', 'Record only')[0], m.get_stream_status()
             wait(lambda: m.get_recording_status()['writing'])
