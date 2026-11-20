@@ -357,8 +357,10 @@
       <div class="space-y-3">
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700">
           <div class="flex items-center justify-between mb-2">
-            <span data-bind="program_label" class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
+            <span data-bind="match_program_label" class="text-xs font-semibold text-brand-red uppercase tracking-wider">🔴 Program</span>
             <button onclick="openLayoutEditor()" aria-label="Video layout" class="text-xs px-2 py-1 rounded bg-brand-blue text-white">Layout</button>
+            <button id="match-output-toggle" onclick="toggleMatchOutput()" title="Show what viewers get (a few seconds behind)"
+                    class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">📡 Output</button>
             <button id="match-preview-toggle" onclick="toggleMatchPreview()"
                     class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
           </div>
@@ -646,6 +648,17 @@
             <iframe data-preview="setup" data-program data-src="http://{{ media_host }}:8889/program" allow="autoplay" loading="lazy"></iframe>
           </div>
         </div>
+        <!-- What viewers get: the encoded output, with the Score67 overlay (a few seconds behind) -->
+        <div>
+          <div class="flex items-center justify-between mb-1">
+            <span class="text-xs font-semibold text-brand-cyan uppercase tracking-wider">📡 Output · as viewers see it</span>
+            <span class="text-xs text-slate-500">a few seconds behind</span>
+          </div>
+          <div class="webrtc-frame border-2 border-slate-700" id="frame-output">
+            <div class="preview-offline" data-offline="output">Starts with GO LIVE or recording</div>
+            <iframe data-preview="setup" data-output data-src="http://{{ media_host }}:8889/final" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
       </div>
 
       <!-- Tally / Cut Buttons -->
@@ -755,6 +768,13 @@
           <p id="usb-audio-active-label" class="text-xs text-slate-500 mt-1 hidden">
             Active: <span id="usb-audio-active-name" class="text-brand-cyan font-medium"></span>
           </p>
+          <label class="mt-2 flex items-center gap-2 text-xs text-slate-400">⏱ Mic delay
+            <input id="mic-delay" type="range" min="0" max="3000" step="100" value="0" class="flex-1"
+                   oninput="document.getElementById('mic-delay-value').textContent = (this.value / 1000).toFixed(1) + ' s'"
+                   onchange="setMicDelay(this.value)" aria-label="Microphone delay">
+            <span id="mic-delay-value" class="font-mono text-white w-12 text-right">0.0 s</span>
+          </label>
+          <p class="text-xs text-slate-500">Voice before the picture? Increase until lips/whistle and sound match (often 1–2 s).</p>
         </div>
         <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
         <div>
@@ -867,6 +887,14 @@
             <option value="15">15 min</option><option value="10">10 min</option>
           </select>
         </label>
+        <label class="mt-3 flex items-center gap-2 text-sm text-slate-300">Added time
+          <select id="added-time" onchange="setAddedTime(this.value)" aria-label="Announced added time"
+                  class="bg-slate-700 text-white rounded-lg px-2 py-1">
+            <option value="0">none</option>
+            <option value="1">+1 min</option><option value="2">+2 min</option><option value="3">+3 min</option><option value="4">+4 min</option><option value="5">+5 min</option><option value="6">+6 min</option><option value="7">+7 min</option><option value="8">+8 min</option><option value="9">+9 min</option><option value="10">+10 min</option>
+          </select>
+          <span class="text-xs text-slate-500">past the half's end the clock shows 45:00 +1:23</span>
+        </label>
         <button onclick="openClockEditor()" class="mt-3 text-sm text-brand-cyan underline">✎ Adjust clock</button>
         <!-- Correct the clock without stopping it -->
         <div class="mt-3 flex flex-wrap items-center gap-2">
@@ -913,6 +941,7 @@
                 {{ icons[name] }} {{ label }}
               </label>
               <span data-dest-state class="chip chip-slate hidden"></span>
+              <span data-dest-rate class="text-xs font-mono hidden"></span>
               <span class="ml-auto flex gap-2">
                 <button data-dest-start onclick="startDestination('{{ name }}')" class="rec-action hidden">▶ Start</button>
                 <button data-dest-stop onclick="stopDestination('{{ name }}')" class="rec-action rec-danger hidden">⏹ Stop</button>
@@ -1430,6 +1459,23 @@
       if (state.tab === 'recordings') loadRecordings(true);
     }
 
+    // Match preview: the program (instant, for cutting) or the output viewers get.
+    function toggleMatchOutput() {
+      state.matchOutput = !state.matchOutput;
+      if (state.matchOutput && !state.outputLive) showToast('The output starts with GO LIVE or recording', 'info');
+      renderOutputPreview();
+    }
+    function renderOutputPreview() {
+      const frame = document.querySelector('iframe[data-preview="match"]');
+      const output = state.matchOutput && state.outputLive;
+      frame.dataset.src = frame.dataset.src.replace(/[^/]+$/, output ? 'final' : (state.programPath || 'program'));
+      const button = document.getElementById('match-output-toggle');
+      button.classList.toggle('bg-brand-blue', !!state.matchOutput);
+      button.classList.toggle('text-white', !!state.matchOutput);
+      button.setAttribute('aria-pressed', String(!!state.matchOutput));
+      syncPreviews();
+    }
+
     function toggleMatchPreview() {
       state.matchPreview = !state.matchPreview;
       storeSet('mcc-match-preview', state.matchPreview ? 'on' : 'off');
@@ -1462,13 +1508,15 @@
         const visible = frame.dataset.preview === 'match'
           ? state.matchMode && state.matchPreview
           : !state.matchMode && state.tab === 'main';
-        const online = !frame.dataset.camera || !!state.cameras[frame.dataset.camera];
+        const online = 'output' in frame.dataset ? !!state.outputLive
+          : !frame.dataset.camera || !!state.cameras[frame.dataset.camera];
         const wanted = visible && online;
         frame.hidden = !wanted;
         const placeholder = frame.parentElement.querySelector('[data-offline]');
         if (placeholder) {
           placeholder.hidden = online;
-          placeholder.textContent = state.connectionLost ? 'Camera status unavailable' : 'Camera offline';
+          placeholder.textContent = 'output' in frame.dataset ? 'Starts with GO LIVE or recording'
+            : state.connectionLost ? 'Camera status unavailable' : 'Camera offline';
         }
         if (wanted && frame.getAttribute('src') !== frame.dataset.src) frame.setAttribute('src', frame.dataset.src);
         if (!wanted && frame.hasAttribute('src')) frame.removeAttribute('src');
@@ -2062,6 +2110,17 @@
     }
 
     // ──────────────────────── YouTube Stream ────────────────────────
+    async function setMicDelay(value) {
+      const {ok, data} = await apiRequest('/api/audio/mic-delay', {ms: parseInt(value, 10)});
+      showToast(data.message || data.error || 'Could not set the delay', ok ? 'success' : 'error');
+    }
+    function showMicDelay(ms) {
+      const slider = document.getElementById('mic-delay');
+      if (!slider || document.activeElement === slider || typeof ms !== 'number') return;
+      slider.value = ms;
+      document.getElementById('mic-delay-value').textContent = (ms / 1000).toFixed(1) + ' s';
+    }
+
     function toggleKeyVisibility(button) {
       const input = button.parentElement.querySelector('[data-dest-key]');
       input.type = input.type === 'password' ? 'text' : 'password';
@@ -2148,6 +2207,16 @@
         const [text, look] = status ? DEST_STATES[status.state] || [status.state.toUpperCase(), 'chip chip-slate'] : ['', ''];
         chip.textContent = text;
         chip.className = (look || 'chip chip-slate') + (status ? '' : ' hidden');
+        // Upload health: the platform connection keeps up with real time, or falls behind.
+        const rate = row.querySelector('[data-dest-rate]');
+        const health = status && status.health;
+        rate.classList.toggle('hidden', !health);
+        if (health) {
+          rate.textContent = `↑ ${(status.kbps / 1000).toFixed(1)} Mbit/s` + (health === 'good' ? '' : ` · ${health === 'slow' ? 'upload struggling' : 'upload too slow'} (${status.speed.toFixed(2)}×)`);
+          rate.className = 'text-xs font-mono ' + {good: 'text-slate-400', slow: 'text-brand-amber font-semibold', failing: 'text-red-400 font-semibold'}[health];
+          rate.title = health === 'good' ? 'The upload keeps up with the live picture'
+            : 'The internet upload cannot keep up: viewers see buffering. Use a lower quality, fewer platforms, or move the phone for a better signal.';
+        }
         row.querySelector('[data-dest-start]').classList.toggle('hidden', !(streaming && on && !status));
         row.querySelector('[data-dest-stop]').classList.toggle('hidden', !status);
         const error = row.querySelector('[data-dest-error]');
@@ -2163,7 +2232,7 @@
       need.classList.toggle('upload-warning', enabled * kbps > 10000);
       document.querySelectorAll('[data-dest-summary]').forEach(box => {
         box.innerHTML = DESTINATIONS.filter(name => live[name]).map(name => [name, live[name]]).map(([name, s]) =>
-          `<span class="${(DEST_STATES[s.state] || ['', 'chip chip-slate'])[1]}" title="${esc(s.label)}: ${esc(s.state)}">${DEST_SHORT[name] || esc(name)}</span>`).join('');
+          `<span class="${s.health === 'failing' ? 'chip chip-red' : s.health === 'slow' ? 'chip chip-amber' : (DEST_STATES[s.state] || ['', 'chip chip-slate'])[1]}" title="${esc(s.label)}: ${esc(s.state)}${s.health && s.health !== 'good' ? ' — upload too slow' : ''}">${DEST_SHORT[name] || esc(name)}${s.health && s.health !== 'good' ? ' ⚠' : ''}</span>`).join('');
       });
     }
 
@@ -2404,6 +2473,10 @@
         if (document.activeElement !== input && !dirtyNames.has(id)) input.value = sb[id.replace('-', '_')];
       }
       state.clockElapsed = sb.clock_elapsed_secs;
+      state.half = sb.half;
+      state.added = sb.added || 0;
+      const addedSelect = document.getElementById('added-time');
+      if (addedSelect && document.activeElement !== addedSelect) addedSelect.value = String(state.added);
       state.clockRunning = sb.clock_running;
       state.clockLastServerUpdate = Date.now();
       const toggle = document.getElementById('match-clock-toggle');
@@ -2522,6 +2595,21 @@
       return `${m}:${s}`;
     }
 
+    // Same as the broadcast: past the end of a half, "45:00 +1:23" and announced "(+3)".
+    function matchClockText(seconds) {
+      const end = halfLength * 60 * (state.half === 2 ? 2 : 1);
+      let text = formatClock(seconds);
+      if (seconds >= end + 1) {
+        const over = Math.floor(seconds) - end;
+        text = `${formatClock(end)} +${Math.floor(over / 60)}:${String(over % 60).padStart(2, '0')}`;
+      }
+      return text + (state.added ? ` (+${state.added})` : '');
+    }
+    function setAddedTime(minutes) {
+      apiPost('/api/scoreboard/clock', {action: 'set_added', minutes: parseInt(minutes, 10)}, {quiet: true})
+        .then(data => data && applyScoreboard(data.scoreboard));
+    }
+
     // Client-side clock interpolation (runs every second)
     function interpolateClock() {
       let displaySeconds = state.clockElapsed;
@@ -2529,7 +2617,7 @@
         const drift = (Date.now() - state.clockLastServerUpdate) / 1000;
         displaySeconds = state.clockElapsed + drift;
       }
-      const clockStr = formatClock(displaySeconds);
+      const clockStr = matchClockText(displaySeconds);
       bind('clock', clockStr);
 
       // Also update the scoreboard preview in real time
@@ -2625,6 +2713,7 @@
     }
 
     function renderMeters(info) {
+      if (info.mixer) showMicDelay(info.mixer.mic_delay_ms);
       if (info.mixer && !mutePending && state.muted !== !!info.mixer.muted) {
         state.muted = !!info.mixer.muted;
         renderMute();
@@ -2861,13 +2950,15 @@
       renderDestinations();
       // The program preview shows the finished output while live/recording, otherwise the
       // feed on air; it follows the switch (the iframe reloads when the source changes).
+      state.outputLive = !!(stream.encoder && stream.encoder.active);
       if (stream.program_path) {
+        state.programPath = stream.program_path;
         document.querySelectorAll('iframe[data-program]').forEach(frame => {
           frame.dataset.src = frame.dataset.src.replace(/[^/]+$/, stream.program_path);
         });
-        bind('program_label', stream.program_path === 'final' ? '🔴 Program · as broadcast' : '🔴 Program · before scoreboard');
-        syncPreviews();
       }
+      bind('match_program_label', state.matchOutput && state.outputLive ? '📡 Output · as viewers see it' : '🔴 Program');
+      renderOutputPreview();
       if (typeof stream.muted === 'boolean' && !mutePending) {
         state.muted = stream.muted;
         renderMute();

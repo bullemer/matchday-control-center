@@ -711,3 +711,28 @@ test('graphics chip option asks the server and undoes the tick when it is refuse
   expect(asked).toEqual({hardware: true});
   await expect(box).not.toBeChecked();
 });
+
+test('output preview, added time and microphone delay', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  // Not live: the output tile says when it starts.
+  await expect(page.locator('[data-offline="output"]')).toHaveText('Starts with GO LIVE or recording');
+  await expect(page.locator('iframe[data-output]')).toBeHidden();
+  // Announced added time shows in the clock as on TV.
+  await page.locator('#added-time').selectOption('3');
+  await expect(page.locator('#match-clock-display')).toContainText('(+3)');
+  expect((await (await page.request.get('/api/scoreboard')).json()).scoreboard.added).toBe(3);
+  await page.locator('#added-time').selectOption('0');
+  await expect(page.locator('#match-clock-display')).not.toContainText('(+');
+  // Microphone delay goes to the server.
+  await page.evaluate(() => setMicDelay('1500'));
+  await expect(page.locator('#toast-container')).toContainText('Microphone delay 1.5 s');
+  expect(await (await page.request.get('/test/mic-delay')).json()).toContain(1500);
+  // Match mode: the preview switches between program and output while live.
+  await page.evaluate(() => toggleMatchOutput());
+  await expect(page.locator('#match-output-toggle')).toHaveAttribute('aria-pressed', 'true');
+  await expect(page.locator('#toast-container')).toContainText('The output starts with GO LIVE or recording');
+  expect(errors).toEqual([]);
+});

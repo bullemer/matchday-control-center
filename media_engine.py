@@ -5,6 +5,7 @@ from browser_overlay import FRAME_PATH, ensure_frame
 import recordings
 
 import hashlib
+import collections
 import json
 import logging
 import os
@@ -59,6 +60,7 @@ _encoder_thread = None
 # outage therefore restarts just the pusher and never interrupts the recording.
 _mediamtx_proc = _encoder_proc = _recorder_proc = _relay_proc = None
 _active_camera = None
+_last_camera = None       # on air at the last STOP: the next GO LIVE starts there again
 _layout = {"mode": "single", "main": "cam1", "secondary": "cam2", "position": "top-right"}
 _relay_secondary = None
 _layout_warning = ""
@@ -113,6 +115,7 @@ _cut_seconds = 3.0        # how long a cut takes here (moving average); the retu
 # (copy only) next to it, from the replay request until LIVE_TAIL after live is back.
 _live_capture = None      # {"proc", "camera", "session", "path", "aired", "idle_since"}
 LIVE_TAIL = 3.0
+SHUTDOWN_SAVE_SECONDS = 60
 _state = "stopped"
 # One message per part of the pipeline, so one part's error neither hides nor clears another's.
 ERROR_PARTS = ("server", "relay", "encoder", "destinations")
@@ -170,6 +173,8 @@ class Process:
         # Stream copy reports frame=0, so its progress is advancing output time. Encoders
         # keep frame counting: a relay can emit generated silence with no picture.
         self.copy = copy
+        self.total_size = 0
+        self._samples = collections.deque(maxlen=60)  # (monotonic, out_time_us, total_size)
         self.error = ""
         self.launched = time.monotonic()
         self.secret = secret
@@ -190,6 +195,14 @@ class Process:
                         self.frame = frame
                     except ValueError:
                         pass
+                elif progress and self.copy and line.startswith("total_size="):
+                    try:
+                        self.total_size = int(line.split("=", 1)[1])
+                    except ValueError:
+                        pass
+                elif progress and self.copy and line.startswith("progress="):
+                    # End of one progress report: one sample for the upload rate.
+                    self._samples.append((time.monotonic(), self.out_time, self.total_size))
                 elif progress and self.copy and line.startswith("out_time_us="):
                     # Stream copy (YouTube pusher, recorder) reports frame=0: output time advances.
                     try:
@@ -215,6 +228,22 @@ class Process:
 
     def healthy(self):
         return self.poll() is None and self.last_progress > 0 and time.monotonic() - self.last_progress < 15
+
+    def rates(self, window=6.0):
+        """(kbit/s sent, speed) over the last seconds; speed 1.0 = keeping up with real time.
+        ffmpeg's own speed= averages the whole run and hides an uplink getting slow."""
+        samples = list(self._samples)
+        if len(samples) < 2:
+            return None, None
+        now = samples[-1]
+        if time.monotonic() - now[0] > 3:  # no report for a while: nothing is going out
+            return 0.0, 0.0
+        first = next((x for x in samples if now[0] - x[0] <= window), samples[0])
+        elapsed = now[0] - first[0]
+        if elapsed < 1.5:
+            return None, None
+        return (round((now[2] - first[2]) * 8 / elapsed / 1000, 0),
+                round((now[1] - first[1]) / 1e6 / elapsed, 2))
 
 
 class Meter(Process):
@@ -531,8 +560,44 @@ def get_audio_source():
     return "mix"
 
 
+AUDIO_SETTING = BASE / "data/audio.json"
+MIC_DELAY_MAX = 3000
+_mic_delay_ms = 0
+
+
+def load_audio_setting():
+    global _mic_delay_ms
+    try:
+        value = json.loads(AUDIO_SETTING.read_text()).get("mic_delay_ms", 0)
+        _mic_delay_ms = value if type(value) is int and 0 <= value <= MIC_DELAY_MAX else 0
+    except (OSError, ValueError, AttributeError):
+        _mic_delay_ms = 0
+
+
+def set_mic_delay(ms):
+    """Delay USB microphones by ms so the commentary matches the (later) camera picture.
+    A relay that plays a microphone is rebuilt with it (a seamless cut)."""
+    global _mic_delay_ms
+    if type(ms) is not int or not 0 <= ms <= MIC_DELAY_MAX:
+        return False, f"Delay must be 0 to {MIC_DELAY_MAX} ms"
+    with _lock:
+        _mic_delay_ms = ms
+        camera, uses_mic, replay = _active_camera, any(c.startswith("usb:") for c in _relay_channels), _replay
+    try:
+        AUDIO_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        AUDIO_SETTING.write_text(json.dumps({"mic_delay_ms": ms}))
+    except OSError:
+        logger.exception("Cannot save the microphone delay")
+    message = f"Microphone delay {ms / 1000:.1f} s"
+    if camera and uses_mic and not replay and get_active_camera() == camera:
+        ok, result = switch_camera(camera, force=True)
+        if not ok:
+            return False, result
+    return True, message
+
+
 def get_mixer():
-    return {"follow": _follow, "muted": _muted, "preset": get_audio_source(),
+    return {"follow": _follow, "muted": _muted, "preset": get_audio_source(), "mic_delay_ms": _mic_delay_ms,
             "channels": {c: {**setting, "available": c in CAMERA_IDS or c[4:] in _mic_ids}
                          for c, setting in _mix.items()}}
 
@@ -571,9 +636,31 @@ def get_youtube_running():
     return any(t["proc"] and t["proc"].healthy() for t in list(_targets.values()))
 
 
+UPLOAD_SLOW, UPLOAD_FAILING = 0.97, 0.9   # speed below which an upload falls behind
+
+
+def _upload_health(target):
+    """Upload rate and whether this connection keeps up (speed ~1.0) or falls behind."""
+    proc = target.get("proc")
+    try:
+        kbps, speed = proc.rates() if proc is not None and target["state"] == "live" else (None, None)
+    except (TypeError, ValueError, AttributeError):
+        kbps, speed = None, None
+    if speed is None:
+        health = None
+    elif speed >= UPLOAD_SLOW:
+        health = "good"
+    elif speed >= UPLOAD_FAILING:
+        health = "slow"
+    else:
+        health = "failing"
+    return {"kbps": kbps, "speed": speed, "health": health}
+
+
 def get_destinations():
     """Per-destination status for the dashboard (never the key or URL)."""
-    return {name: {"label": t["label"], "state": t["state"], "error": t["error"], "started_at": t["started_at"]}
+    return {name: {"label": t["label"], "state": t["state"], "error": t["error"], "started_at": t["started_at"],
+                   **_upload_health(t)}
             for name, t in list(_targets.items())}
 
 
@@ -859,7 +946,10 @@ def _relay_command(cam, wanted, replay=None):
     parts, labels, channels = [], [], {}
     for index, (channel, pad, gain) in enumerate(sources):
         name = f"m{index}"
-        parts.append(f"[{pad}]aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,"
+        # A USB microphone is heard at once, the camera picture arrives a second or two
+        # later: the delay lines the commentary up with the picture.
+        delay = f"adelay=delays={_mic_delay_ms}:all=1," if channel.startswith("usb:") and _mic_delay_ms else ""
+        parts.append(f"[{pad}]{delay}aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,"
                      f"volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}[{name}]")
         labels.append(f"[{name}]")
         channels[channel] = name
@@ -1521,7 +1611,7 @@ def make_target(name, key="", server=None):
         raise ValueError(f"{label}: the server must be an rtmp:// or rtmps:// address")
     if not re.fullmatch(key_pattern, key) or (name != "custom" and not key):
         raise ValueError(f"{label}: invalid stream key")
-    return {"label": label, "url": f"{server}/{key}" if key else server, "secret": key or None,
+    return {"label": label, "url": f"{server}/{key}" if key else server, "secret": key or None, "server": server,
             "proc": None, "state": "starting", "error": "", "failures": 0, "retry_at": 0.0, "started_at": None}
 
 
@@ -1585,10 +1675,11 @@ def _room_note(profile):
     return f" — disk space for only about {minutes} min of recording (saving the file needs the same space again)"
 
 
-def _begin_recording(title):
-    """Under _lock: open a new session; the supervisor launches the recorder."""
+def _begin_recording(title, session=None):
+    """Under _lock: open a new session (or continue an interrupted one after a crash);
+    the supervisor launches the recorder."""
     global _want_record, _recording, _rec_failures, _rec_retry_at, _record_warning, _disk_warning, _disk_check_at
-    _recording = recordings.create_session(_profile, title)
+    _recording = session if session and recordings.reopen(session) else recordings.create_session(_profile, title)
     _want_record, _rec_failures, _rec_retry_at, _record_warning = True, 0, 0.0, ""
     _disk_warning, _disk_check_at = "", 0.0
 
@@ -1614,7 +1705,7 @@ def _attach(targets, record, title):
     return True, "; ".join(messages)
 
 
-def _start(targets, profile, record, title):
+def _start(targets, profile, record, title, session=None):
     global _state, _profile
     if not targets and not record:
         return False, "Choose at least one streaming destination"
@@ -1634,7 +1725,7 @@ def _start(targets, profile, record, title):
             if targets:
                 _state = "starting"
         try:
-            return _start_output(targets, profile, token, record, title)
+            return _start_output(targets, profile, token, record, title, session)
         finally:
             with _lock:
                 if token == _stop_generation and not _want_stream:
@@ -1643,7 +1734,7 @@ def _start(targets, profile, record, title):
         _start_lock.release()
 
 
-def _start_output(targets, profile, token, record=False, title=""):
+def _start_output(targets, profile, token, record=False, title="", session=None):
     """Start relay + encoder (and the requested destinations / recording) from cold."""
     global _want_stream, _state, _profile, _retry_at, _retries, _hw_warning
     if profile not in PROFILES:
@@ -1673,7 +1764,7 @@ def _start_output(targets, profile, token, record=False, title=""):
             return False, "Cannot query camera readiness"
         if token != _stop_generation:
             return False, SUPERSEDED
-        preferred = [_active_camera] if _active_camera else []
+        preferred = [c for c in (_active_camera, _last_camera) if c]
         if _layout["mode"] != "single":
             preferred = [_layout["main"]]
         candidates = preferred if _layout["mode"] != "single" else preferred + CAMERA_IDS
@@ -1700,12 +1791,46 @@ def _start_output(targets, profile, token, record=False, title=""):
         _summarize_targets()
         _retry_at, _retries = 0, 0
         if record:
-            _begin_recording(title)
+            _begin_recording(title, session)
         note = _room_note(_profile) if record else ""
         if not targets:
             return True, "Recording starting" + note
         names = ", ".join(t["label"] for t in targets.values())
         return True, f"Going live on {names}" + (" and recording" if record else "") + "; watch the live status for confirmation" + note
+
+
+def resume_state():
+    """What a restart needs to continue this broadcast (None when nothing is wanted).
+    Holds stream keys: the app keeps it in its private data folder."""
+    with _lock:
+        if not _want_stream:
+            return None
+        return {"targets": {name: {"key": t.get("secret") or "", "server": t.get("server")} for name, t in _targets.items()},
+                "profile": _profile, "record": bool(_want_record and _recording), "session": _recording,
+                "camera": (_replay or {}).get("camera") or _active_camera or _last_camera,
+                "layout": dict(_layout)}
+
+
+def resume(state, title=""):
+    """Continue a broadcast interrupted by a crash or restart: same platforms, quality,
+    camera and layout; the recording continues in the same session when it is unsaved."""
+    global _last_camera, _layout
+    targets = {}
+    for name, settings in (state.get("targets") or {}).items():
+        try:
+            targets[name] = make_target(name, settings.get("key", ""), settings.get("server"))
+        except (ValueError, AttributeError, TypeError) as exc:
+            logger.warning("Not resuming %s: %s", name, exc)
+    record = bool(state.get("record"))
+    if not targets and not record:
+        return False, "Nothing to resume"
+    with _lock:
+        _last_camera = state.get("camera") if state.get("camera") in CAMERA_IDS else _last_camera
+        layout = state.get("layout")
+        if isinstance(layout, dict) and layout.get("mode") in ("single", "pip", "split") \
+                and layout.get("main") in CAMERA_IDS and layout.get("secondary") in CAMERA_IDS:
+            _layout = {**_layout, **{k: layout[k] for k in ("mode", "main", "secondary", "position") if k in layout}}
+    return _start(targets, state.get("profile", "720p"), record, title, session=state.get("session") if record else None)
 
 
 def stop_stream(name=None):
@@ -1757,8 +1882,9 @@ def _stop_all(finalize=True):
     global _want_stream, _relay_proc, _active_camera, _generation
     global _state, _started_at, _pending_camera, _encoder_proc
     global _relay_channels, _relay_missing, _relay_muted, _stop_generation, _relay_secondary, _layout_warning
-    global _recorder_proc, _want_record, _recording, _record_warning, _replay, _relay_zmq
+    global _recorder_proc, _want_record, _recording, _record_warning, _replay, _relay_zmq, _last_camera
     with _lock:
+        _last_camera = (_replay or {}).get("camera") or _active_camera or _last_camera
         ended_replay, _replay = _replay is not None, None
         _want_stream = False
         _stop_generation += 1
@@ -2036,7 +2162,13 @@ def shutdown_all():
         if worker and worker is not threading.current_thread():
             worker.join(timeout=20)
     with _lock:
-        _stop_all(finalize=False)  # an open recording is joined at the next start
+        session = _recording
+        _stop_all(finalize=False)
+    if session:
+        # Logout or shutdown: save the MP4 now if it fits the time left; otherwise the
+        # parts stay safe and the next start joins them.
+        recordings.finalize(session, timeout=SHUTDOWN_SAVE_SECONDS)
+    with _lock:
         _await_retired()
         for key in list(_meters):
             _kill_process(_meters.pop(key))

@@ -56,6 +56,22 @@ class ApiTests(unittest.TestCase):
                 self.post('/api/stream/start',{**body,'remember':False})
             self.assertFalse(keys.exists())
 
+    def test_stoppage_time_counts_on_past_the_end_of_a_half(self):
+        t=a._match_clock_text
+        self.assertEqual(t(32*60+10,1,45),'32:10')
+        self.assertEqual(t(45*60,1,45),'45:00')
+        self.assertEqual(t(46*60+23,1,45),'45:00 +1:23')
+        self.assertEqual(t(80*60,2,45),'80:00')
+        self.assertEqual(t(92*60+5,2,45,3),'90:00 +2:05 (+3)')
+        self.assertEqual(t(41*60,1,40,2),'40:00 +1:00 (+2)')
+        with patch.object(a,'_save_match'):
+            r=self.post('/api/scoreboard/clock',{'action':'set_added','minutes':3})
+            self.assertEqual(r.json['scoreboard']['added'],3)
+            self.assertIn('(+3)',Path(a.SCOREBOARD_PATH).read_text())
+            self.assertEqual(self.post('/api/scoreboard/clock',{'action':'set_added','minutes':20}).status_code,400)
+            self.post('/api/scoreboard/clock',{'action':'set_half','half':2})
+            self.assertEqual(a._clock['added'],0)  # a new half starts without added time
+
     def test_mute_endpoint_validates(self):
         self.assertEqual(self.post('/api/audio/mute',{'muted':'yes'}).status_code,400)
         with patch.object(a,'set_mute',return_value=(True,'Audio muted')) as mute:

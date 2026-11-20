@@ -560,7 +560,26 @@ def chapters(session):
     return "\n".join(lines)
 
 
-def finalize(sid):
+def reopen(sid):
+    """Continue an interrupted, unsaved session after a restart: the recorder adds a part."""
+    with _lock:
+        try:
+            session = _load(sid)
+        except ValueError:
+            return False
+        if session["state"] not in ("unfinished", "recording") or session.get("file") or sid in _finalizing:
+            return False
+        for part in session["parts"]:
+            if part["duration"] is None:
+                path = _dir(sid) / part["file"]
+                part["duration"] = round(_probe_duration(path) or 0.0, 3) if path.exists() else 0.0
+        session.update(state="recording", error="")
+        _save(session)
+        logger.info("Recording %s continues after a restart", sid)
+        return True
+
+
+def finalize(sid, timeout=3600):
     """Join the parts into one MP4 (copy only) and remove the parts when that worked."""
     with _lock:
         if sid in _finalizing:
@@ -589,7 +608,7 @@ def finalize(sid):
         listing.write_text("".join(f"file '{p['file']}'\n" for p in parts))
         _run(["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y", "-f", "concat",
               "-safe", "0", "-i", str(listing), "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy",
-              "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", str(tmp)], timeout=3600)
+              "-bsf:a", "aac_adtstoasc", "-movflags", "+faststart", str(tmp)], timeout=timeout)
         if not tmp.stat().st_size:
             raise RuntimeError("Joined file is empty")
         os.replace(tmp, folder / name)

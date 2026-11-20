@@ -139,3 +139,175 @@ class LiveWindowStoreTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class StopRemembersCameraTests(EngineStateCase):
+    def test_go_live_after_stop_starts_on_the_camera_that_was_on_air(self):
+        self.stack.enter_context(patch.object(m, '_last_camera', None))
+        self.stack.enter_context(patch.object(m, '_replay', None))
+        self.stack.enter_context(patch.object(m, '_layout', {'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}))
+        self.running()
+        m._active_camera = 'cam3'
+        m._stop_all()
+        self.assertIsNone(m._active_camera)
+        board = Path(self.tmp, 'scoreboard.txt'); board.write_text('x')
+        with patch.object(m, 'get_mediamtx_running', return_value=True), patch.object(m, 'SCOREBOARD_PATH', str(board)), \
+                patch.object(m, '_paths', return_value={'cam1': True, 'cam2': True, 'cam3': True}), \
+                patch.object(m, 'switch_camera', return_value=(True, 'ok')) as cut, patch.object(m, '_launch_encoder'):
+            self.assertTrue(m.start_recording()[0])
+        cut.assert_called_once_with('cam3', expected_stop=m._stop_generation)
+
+
+class ResumeTests(EngineStateCase):
+    """The app went down while live: the next start continues the broadcast."""
+    def setUp(self):
+        super().setUp()
+        for key, value in dict(_replay=None, _last_camera=None,
+                               _layout={'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}).items():
+            self.stack.enter_context(patch.object(m, key, value))
+
+    def test_snapshot_and_resume_continue_the_same_session(self):
+        self.running(key='yt-key')
+        m._active_camera, m._layout = 'cam2', {'mode': 'pip', 'main': 'cam2', 'secondary': 'cam3', 'position': 'top-left'}
+        r.new_part(m._recording); r.part_started(m._recording, 1000.0)
+        Path(self.tmp, m._recording, 'part-001.ts').write_bytes(b'x')
+        state = m.resume_state()
+        self.assertEqual(state['targets'], {'youtube': {'key': 'yt-key', 'server': m.YOUTUBE_RTMP_BASE}})
+        self.assertEqual((state['camera'], state['record'], state['layout']['mode']), ('cam2', True, 'pip'))
+        session = state['session']
+        m._stop_all(finalize=False)  # the crash
+        m._layout = {'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}
+        self.assertIsNone(m.resume_state())
+        r.recover()
+        self.assertEqual(r._load(session)['state'], 'unfinished')
+        with patch.object(m, '_start_output', return_value=(True, 'Going live')) as start, \
+                patch.object(r, '_probe_duration', return_value=50.0):
+            self.assertTrue(m.resume(state, 'A vs B')[0])
+            targets, profile, token, record, title, again = start.call_args.args
+            self.assertEqual((list(targets), record, again), (['youtube'], True, session))
+            self.assertEqual((m._last_camera, m._layout['mode'], m._layout['secondary']), ('cam2', 'pip', 'cam3'))
+            # The recorder continues the same session with a new part.
+            with m._lock:
+                m._begin_recording('A vs B', session)
+            self.assertEqual(m._recording, session)
+            self.assertEqual(r._load(session)['state'], 'recording')
+            self.assertEqual(r.new_part(session).rsplit('/', 1)[1], 'part-002.ts')
+
+    def test_saved_session_cannot_be_reopened(self):
+        sid = r.create_session('720p', 'A vs B')
+        s = r._load(sid); s.update(state='done', file='x.mp4'); r._save(s)
+        self.assertFalse(r.reopen(sid))
+        self.assertFalse(r.reopen('20990101-000000'))
+        with m._lock:
+            m._profile = '720p'
+            m._begin_recording('A vs B', sid)  # a fresh session instead
+        self.assertNotEqual(m._recording, sid)
+
+    def test_shutdown_saves_the_recording_within_a_time_limit(self):
+        self.running()
+        session = m._recording
+        with patch.object(r, 'finalize') as finalize, patch.object(m, '_thread', None), \
+                patch.object(m, '_encoder_thread', None), patch.object(m, '_mediamtx_proc', None), \
+                patch.object(m, '_meters', {}), patch.object(m._stop, 'set'):
+            m.shutdown_all()
+        finalize.assert_called_once_with(session, timeout=m.SHUTDOWN_SAVE_SECONDS)
+
+
+class AppResumeTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        import app as a
+        self.a = a
+        self.tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.object(a, 'RUNTIME_DIR', self.tmp))
+        self.enterContext(patch.object(a, '_resume_pending', None))
+
+    def test_live_state_is_kept_while_live_and_removed_after_stop(self):
+        a, path = self.a, self.tmp / 'live-state.json'
+        with patch.object(a, 'resume_state', return_value={'targets': {'youtube': {'key': 'k', 'server': 's'}}, 'record': True, 'session': 'x'}):
+            a._save_live_state()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)  # holds stream keys
+        self.assertEqual(a._load_resume()['session'], 'x')
+        with patch.object(a, 'resume_state', return_value=None):
+            a._save_live_state()  # STOP: nothing wanted
+        self.assertFalse(path.exists())
+
+    def test_old_live_state_is_not_resumed(self):
+        a, path = self.a, self.tmp / 'live-state.json'
+        path.write_text('{"saved_at": %f, "record": true}' % (a.time.time() - a.RESUME_MAX - 5))
+        self.assertIsNone(a._load_resume())
+        self.assertFalse(path.exists())
+
+    def test_recovery_leaves_the_resumed_session_alone(self):
+        a = self.a
+        a._resume_pending = {'record': True, 'session': 'keep'}
+        sessions = [{'id': 'keep', 'state': 'unfinished'}, {'id': 'old', 'state': 'unfinished'}]
+        with patch.object(a.recordings, 'recover'), patch.object(a.recordings, 'list_sessions', return_value=sessions), \
+                patch.object(a.recordings, 'finalize') as finalize, patch.object(a, '_resume_broadcast') as resume:
+            a._recover_recordings()
+        finalize.assert_called_once_with('old')
+        resume.assert_called_once()
+
+    def test_resume_waits_for_a_camera_then_goes_live(self):
+        a = self.a
+        status = iter([{'cam1': False}, {'cam1': True}])
+        with patch.object(a, 'get_mediamtx_running', return_value=True), \
+                patch.object(a, 'get_camera_status', side_effect=lambda: next(status)), \
+                patch.object(a._workers_stop, 'wait'), patch.object(a, 'resume', return_value=(True, 'Going live')) as go:
+            a._resume_pending = {'record': True, 'session': 's'}
+            a._resume_broadcast(a._resume_pending)
+        go.assert_called_once()
+        self.assertIsNone(a._resume_pending)
+
+
+class UploadHealthTests(unittest.TestCase):
+    def proc(self, samples):
+        p = m.Process.__new__(m.Process)
+        p._samples = __import__('collections').deque(samples, maxlen=60)
+        return p
+
+    def test_rate_and_speed_over_the_last_seconds(self):
+        now = m.time.monotonic()
+        # 5 s: 4.8 s of media and 2.5 MB out = 4000 kbit/s at 0.96x
+        p = self.proc([(now - 20, 0, 0), (now - 5, 10_000_000, 1_000_000), (now, 14_800_000, 3_500_000)])
+        self.assertEqual(p.rates(), (4000.0, 0.96))
+        self.assertEqual(self.proc([(now, 1, 1)]).rates(), (None, None))
+        self.assertEqual(self.proc([(now - 9, 0, 0), (now - 8, 1_000_000, 1)]).rates(), (0.0, 0.0))  # stalled
+
+    def test_health_levels(self):
+        for speed, health in ((1.0, 'good'), (0.95, 'slow'), (0.5, 'failing'), (None, None)):
+            proc = MagicMock(); proc.rates.return_value = (4000.0, speed)
+            self.assertEqual(m._upload_health({'proc': proc, 'state': 'live'})['health'], health)
+        self.assertIsNone(m._upload_health({'proc': proc, 'state': 'starting'})['health'])
+
+
+class MicDelayTests(EngineStateCase):
+    def setUp(self):
+        super().setUp()
+        for key, value in dict(_mic_delay_ms=0, _replay=None, _muted=False, _relay_zmq=None,
+                               AUDIO_SETTING=Path(self.tmp, 'audio.json'),
+                               _layout={'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}).items():
+            self.stack.enter_context(patch.object(m, key, value))
+
+    def test_usb_microphone_is_delayed_to_match_the_picture(self):
+        m._mic_delay_ms = 1500
+        with patch.object(m, '_probe', return_value={'video', 'audio'}), patch.object(m, '_usb_device_available', return_value=True):
+            cmd, channels, *_ = m._relay_command('cam1', {'usb:mic': 0.0, 'cam1': 0.0})
+        graph = cmd[cmd.index('-filter_complex') + 1]
+        usb, cam = channels['usb:mic'], channels['cam1']
+        self.assertRegex(graph, r'\[1:a:0\]adelay=delays=1500:all=1,aresample')
+        self.assertNotRegex(graph, r'\[0:a:0\]adelay')  # camera sound is already in step
+
+    def test_setting_persists_and_rebuilds_a_relay_with_a_microphone(self):
+        m._active_camera, m._relay_channels = 'cam1', {'usb:mic': 'm0'}
+        with patch.object(m, 'get_active_camera', return_value='cam1'), \
+                patch.object(m, 'switch_camera', return_value=(True, 'ok')) as cut:
+            self.assertTrue(m.set_mic_delay(1200)[0])
+            cut.assert_called_once_with('cam1', force=True)
+            m._relay_channels = {'cam1': 'm0'}
+            self.assertTrue(m.set_mic_delay(800)[0])
+            self.assertEqual(cut.call_count, 1)  # no microphone on air: nothing to rebuild
+        self.assertFalse(m.set_mic_delay(5000)[0])
+        m._mic_delay_ms = 0
+        m.load_audio_setting()
+        self.assertEqual(m._mic_delay_ms, 800)

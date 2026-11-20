@@ -44,7 +44,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           get_audio_levels, set_mic_devices, get_mixer, set_mix, set_follow, set_mute,
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
                           get_recording_status, play_replay, stop_replay, get_replay_status,
-                          add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting)
+                          add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting,
+                          resume_state, resume, set_mic_delay, load_audio_setting)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -133,6 +134,7 @@ _clock = {
     "start_ts": None,      # time.monotonic() when clock was started
     "half": 1,
     "half_length": 45,     # minutes; the 2nd half starts at this clock time
+    "added": 0,            # announced added time of the current half (minutes, 0 = none)
 }
 
 
@@ -151,6 +153,17 @@ def _format_clock(total_seconds):
     return f"{minutes:02d}:{seconds:02d}"
 
 
+def _match_clock_text(elapsed, half, half_length, added=0):
+    """Broadcast clock: 32:10; past the end of a half the clock stops at it and the
+    stoppage time counts on, as on TV: "45:00 +1:23", with announced added time "(+3)"."""
+    end = half_length * 60 * (2 if half == 2 else 1)
+    text = _format_clock(elapsed)
+    if elapsed >= end + 1:
+        over = int(elapsed) - end
+        text = f"{_format_clock(end)} +{over // 60}:{over % 60:02d}"
+    return text + (f" (+{added})" if added else "")
+
+
 def _write_scoreboard_file():
     with _scoreboard_lock:
         _write_scoreboard_locked()
@@ -163,7 +176,7 @@ def _write_scoreboard_locked():
         away = _scoreboard["away_name"]
         aws = _scoreboard["away_score"]
     with _clock_lock:
-        clock_str = _format_clock(_clock_elapsed())
+        clock_str = _match_clock_text(_clock_elapsed(), _clock["half"], _clock["half_length"], _clock["added"])
 
     # Only live relays draw this file: a replay shows the recording's own scoreboard, and
     # the live one returns together with the live picture.
@@ -201,6 +214,8 @@ def _get_scoreboard_state():
         sb["clock_elapsed_secs"] = round(elapsed, 1)
         sb["half"] = _clock["half"]
         sb["half_length"] = _clock["half_length"]
+        sb["added"] = _clock["added"]
+        sb["clock_text"] = _match_clock_text(elapsed, _clock["half"], _clock["half_length"], _clock["added"])
     sb["overlay_status"] = browser_overlay.status()
     return sb
 
@@ -786,6 +801,16 @@ def api_audio_mute():
     return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 502
 
 
+@app.route("/api/audio/mic-delay", methods=["POST"])
+@api_endpoint
+def api_audio_mic_delay():
+    """{"ms": 0-3000}: delay USB microphones to match the camera picture."""
+    data = request.get_json(force=True, silent=True) or {}
+    log.info("Microphone delay %s ms requested", data.get("ms"))
+    success, msg = set_mic_delay(data.get("ms"))
+    return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 400
+
+
 @app.route("/api/audio/devices", methods=["GET"])
 @api_endpoint
 def api_audio_devices():
@@ -852,21 +877,24 @@ def api_scoreboard_clock():
     Accepts JSON with "action": start | pause | reset | set_half | adjust | set
     For set_half, also accepts "half": 1 or 2 and optional "minutes" (half length, 10-60)
     set_half_length: "minutes" (10-60) without touching the clock.
+    set_added: "minutes" (0-15) of announced added time for the current half (0 hides it).
     For adjust, "seconds" to add (negative to subtract); for set, "seconds" of match time.
     adjust and set keep the clock running or paused as it was.
     """
     data = request.get_json(force=True, silent=True) or {}
     action = text_field(data, "action", 20).lower()
 
-    if action not in ("start", "pause", "reset", "set_half", "set_half_length", "adjust", "set"):
+    if action not in ("start", "pause", "reset", "set_half", "set_half_length", "set_added", "adjust", "set"):
         return jsonify({
             "ok": False,
-            "error": "action must be one of: start, pause, reset, set_half, set_half_length, adjust, set",
+            "error": "action must be one of: start, pause, reset, set_half, set_half_length, set_added, adjust, set",
         }), 400
     minutes = data.get("minutes")
     if action == "set_half_length" or (action == "set_half" and minutes is not None):
         if type(minutes) is not int or not 10 <= minutes <= 60:
             raise ValueError("Half length must be a whole number of minutes between 10 and 60")
+    if action == "set_added" and (type(minutes) is not int or not 0 <= minutes <= 15):
+        raise ValueError("Added time must be a whole number of minutes between 0 and 15")
     if action in ("adjust", "set"):
         seconds = data.get("seconds")
         low = -3600 if action == "adjust" else 0
@@ -894,7 +922,7 @@ def api_scoreboard_clock():
             _clock["running"] = False
             _clock["elapsed"] = 0.0
             _clock["start_ts"] = None
-            _clock["half"] = 1
+            _clock["half"], _clock["added"] = 1, 0
             log.info("Match clock reset to 00:00")
 
         elif action in ("adjust", "set"):
@@ -909,6 +937,10 @@ def api_scoreboard_clock():
             _clock["half_length"] = minutes
             log.info("Half length set to %d min", minutes)
 
+        elif action == "set_added":
+            _clock["added"] = minutes
+            log.info("Added time: %d min", minutes)
+
         elif action == "set_half":
             if minutes is not None:
                 _clock["half_length"] = minutes
@@ -917,7 +949,7 @@ def api_scoreboard_clock():
                 half = int(half)
             except (ValueError, TypeError):
                 half = 2
-            _clock["half"] = half
+            _clock["half"], _clock["added"] = half, 0
             if half == 2:
                 _clock["elapsed"] = _clock["half_length"] * 60.0
                 _clock["running"] = False
@@ -1022,7 +1054,8 @@ def _restore_match():
             resume = gap is not None and 0 <= gap <= CLOCK_RESUME_MAX
             _clock.update(running=resume, elapsed=elapsed + (gap if resume else 0.0),
                           start_ts=time.monotonic() if resume else None,
-                          half=state["half"], half_length=half_length)
+                          half=state["half"], half_length=half_length,
+                          added=state["added"] if type(state.get("added")) is int and 0 <= state["added"] <= 15 else 0)
             if resume:
                 log.info("Match clock resumed at %s after a %.0f s restart", _format_clock(_clock["elapsed"]), gap)
     except (ValueError, KeyError, OSError, TypeError):
@@ -1045,8 +1078,75 @@ def _overlay_worker():
             if time.monotonic() - saved >= 5:
                 saved = time.monotonic()
                 _save_match()
+                _save_live_state()
         except OSError:
             log.exception("Cannot update scoreboard")
+
+
+# --- Resume after a crash or restart -------------------------------------
+# While live or recording, what is needed to continue is saved every 5 s. STOP (nothing
+# wanted any more) removes it; a crash, kill or logout leaves it, and the next start
+# within RESUME_MAX continues the broadcast by itself.
+RESUME_MAX = 600
+_resume_pending = None
+
+
+def _live_state_path():
+    return RUNTIME_DIR / "live-state.json"
+
+
+def _save_live_state():
+    state = resume_state()
+    path = _live_state_path()
+    if state is None:
+        if _resume_pending is None:  # not while a resume is still to come
+            path.unlink(missing_ok=True)
+        return
+    state["saved_at"] = time.time()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, suffix=".tmp")  # 0600: holds stream keys
+    try:
+        with os.fdopen(fd, "w") as output:
+            json.dump(state, output)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def _load_resume():
+    """The broadcast to continue, if the app went down while live within RESUME_MAX."""
+    try:
+        state = json.loads(_live_state_path().read_text())
+        age = time.time() - float(state["saved_at"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if not 0 <= age <= RESUME_MAX or not isinstance(state, dict):
+        log.info("Not resuming the broadcast: it ended %.0f s ago", age)
+        _live_state_path().unlink(missing_ok=True)
+        return None
+    return state
+
+
+def _resume_broadcast(state, wait=90):
+    """Wait for MediaMTX and a camera, then go live again."""
+    global _resume_pending
+    try:
+        deadline = time.monotonic() + wait
+        while not _workers_stop.is_set() and time.monotonic() < deadline:
+            cameras = get_camera_status() if get_mediamtx_running() else {}
+            if any(cameras.get(c) for c in CAMERA_IDS):
+                break
+            _workers_stop.wait(1)
+        if _workers_stop.is_set():
+            return
+        ok, message = resume(state, title=_match_title())
+        log.log(logging.INFO if ok else logging.WARNING, "Resuming the broadcast after a restart: %s", message)
+        if not ok and state.get("session"):
+            recordings.finalize(state["session"])
+    except Exception:
+        log.exception("Resuming the broadcast failed")
+    finally:
+        _resume_pending = None
 
 def _diagnostics_worker():
     global _diagnostics
@@ -1071,14 +1171,18 @@ def _background_init():
         log.exception("MediaMTX initialization failed")
 
 def _recover_recordings():
-    """A recording interrupted by a crash or restart is joined into its MP4 now."""
+    """A recording interrupted by a crash or restart is joined into its MP4 now, unless
+    the broadcast resumes: then it continues in the same session."""
+    resuming = (_resume_pending or {}).get("session") if (_resume_pending or {}).get("record") else None
     try:
         recordings.recover()
         for item in recordings.list_sessions():
-            if item["state"] == "unfinished":
+            if item["state"] == "unfinished" and item["id"] != resuming:
                 recordings.finalize(item["id"])
     except Exception:
         log.exception("Recording recovery failed")
+    if _resume_pending:
+        _resume_broadcast(_resume_pending)
 
 def initialize():
     RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1094,6 +1198,11 @@ def initialize():
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     _restore_match()
+    global _resume_pending
+    _resume_pending = _load_resume()
+    if _resume_pending:
+        log.info("The app stopped while live; resuming the broadcast once a camera is back")
+    load_audio_setting()
     threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()
     browser_overlay.start()
@@ -1119,7 +1228,12 @@ if __name__ == "__main__":
     initialize()
     atexit.register(shutdown)
     def terminate(signum, frame):
+        if signum == signal.SIGINT:  # Ctrl+C is a deliberate quit: do not resume next start
+            _live_state_path().unlink(missing_ok=True)
+            globals()["_resume_pending"] = None
         raise SystemExit(0)
     signal.signal(signal.SIGTERM, terminate)
     signal.signal(signal.SIGINT, terminate)
+    # Logging out closes the terminal: SIGHUP used to kill the app without saving anything.
+    signal.signal(signal.SIGHUP, terminate)
     serve(app, host=os.environ.get("MCC_BIND", "0.0.0.0"), port=5000, threads=16)
