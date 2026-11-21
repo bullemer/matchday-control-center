@@ -68,7 +68,8 @@ _layout_warning = ""
 # each has on/off and a gain in dB. With _follow, only the on-air camera's channel is on
 # among the cameras (its sound follows the cut). Gains change live over ZMQ; switching a
 # channel on that the running relay does not include rebuilds the relay.
-_mix = {c: {"on": c == "cam1", "gain": 0.0} for c in CAMERA_IDS}
+# Camera sound starts off: the broadcast is silent until the operator picks a source.
+_mix = {c: {"on": False, "gain": 0.0} for c in CAMERA_IDS}
 _follow = False
 _muted = False           # master mute: every channel at zero volume, mixer settings kept
 _mic_ids = set()         # detected microphone ids, set by the app
@@ -460,7 +461,7 @@ def generate_mediamtx_config():
             if password else {"user": "any", "ips": [], "permissions": camera_publish},
             {"user": "any", "ips": [], "permissions": [{"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
-                {"action": "api"}, {"action": "publish", "path": "~^(program|final|cam[123])$"}]},
+                {"action": "api"}, {"action": "publish", "path": "~^(program|final|monitor|cam[123])$"}]},
         ],
         # A camera reconnecting after a Wi-Fi drop replaces its own stale session at once
         # (otherwise it is refused until MediaMTX times the dead one out).
@@ -474,6 +475,10 @@ def generate_mediamtx_config():
             {"codec": "H264"}, {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]
     config["paths"]["program"] = program
     config["paths"]["final"] = {"overridePublisher": True}  # the encoder's finished picture
+    # The live mix without the microphones, for the operator's headset (no own-voice echo).
+    # Always available: the headset player stays connected through cuts and while off air.
+    config["paths"]["monitor"] = {"alwaysAvailable": True, "alwaysAvailableTracks": [
+        {"codec": "MPEG4Audio", "sampleRate": 48000, "channelCount": 2}]}
     Path(MEDIAMTX_CONFIG).parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     Path(MEDIAMTX_CONFIG).write_text(json.dumps(config, indent=2))  # JSON is valid YAML
     return MEDIAMTX_CONFIG
@@ -523,6 +528,8 @@ def start_mediamtx():
                     if _encoder_thread is None or not _encoder_thread.is_alive():
                         _encoder_thread = threading.Thread(target=_watch_encoder, daemon=True, name="encoder-supervisor")
                         _encoder_thread.start()
+                    if _monitor["on"]:
+                        start_monitor_worker()
                     _set_error("server")
                     return True
                 except requests.RequestException:
@@ -548,11 +555,13 @@ def get_active_camera():
 
 
 def get_audio_source():
-    """The preset matching the mixer ("cam1", "active", "usb:<id>"), else "mix"."""
+    """The preset matching the mixer ("off", "cam1", "active", "usb:<id>"), else "mix"."""
     cams_on = [c for c in CAMERA_IDS if _mix[c]["on"]]
     mics_on = [c for c in _mix if c.startswith("usb:") and _mix[c]["on"]]
     if _follow:
         return "active" if not mics_on else "mix"
+    if not cams_on and not mics_on:
+        return "off"
     if cams_on == ["cam1"] and not mics_on:
         return "cam1"
     if not cams_on and len(mics_on) == 1:
@@ -563,15 +572,46 @@ def get_audio_source():
 AUDIO_SETTING = BASE / "data/audio.json"
 MIC_DELAY_MAX = 3000
 _mic_delay_ms = 0
+# Noise gate on the microphones: below the threshold (crowd, PA music in the pauses) the
+# mic is turned down by about 30 dB; speech opens it within milliseconds.
+GATE_MIN_DB, GATE_MAX_DB = -70.0, -10.0
+GATE_RANGE = 0.03          # gain while closed (about -30 dB)
+_gate = {"on": True, "threshold_db": -45.0}
+# Headset monitor: "nomic" = the live mix without the microphones (the operator hears their
+# own voice through the headset's sidetone, not 1-3 s late); "full" = exactly what goes out.
+MONITOR_MODES = ("nomic", "full")
+_monitor = {"on": False, "mode": "nomic", "output": ""}
 
 
 def load_audio_setting():
-    global _mic_delay_ms
+    global _mic_delay_ms, _gate, _monitor
     try:
-        value = json.loads(AUDIO_SETTING.read_text()).get("mic_delay_ms", 0)
-        _mic_delay_ms = value if type(value) is int and 0 <= value <= MIC_DELAY_MAX else 0
-    except (OSError, ValueError, AttributeError):
-        _mic_delay_ms = 0
+        data = json.loads(AUDIO_SETTING.read_text())
+        if not isinstance(data, dict):
+            raise ValueError
+    except (OSError, ValueError):
+        data = {}
+    value = data.get("mic_delay_ms", 0)
+    _mic_delay_ms = value if type(value) is int and 0 <= value <= MIC_DELAY_MAX else 0
+    gate = data.get("gate") if isinstance(data.get("gate"), dict) else {}
+    threshold = gate.get("threshold_db", -45.0)
+    _gate = {"on": gate.get("on", True) is not False,
+             "threshold_db": float(threshold) if type(threshold) in (int, float)
+             and GATE_MIN_DB <= threshold <= GATE_MAX_DB else -45.0}
+    monitor = data.get("monitor") if isinstance(data.get("monitor"), dict) else {}
+    output = monitor.get("output")
+    _monitor = {"on": monitor.get("on") is True and isinstance(output, str) and bool(output),
+                "mode": monitor.get("mode") if monitor.get("mode") in MONITOR_MODES else "nomic",
+                "output": output if isinstance(output, str) and len(output) <= 300 else ""}
+
+
+def _save_audio_setting():
+    try:
+        AUDIO_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        AUDIO_SETTING.write_text(json.dumps({"mic_delay_ms": _mic_delay_ms, "gate": dict(_gate),
+                                             "monitor": dict(_monitor)}))
+    except OSError:
+        logger.exception("Cannot save the audio settings")
 
 
 def set_mic_delay(ms):
@@ -583,11 +623,7 @@ def set_mic_delay(ms):
     with _lock:
         _mic_delay_ms = ms
         camera, uses_mic, replay = _active_camera, any(c.startswith("usb:") for c in _relay_channels), _replay
-    try:
-        AUDIO_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        AUDIO_SETTING.write_text(json.dumps({"mic_delay_ms": ms}))
-    except OSError:
-        logger.exception("Cannot save the microphone delay")
+    _save_audio_setting()
     message = f"Microphone delay {ms / 1000:.1f} s"
     if camera and uses_mic and not replay and get_active_camera() == camera:
         ok, result = switch_camera(camera, force=True)
@@ -596,8 +632,164 @@ def set_mic_delay(ms):
     return True, message
 
 
+def _gate_name(volume_name):
+    """The gate filter of a microphone channel whose volume filter is volume_name (m3 -> g3)."""
+    return "g" + volume_name[1:]
+
+
+def _gate_levels():
+    """(threshold, range) for agate: a fully open range (1.0) switches the gate off."""
+    return 10 ** (_gate["threshold_db"] / 20), (GATE_RANGE if _gate["on"] else 1.0)
+
+
+def _gate_options():
+    threshold, gate_range = _gate_levels()
+    return (f"threshold={threshold:.6f}:range={gate_range:g}:ratio=8:attack=5:release=300:"
+            f"detection=rms")
+
+
+def set_gate(on=None, threshold_db=None):
+    """Microphone noise gate: on/off and threshold in dBFS. On/off is switched live in the
+    running relay (agate's range). ffmpeg 6.1 accepts a live threshold command but ignores
+    it, so a new threshold rebuilds a relay that plays a microphone (a seamless cut)."""
+    global _gate
+    if on is not None and type(on) is not bool:
+        return False, "on must be true or false"
+    if threshold_db is not None and (type(threshold_db) not in (int, float)
+                                     or not GATE_MIN_DB <= threshold_db <= GATE_MAX_DB):
+        return False, f"Threshold must be {GATE_MIN_DB:g} to {GATE_MAX_DB:g} dB"
+    with _lock:
+        previous = _gate["threshold_db"]
+        _gate = {"on": _gate["on"] if on is None else on,
+                 "threshold_db": _gate["threshold_db"] if threshold_db is None else round(float(threshold_db), 1)}
+        rebuild = _gate["threshold_db"] != previous
+        gates = [_gate_name(name) for channel, name in _relay_channels.items() if channel.startswith("usb:")]
+        camera, replay = _active_camera, _replay
+    _save_audio_setting()
+    message = (f"Noise gate on at {_gate['threshold_db']:g} dB" if _gate["on"] else "Noise gate off")
+    _, gate_range = _gate_levels()
+    applied = not rebuild and all(_send_command(_relay_zmq or ZMQ_ADDRESS, f"agate@{gate} range {gate_range:g}")
+                                  for gate in gates)
+    # During a replay the new setting comes with the return to live.
+    if gates and not applied and camera and not replay and get_active_camera() == camera:
+        ok, result = switch_camera(camera, force=True)
+        if not ok:
+            return False, result
+    return True, message
+
+
+# ---- Headset monitor ------------------------------------------------------------------
+_monitor_proc = None
+_monitor_key = None        # (mode, output) the running player was started with
+_monitor_retry_at = 0.0
+_monitor_error = ""
+_monitor_thread = None
+MONITOR_RETRY = 2.0
+
+
+def _monitor_command(mode, output):
+    """Play the monitor mix (or exactly what goes out) on a PulseAudio/PipeWire output."""
+    path = "monitor" if mode == "nomic" else "final"
+    return _ffmpeg() + ["-fflags", "nobuffer", "-flags", "low_delay", "-probesize", "32768",
+                        "-analyzeduration", "500000"] + _input(path) + [
+        "-map", "0:a:0", "-ar", "48000", "-ac", "2",
+        "-f", "pulse", "-buffer_duration", "120", "-device", output, "-name", "Matchday Control Center",
+        "Headset monitor"]
+
+
+def get_monitor():
+    proc, setting = _monitor_proc, dict(_monitor)
+    if proc is not None and _monitor_key != (setting["mode"], setting["output"]):
+        proc = None  # still the player of the previous choice: about to be replaced
+    if not setting["on"]:
+        state = "off"
+    elif proc is None and _monitor_proc is not None:
+        state = "starting"
+    elif proc is not None and proc.healthy():
+        state = "playing"
+    elif proc is not None and proc.poll() is None:
+        state = "starting"
+    else:
+        state = "waiting"
+    error = _monitor_error if state == "waiting" else ""
+    if state == "waiting" and setting["mode"] == "full" and not _want_stream:
+        error = "Nothing is going out yet — starts when you go live or record"
+    return {**setting, "state": state, "error": error}
+
+
+def set_monitor(on=None, mode=None, output=None):
+    """Headset monitor on/off, mode ("nomic" or "full") and output device (a sink name)."""
+    global _monitor
+    if on is not None and type(on) is not bool:
+        return False, "on must be true or false"
+    if mode is not None and mode not in MONITOR_MODES:
+        return False, "Invalid monitor mode"
+    if output is not None and (not isinstance(output, str) or len(output) > 300
+                               or any(c in output for c in "\n\r\0")):
+        return False, "Invalid output device"
+    with _lock:
+        new = {"on": _monitor["on"] if on is None else on,
+               "mode": mode or _monitor["mode"],
+               "output": _monitor["output"] if output is None else output}
+        if new["on"] and not new["output"]:
+            return False, "Choose the headset first"
+        _monitor = new
+    _save_audio_setting()
+    start_monitor_worker()
+    if not new["on"]:
+        return True, "Listening off"
+    return True, "Listening: " + ("everything except the microphones" if new["mode"] == "nomic"
+                                  else "exactly what goes out (incl. your mic, 1-3 s late)")
+
+
+def _monitor_tick():
+    """Keep the headset player in line with the setting; restart it when it stops."""
+    global _monitor_proc, _monitor_key, _monitor_retry_at, _monitor_error
+    with _lock:
+        setting = dict(_monitor)
+    key = (setting["mode"], setting["output"]) if setting["on"] else None
+    proc = _monitor_proc
+    if proc is not None and (key != _monitor_key or proc.poll() is not None):
+        if proc.poll() is not None and proc.error:
+            _monitor_error = proc.error
+        _kill_process(proc, "monitor")
+        _monitor_proc = None
+        if key == _monitor_key:
+            _monitor_retry_at = time.monotonic() + MONITOR_RETRY
+        else:
+            _monitor_retry_at = 0.0
+    if key is None or _monitor_proc is not None or time.monotonic() < _monitor_retry_at:
+        return
+    if not get_mediamtx_running():
+        return
+    try:
+        _monitor_proc = Process(_monitor_command(*key), copy=True)
+        _monitor_key = key
+        _monitor_error = ""
+    except OSError as exc:
+        _monitor_error = str(exc)
+        _monitor_retry_at = time.monotonic() + MONITOR_RETRY
+
+
+def _monitor_worker():
+    while not _stop.wait(0.5):
+        try:
+            _monitor_tick()
+        except Exception:
+            logger.exception("Headset monitor")
+
+
+def start_monitor_worker():
+    global _monitor_thread
+    with _lock:
+        if _monitor_thread is None or not _monitor_thread.is_alive():
+            _monitor_thread = threading.Thread(target=_monitor_worker, daemon=True, name="monitor")
+            _monitor_thread.start()
+
+
 def get_mixer():
     return {"follow": _follow, "muted": _muted, "preset": get_audio_source(), "mic_delay_ms": _mic_delay_ms,
+            "gate": dict(_gate), "monitor": get_monitor(),
             "channels": {c: {**setting, "available": c in CAMERA_IDS or c[4:] in _mic_ids}
                          for c, setting in _mix.items()}}
 
@@ -943,20 +1135,30 @@ def _relay_command(cam, wanted, replay=None):
     # Paced to real time: once the camera picture ends, unpaced silence would flood program
     # (and the recording) with minutes of audio per second until the relay is replaced.
     cmd += ["-re", "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo"]
-    parts, labels, channels = [], [], {}
+    parts, labels, monitor_labels, channels = [], [], [], {}
     for index, (channel, pad, gain) in enumerate(sources):
         name = f"m{index}"
+        mic = channel.startswith("usb:")
         # A USB microphone is heard at once, the camera picture arrives a second or two
         # later: the delay lines the commentary up with the picture.
-        delay = f"adelay=delays={_mic_delay_ms}:all=1," if channel.startswith("usb:") and _mic_delay_ms else ""
+        delay = f"adelay=delays={_mic_delay_ms}:all=1," if mic and _mic_delay_ms else ""
+        # The gate works on the mic's own level, before its fader.
+        gate = f"agate@{_gate_name(name)}={_gate_options()}," if mic else ""
+        # The headset monitor gets every source except the microphones.
+        split = f",asplit=2[{name}][{name}x]" if not mic else f"[{name}]"
         parts.append(f"[{pad}]{delay}aresample=48000:async=1,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                     f"volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}[{name}]")
+                     f"{gate}volume@{name}={0.0 if _muted else _db_to_volume(gain):.4f}{split}")
         labels.append(f"[{name}]")
+        if not mic:
+            monitor_labels.append(f"[{name}x]")
         channels[channel] = name
     address = _slot_zmq(_spare_slot()).replace(":", "\\\\:")  # escaped twice: filter option, then graph
-    parts.append(f"[{inputs}:a:0]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:"
+    parts.append(f"[{inputs}:a:0]asplit=2[silence][silencex]")
+    parts.append(f"[silence]{''.join(labels)}amix=inputs={len(labels) + 1}:duration=first:"
                  f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0,"
                  f"azmq=bind_address={address}[aout]")
+    parts.append(f"[silencex]{''.join(monitor_labels)}amix=inputs={len(monitor_labels) + 1}:duration=first:"
+                 f"normalize=0:dropout_transition=0,alimiter=limit=0.891:level=0[mon]")
     width, height, _, bitrate = PROFILES[_profile]
     if replay:  # the recording's own scoreboard is in the replay picture
         parts.append(_replay_filter(width, height, replay))
@@ -968,7 +1170,11 @@ def _relay_command(cam, wanted, replay=None):
         "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
         "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
         "-c:a", "aac", "-ar", "48000", "-ac", "2",
-        "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program"], channels, missing, warning, secondary, video_warning
+        "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program",
+        # The headset monitor: a failure here must never touch the program output.
+        "-map", "[mon]", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
+        "-f", "tee", f"[f=rtsp:rtsp_transport=tcp:onfail=ignore]{RTSP_BASE}/monitor"], \
+        channels, missing, warning, secondary, video_warning
 
 
 def _send_volume(name, volume):
@@ -1453,9 +1659,9 @@ def _set_mixer(change):
 
 
 def set_audio_source(mode):
-    """Presets: "cam1" (Cam 1 mic only), "active" (camera sound follows the cut),
-    "usb:<id>" (that microphone only)."""
-    if mode not in ("cam1", "active") and not (mode.startswith("usb:") and mode[4:]):
+    """Presets: "off" (no sound), "cam1" (Cam 1 mic only), "active" (camera sound
+    follows the cut), "usb:<id>" (that microphone only)."""
+    if mode not in ("off", "cam1", "active") and not (mode.startswith("usb:") and mode[4:]):
         return False, "Invalid audio source"
     if mode.startswith("usb:") and not _usb_device_available(mode[4:]):
         return False, "Unknown audio device"
@@ -1808,13 +2014,14 @@ def resume_state():
         return {"targets": {name: {"key": t.get("secret") or "", "server": t.get("server")} for name, t in _targets.items()},
                 "profile": _profile, "record": bool(_want_record and _recording), "session": _recording,
                 "camera": (_replay or {}).get("camera") or _active_camera or _last_camera,
-                "layout": dict(_layout)}
+                "layout": dict(_layout),
+                "audio": {"mix": {c: dict(v) for c, v in _mix.items()}, "follow": _follow, "muted": _muted}}
 
 
 def resume(state, title=""):
     """Continue a broadcast interrupted by a crash or restart: same platforms, quality,
-    camera and layout; the recording continues in the same session when it is unsaved."""
-    global _last_camera, _layout
+    camera, layout and audio mix; the recording continues in the same session when it is unsaved."""
+    global _last_camera, _layout, _follow, _muted
     targets = {}
     for name, settings in (state.get("targets") or {}).items():
         try:
@@ -1830,6 +2037,17 @@ def resume(state, title=""):
         if isinstance(layout, dict) and layout.get("mode") in ("single", "pip", "split") \
                 and layout.get("main") in CAMERA_IDS and layout.get("secondary") in CAMERA_IDS:
             _layout = {**_layout, **{k: layout[k] for k in ("mode", "main", "secondary", "position") if k in layout}}
+        # Camera sound starts off; a crash must not silence the commentary that was on air.
+        audio = state.get("audio")
+        if isinstance(audio, dict):
+            for channel, setting in (audio.get("mix") or {}).items():
+                if (channel in CAMERA_IDS or (isinstance(channel, str) and channel.startswith("usb:") and channel[4:])) \
+                        and isinstance(setting, dict) and type(setting.get("on")) is bool \
+                        and type(setting.get("gain")) in (int, float):
+                    _mix[channel] = {"on": setting["on"],
+                                     "gain": round(max(GAIN_MIN, min(GAIN_MAX, float(setting["gain"]))), 1)}
+            _follow = audio.get("follow") is True
+            _muted = audio.get("muted") is True
     return _start(targets, state.get("profile", "720p"), record, title, session=state.get("session") if record else None)
 
 
@@ -2158,7 +2376,7 @@ def _supervise():
 def shutdown_all():
     global _mediamtx_proc
     _stop.set()
-    for worker in (_thread, _encoder_thread):
+    for worker in (_thread, _encoder_thread, _monitor_thread):
         if worker and worker is not threading.current_thread():
             worker.join(timeout=20)
     with _lock:
@@ -2172,5 +2390,6 @@ def shutdown_all():
         _await_retired()
         for key in list(_meters):
             _kill_process(_meters.pop(key))
+        _kill_process(_monitor_proc, "monitor")
         _kill_process(_mediamtx_proc)
         _mediamtx_proc = None

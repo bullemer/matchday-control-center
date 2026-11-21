@@ -736,3 +736,37 @@ test('output preview, added time and microphone delay', async ({page}) => {
   await expect(page.locator('#toast-container')).toContainText('The output starts with GO LIVE or recording');
   expect(errors).toEqual([]);
 });
+
+test('noise gate and headset monitor', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.setViewportSize({width:390,height:844});
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  // Listening needs a headset; the USB headset is offered first.
+  await page.locator('#monitor-toggle').click();
+  await expect(page.locator('#monitor-toggle')).toHaveText('Off');
+  await expect(page.locator('#monitor-output option').nth(1)).toHaveText(/USB Headset/);
+  await page.locator('#monitor-output').selectOption('alsa_output.pci.analog');
+  await expect(page.locator('#monitor-warning')).toContainText('loudspeakers feed the sound back');
+  await page.locator('#monitor-output').selectOption('alsa_output.usb-headset');
+  await expect(page.locator('#monitor-warning')).toBeHidden();
+  await page.locator('#monitor-toggle').click();
+  await expect(page.locator('#monitor-toggle')).toHaveText('On');
+  await expect(page.locator('#monitor-toggle')).toHaveAttribute('aria-pressed', 'true');
+  await page.locator('[data-monitor-mode="full"]').click();
+  await expect(page.locator('[data-monitor-mode="full"]')).toHaveClass(/bg-brand-blue/);
+  await expect(page.locator('#monitor-hint')).toContainText('1–3 s late');
+  // Gate: threshold and switch.
+  await page.locator('#gate-threshold').fill('-38');
+  await expect(page.locator('#gate-threshold-value')).toHaveText('-38 dB');
+  await page.locator('#gate-on').uncheck();
+  await expect(page.locator('#gate-threshold')).toBeDisabled();
+  const calls = await (await page.request.get('/test/audio-calls')).json();
+  expect(calls).toEqual([
+    ['monitor', null, null, 'alsa_output.pci.analog'], ['monitor', null, null, 'alsa_output.usb-headset'],
+    ['monitor', true, null, 'alsa_output.usb-headset'], ['monitor', null, 'full', null],
+    ['gate', null, -38], ['gate', false, null]]);
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  expect(errors).toEqual([]);
+});

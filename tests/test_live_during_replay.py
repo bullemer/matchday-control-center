@@ -162,7 +162,8 @@ class ResumeTests(EngineStateCase):
     """The app went down while live: the next start continues the broadcast."""
     def setUp(self):
         super().setUp()
-        for key, value in dict(_replay=None, _last_camera=None,
+        for key, value in dict(_replay=None, _last_camera=None, _follow=False,
+                               _mix={c: {'on': False, 'gain': 0.0} for c in m.CAMERA_IDS},
                                _layout={'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}).items():
             self.stack.enter_context(patch.object(m, key, value))
 
@@ -174,6 +175,9 @@ class ResumeTests(EngineStateCase):
         state = m.resume_state()
         self.assertEqual(state['targets'], {'youtube': {'key': 'yt-key', 'server': m.YOUTUBE_RTMP_BASE}})
         self.assertEqual((state['camera'], state['record'], state['layout']['mode']), ('cam2', True, 'pip'))
+        self.assertEqual(state['audio']['mix']['cam1'], {'on': False, 'gain': 0.0})
+        state['audio'] = {'mix': {'cam1': {'on': True, 'gain': -3.0}, 'bogus': {'on': True, 'gain': 0}},
+                          'follow': False, 'muted': False}
         session = state['session']
         m._stop_all(finalize=False)  # the crash
         m._layout = {'mode': 'single', 'main': 'cam1', 'secondary': 'cam2', 'position': 'top-right'}
@@ -186,6 +190,7 @@ class ResumeTests(EngineStateCase):
             targets, profile, token, record, title, again = start.call_args.args
             self.assertEqual((list(targets), record, again), (['youtube'], True, session))
             self.assertEqual((m._last_camera, m._layout['mode'], m._layout['secondary']), ('cam2', 'pip', 'cam3'))
+            self.assertEqual((m._mix['cam1'], 'bogus' in m._mix), ({'on': True, 'gain': -3.0}, False))
             # The recorder continues the same session with a new part.
             with m._lock:
                 m._begin_recording('A vs B', session)

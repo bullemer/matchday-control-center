@@ -36,6 +36,7 @@ def run():
         m.YOUTUBE_RTMP_BASE = m.RTMP_BASE  # cam3 is a local test sink
         m.ZMQ_ADDRESS = 'tcp://127.0.0.1:28799'
         m.recordings.RECORDINGS_DIR = Path(tmp) / 'recordings'
+        m.AUDIO_SETTING = Path(tmp) / 'audio.json'  # never the real data/audio.json
         def config():
             original_config()
             p = Path(m.MEDIAMTX_CONFIG)
@@ -57,6 +58,7 @@ def run():
                 return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             sources += [source('cam1', 'red'), source('cam2', 'blue', 660)]
             wait(lambda: m.get_camera_status()['cam1'] and m.get_camera_status()['cam2'])
+            assert m.get_audio_source() == 'off', m.get_mixer()  # camera sound starts off
             assert m.set_audio_source('active')[0]
             assert m.start_youtube_stream('cam3', record=True, title='Red vs Blue')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
@@ -237,6 +239,11 @@ def run():
                 time.sleep(2)
                 assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
             print('PASS: three cuts preserve encoder PID and frame progress', flush=True)
+            assert m.set_audio_source('off')[0]
+            wait(lambda: m.get_stream_status()['audio_on_air'] == []
+                 and (m.get_audio_levels().get('program') or {}).get('peak', -120) < -60, seconds=30)
+            assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
+            print('PASS: audio Off silences the program and keeps the encoder', flush=True)
             assert m.set_audio_source('cam1')[0]
             assert m._encoder_proc.proc.pid == encoder_pid
             print('PASS: locked commentary audio preserves output encoder', flush=True)

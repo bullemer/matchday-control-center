@@ -58,6 +58,22 @@ a.switch_camera=lambda camera: (False,'Camera unavailable')
 a.set_audio_source=lambda mode: (True,'Audio updated')
 mic_delay=[]
 a.set_mic_delay=lambda ms: (mic_delay.append(ms) or True,f'Microphone delay {ms/1000:.1f} s')  # never the real data/audio.json
+audio_calls=[]
+def fake_gate(on=None, threshold_db=None):
+    audio_calls.append(['gate', on, threshold_db])
+    __import__("media_engine")._gate.update({k: v for k, v in (('on', on), ('threshold_db', threshold_db)) if v is not None})
+    return True, 'Noise gate updated'
+def fake_monitor(on=None, mode=None, output=None):
+    audio_calls.append(['monitor', on, mode, output])
+    __import__("media_engine")._monitor.update({k: v for k, v in (('on', on), ('mode', mode), ('output', output)) if v is not None})
+    return True, 'Listening updated'
+a.set_gate=fake_gate  # never the real data/audio.json or a real sound card
+a.set_monitor=fake_monitor
+a.get_audio_outputs=lambda: [{'id':'alsa_output.usb-headset','name':'USB Headset','bus':'usb'},
+                             {'id':'alsa_output.pci.analog','name':'Speaker + Headphones','bus':'pci'}]
+@a.app.route('/test/audio-calls')
+def audio_calls_list():
+    return a.jsonify(audio_calls)
 @a.app.route('/test/mic-delay')
 def mic_delay_calls():
     return a.jsonify(mic_delay)

@@ -67,7 +67,8 @@ so try a real stream before relying on a slower laptop.
    URLs use the detected hotspot address; previews use the host serving the dashboard.
    Use H.264 video and AAC audio for RTMP ingest. Preview audio support depends on
    the browser/codec; verify commentary at the broadcast output.
-4. Select a camera and choose Cam 1 commentary, Follow camera, or an available mic.
+4. Select a camera and choose the sound: camera and mic audio start **Off** (the broadcast
+   is silent until you pick a source), then Cam 1 commentary, Follow camera, or an available mic.
    A silent camera in Follow mode receives generated silence. If the chosen commentary
    source (Cam 1 or the USB mic) is missing or drops out, the picture stays on the
    selected camera with that camera's own audio (or silence) and the dashboard shows an
@@ -78,6 +79,20 @@ so try a real stream before relying on a slower laptop.
    the previous mix. Audio-source and level changes made while muted take effect on
    unmute. Mute lasts until it is switched off, including across camera cuts, and resets
    to off when the app restarts.
+   **Mic noise gate** (Main tab, on by default at -45 dB): USB microphones stay about 30 dB
+   down while nobody speaks, so crowd noise and stadium/PA music (GEMA → YouTube blocks)
+   do not get through in the pauses. Set the threshold between the noise and your voice
+   on the mic's IN meter. On/off switches live; a new threshold rebuilds the relay with a
+   seamless cut (ffmpeg 6.1 ignores a live threshold change).
+   **🎧 Listen in headset** (Main tab): choose the headset and switch it on.
+   *Without my mic* (default) plays everything on air except the microphones — cameras,
+   replays — from the MediaMTX path `monitor`, a second relay output that can never break
+   the program; hear your own voice through the headset's sidetone. *Exactly YouTube*
+   plays the final output (`final`), your own voice included 1-3 s late: for a quick check.
+   Use a wired USB headset (or one with its own USB/DECT dongle): Bluetooth headsets drop to
+   telephone quality with the microphone on and add delay; loudspeakers feed back into the
+   microphones. Needs PulseAudio/PipeWire (not inside the Docker image). Gate and headset
+   settings are kept in `data/audio.json`.
 5. Switch on the platforms (YouTube, Facebook, Twitch, Custom RTMP), enter their stream
    keys, choose 1080p, 720p or 480p, and click GO LIVE. See *Streaming destinations*
    below. Each platform needs its own full upload (720p about 4.1 Mbps each); the panel
@@ -350,7 +365,12 @@ npm run build:css
 npx playwright install chromium
 npx playwright test
 PATH="$PATH" venv/bin/python tests/media_smoke.py
+PATH="$PATH" venv/bin/python tests/monitor_smoke.py   # gate + headset monitor, ~1 min
 ```
+
+`monitor_smoke.py` also needs `pactl`: it loads two temporary null sinks (a fake
+microphone playing a test tone and a stand-in headset — nothing is audible) and unloads
+them at the end.
 
 The media smoke test requires a provisioned `mediamtx` binary plus ffmpeg/ffprobe.
 It uses synthetic cameras and private loopback test ports (21935, 28554, 29997).

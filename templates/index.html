@@ -385,10 +385,11 @@
         <div class="bg-slate-800 rounded-xl p-3 border border-slate-700 space-y-2">
           <div class="flex gap-2">
             <button data-mute="compact" onclick="toggleMute()" aria-pressed="false" class="mute-btn mute-compact">🔊 Mute</button>
-            <div class="flex-1 grid grid-cols-3 rounded-lg overflow-hidden border border-slate-600">
-              <button data-audio="cam1" onclick="setAudioSource('cam1')" title="Cam 1 mic" class="px-2 py-2.5 text-sm font-medium">🎙 Cam 1</button>
-              <button data-audio="active" onclick="setAudioSource('active')" title="Follow camera" class="px-2 py-2.5 text-sm font-medium">🔄 Follow</button>
-              <button data-audio="usb" onclick="setAudioSource('usb')" title="USB mic" class="px-2 py-2.5 text-sm font-medium">🎤 USB</button>
+            <div class="flex-1 grid grid-cols-4 rounded-lg overflow-hidden border border-slate-600">
+              <button data-audio="off" onclick="setAudioSource('off')" title="No camera or mic sound" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🔇 Off</button>
+              <button data-audio="cam1" onclick="setAudioSource('cam1')" title="Cam 1 mic" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🎙 Cam 1</button>
+              <button data-audio="active" onclick="setAudioSource('active')" title="Follow camera" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🔄 Follow</button>
+              <button data-audio="usb" onclick="setAudioSource('usb')" title="USB mic" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🎤 USB</button>
             </div>
           </div>
           <div data-usb-picker class="hidden">
@@ -741,18 +742,22 @@
         <button data-mute onclick="toggleMute()" aria-pressed="false" class="mute-btn">🔊 Audio on — tap to mute</button>
         <div class="flex items-center gap-3 flex-wrap">
           <span class="text-sm text-slate-400">🔊 Audio Source:</span>
-          <div class="flex rounded-lg overflow-hidden border border-slate-600">
-            <button id="audio-cam1" data-audio="cam1" onclick="setAudioSource('cam1')"
+          <div class="grid grid-cols-2 sm:flex w-full sm:w-auto rounded-lg overflow-hidden border border-slate-600">
+            <button id="audio-off" data-audio="off" onclick="setAudioSource('off')"
                     class="px-3 py-2 text-sm font-medium bg-brand-blue text-white transition-colors">
+              🔇 Off
+            </button>
+            <button id="audio-cam1" data-audio="cam1" onclick="setAudioSource('cam1')"
+                    class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
               🎙 Main Mic (Cam 1)
             </button>
             <button id="audio-follow" data-audio="active" onclick="setAudioSource('active')"
                     class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
-              🔄 Follow Active Camera
+              🔄 Follow Camera
             </button>
             <button id="audio-usb" data-audio="usb" onclick="setAudioSource('usb')"
                     class="px-3 py-2 text-sm font-medium bg-slate-700 text-slate-300 transition-colors">
-              🎤 USB Microphone
+              🎤 USB Mic
             </button>
           </div>
         </div>
@@ -775,6 +780,40 @@
             <span id="mic-delay-value" class="font-mono text-white w-12 text-right">0.0 s</span>
           </label>
           <p class="text-xs text-slate-500">Voice before the picture? Increase until lips/whistle and sound match (often 1–2 s).</p>
+        </div>
+        <!-- Noise gate: microphones stay closed in the pauses (crowd, PA music → YouTube blocks). -->
+        <div id="gate-panel" class="border-t border-slate-700 pt-3 space-y-1">
+          <label class="flex items-center gap-2 text-sm text-slate-300">
+            <input id="gate-on" type="checkbox" checked onchange="setGate({on: this.checked})" class="w-4 h-4 rounded">
+            🚪 Mic noise gate
+          </label>
+          <label class="flex items-center gap-2 text-xs text-slate-400">Opens above
+            <input id="gate-threshold" type="range" min="-70" max="-10" step="1" value="-45" class="flex-1"
+                   oninput="document.getElementById('gate-threshold-value').textContent = this.value + ' dB'"
+                   onchange="setGate({threshold_db: parseInt(this.value, 10)})" aria-label="Noise gate threshold">
+            <span id="gate-threshold-value" class="font-mono text-white w-14 text-right">-45 dB</span>
+          </label>
+          <p class="text-xs text-slate-500">The mic stays quiet in the pauses (crowd, stadium music) and opens when you speak.
+            Watch your mic's IN meter: set this between the noise and your voice.</p>
+        </div>
+        <!-- Headset monitor: hear what the viewers hear. -->
+        <div id="monitor-panel" class="border-t border-slate-700 pt-3 space-y-2">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="text-sm text-slate-300">🎧 Listen in headset</span>
+            <button id="monitor-toggle" onclick="toggleMonitor()" aria-pressed="false"
+                    class="px-3 py-1.5 rounded-lg text-sm font-medium bg-slate-700 text-slate-300">Off</button>
+            <span id="monitor-state" class="text-xs text-slate-400" role="status"></span>
+          </div>
+          <select id="monitor-output" onchange="setMonitor({output: this.value})" aria-label="Headset"
+                  class="w-full bg-slate-800 border border-slate-600 rounded-lg px-3 py-2 text-sm text-white focus:border-brand-cyan focus:outline-none">
+            <option value="">Choose the headset…</option>
+          </select>
+          <div class="grid grid-cols-2 rounded-lg overflow-hidden border border-slate-600">
+            <button data-monitor-mode="nomic" onclick="setMonitor({mode: 'nomic'})" class="px-2 py-2 text-sm font-medium">Without my mic</button>
+            <button data-monitor-mode="full" onclick="setMonitor({mode: 'full'})" class="px-2 py-2 text-sm font-medium">Exactly YouTube</button>
+          </div>
+          <p id="monitor-hint" class="text-xs text-slate-500"></p>
+          <p id="monitor-warning" class="hidden text-xs font-semibold text-brand-amber"></p>
         </div>
         <p data-bind="audio_warning" class="hidden text-xs font-semibold text-brand-amber"></p>
         <div>
@@ -1179,7 +1218,7 @@
       pendingCam: null,            // cut requested from this device, awaiting the server
       serverPendingCam: null,      // cut in flight from any device
       cameras: {},
-      audioSource: 'cam1',         // 'cam1', 'active', or 'usb:<device_id>'
+      audioSource: 'off',          // 'off', 'cam1', 'active', or 'usb:<device_id>'
       audioDevices: [],            // detected USB audio devices from server
       selectedUsbDevice: null,     // currently selected USB device id
       usbPickerOpen: false,        // picker shown before a device is chosen
@@ -2712,8 +2751,107 @@
       row.classList.toggle('on-air', !!onAir);
     }
 
+    // ──────────────────────── Noise gate + headset monitor ────────────────────────
+    const monitor = {setting: {on: false, mode: 'nomic', output: '', state: 'off', error: ''}, outputs: [],
+                     pending: false, signature: null};
+    let gatePending = false;
+    async function setGate(change) {
+      gatePending = true;
+      try {
+        const result = await apiPost('/api/audio/gate', change);
+        if (result && result.mixer) showGate(result.mixer.gate, true);
+      } finally {
+        gatePending = false;
+      }
+    }
+    function showGate(gate, force = false) {
+      if (!gate || (gatePending && !force)) return;
+      const box = document.getElementById('gate-on');
+      const slider = document.getElementById('gate-threshold');
+      box.checked = !!gate.on;
+      slider.disabled = !gate.on;
+      if (document.activeElement !== slider) {
+        slider.value = gate.threshold_db;
+        document.getElementById('gate-threshold-value').textContent = gate.threshold_db + ' dB';
+      }
+    }
+    async function setMonitor(change) {
+      if (monitor.pending) return;
+      monitor.pending = true;
+      try {
+        const result = await apiPost('/api/audio/monitor', change);
+        if (result && result.mixer) monitor.setting = result.mixer.monitor;
+      } finally {
+        monitor.pending = false;
+        showMonitor();
+      }
+    }
+    function toggleMonitor() {
+      const output = document.getElementById('monitor-output').value;
+      if (!monitor.setting.on && !output) {
+        showToast('Choose the headset first', 'error');
+        return;
+      }
+      setMonitor({on: !monitor.setting.on, output});
+    }
+    async function loadAudioOutputs() {
+      const select = document.getElementById('monitor-output');
+      if (!select || document.activeElement === select) return;
+      const result = await apiGet('/api/audio/outputs');
+      if (!result || !result.ok) return;
+      monitor.outputs = result.outputs || [];
+      const signature = JSON.stringify(monitor.outputs.map(o => [o.id, o.name]));
+      if (signature === monitor.signature) return;
+      monitor.signature = signature;
+      select.innerHTML = '';
+      select.appendChild(new Option(monitor.outputs.length ? 'Choose the headset…' : 'No sound outputs found', ''));
+      monitor.outputs.forEach(o => select.appendChild(new Option(
+        (o.bus === 'usb' ? '🎧 ' : o.bus === 'bluetooth' ? '📶 ' : '🔈 ') + o.name, o.id)));
+      showMonitor();
+    }
+    function showMonitor(setting) {
+      if (setting && !monitor.pending) monitor.setting = setting;
+      const s = monitor.setting;
+      const toggle = document.getElementById('monitor-toggle');
+      if (!toggle) return;
+      toggle.textContent = s.on ? 'On' : 'Off';
+      toggle.setAttribute('aria-pressed', String(!!s.on));
+      toggle.classList.toggle('bg-brand-green', !!s.on);
+      toggle.classList.toggle('text-white', !!s.on);
+      toggle.classList.toggle('bg-slate-700', !s.on);
+      toggle.classList.toggle('text-slate-300', !s.on);
+      document.querySelectorAll('[data-monitor-mode]').forEach(btn => {
+        const on = btn.dataset.monitorMode === s.mode;
+        btn.classList.toggle('bg-brand-blue', on);
+        btn.classList.toggle('text-white', on);
+        btn.classList.toggle('bg-slate-700', !on);
+        btn.classList.toggle('text-slate-300', !on);
+      });
+      const select = document.getElementById('monitor-output');
+      if (document.activeElement !== select && s.output && [...select.options].some(o => o.value === s.output)) {
+        select.value = s.output;
+      }
+      const stateText = {off: '', starting: 'Connecting…', playing: '● Listening', waiting: 'Waiting…'}[s.state] || '';
+      const stateEl = document.getElementById('monitor-state');
+      stateEl.textContent = s.state === 'waiting' && s.error ? 'Waiting — ' + s.error : stateText;
+      stateEl.className = 'text-xs ' + (s.state === 'playing' ? 'text-brand-green' : s.state === 'waiting' ? 'text-brand-amber' : 'text-slate-400');
+      document.getElementById('monitor-hint').textContent = s.mode === 'full'
+        ? 'Exactly what goes out, your own voice included 1–3 s late: for a quick check, not for talking.'
+        : 'Cameras, replays and everything else on air, without the microphones: hear your own voice through the headset itself (sidetone).';
+      const chosen = monitor.outputs.find(o => o.id === (select.value || s.output));
+      const warning = !chosen ? ''
+        : chosen.bus === 'bluetooth' ? 'Bluetooth adds delay and drops out — a USB headset is better.'
+        : /speaker/i.test(chosen.name) && chosen.bus !== 'usb' ? 'Use headphones on this output: loudspeakers feed the sound back into the microphones.'
+        : '';
+      const warningEl = document.getElementById('monitor-warning');
+      warningEl.textContent = warning;
+      warningEl.classList.toggle('hidden', !warning);
+    }
+
     function renderMeters(info) {
       if (info.mixer) showMicDelay(info.mixer.mic_delay_ms);
+      if (info.mixer) showGate(info.mixer.gate);
+      if (info.mixer && info.mixer.monitor) showMonitor(info.mixer.monitor);
       if (info.mixer && !mutePending && state.muted !== !!info.mixer.muted) {
         state.muted = !!info.mixer.muted;
         renderMute();
@@ -2750,6 +2888,8 @@
       }
     }
     setInterval(pollMeters, 250);
+    loadAudioOutputs();
+    setInterval(loadAudioOutputs, 10000);  // a headset plugged in later appears by itself
 
     // ──────────────────────── Status banner ────────────────────────
     const bannerStyles = {

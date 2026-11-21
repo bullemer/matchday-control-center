@@ -37,7 +37,8 @@ from pathlib import Path
 from urllib.parse import quote, urlsplit
 from werkzeug.exceptions import HTTPException
 from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
-                             stop_hotspot, get_usb_audio_devices, get_firewall_status, UPLINK_CONFLICT)
+                             stop_hotspot, get_usb_audio_devices, get_audio_outputs, get_firewall_status,
+                             UPLINK_CONFLICT)
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CAMERA_USER, camera_password,
                           get_mediamtx_running, get_stream_status, start_stream, stop_stream,
                           make_target, DESTINATIONS, PROFILES, switch_camera, set_audio_source, shutdown_all,
@@ -45,7 +46,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           SUPERSEDED, set_layout, CAMERA_IDS, start_recording, stop_recording,
                           get_recording_status, play_replay, stop_replay, get_replay_status,
                           add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting,
-                          resume_state, resume, set_mic_delay, load_audio_setting)
+                          resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
+                          start_monitor_worker)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -739,11 +741,11 @@ def api_layout():
 @app.route("/api/audio-source", methods=["POST"])
 @api_endpoint
 def api_audio_source():
-    """Set the audio mode — 'cam1', 'active', or 'usb:<device_id>'."""
+    """Set the audio mode — 'off', 'cam1', 'active', or 'usb:<device_id>'."""
     data = request.get_json(force=True, silent=True) or {}
     mode = text_field(data, "mode", 200)
 
-    if mode not in ("cam1", "active") and not (mode.startswith("usb:") and len(mode) > 4):
+    if mode not in ("off", "cam1", "active") and not (mode.startswith("usb:") and len(mode) > 4):
         return jsonify({
             "ok": False,
             "error": "mode must be 'cam1', 'active', or 'usb:<device_id>'",
@@ -808,6 +810,33 @@ def api_audio_mic_delay():
     data = request.get_json(force=True, silent=True) or {}
     log.info("Microphone delay %s ms requested", data.get("ms"))
     success, msg = set_mic_delay(data.get("ms"))
+    return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 400
+
+
+@app.route("/api/audio/gate", methods=["POST"])
+@api_endpoint
+def api_audio_gate():
+    """{"on": bool, "threshold_db": -70..-10}: noise gate on the microphones."""
+    data = request.get_json(force=True, silent=True) or {}
+    log.info("Noise gate %s requested", data)
+    success, msg = set_gate(data.get("on"), data.get("threshold_db"))
+    return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 400
+
+
+@app.route("/api/audio/outputs", methods=["GET"])
+@api_endpoint
+def api_audio_outputs():
+    """Sound outputs (headsets, headphones, speakers) the monitor can play on."""
+    return jsonify({"ok": True, "outputs": get_audio_outputs()})
+
+
+@app.route("/api/audio/monitor", methods=["POST"])
+@api_endpoint
+def api_audio_monitor():
+    """{"on": bool, "mode": "nomic"|"full", "output": sink}: listen in the headset."""
+    data = request.get_json(force=True, silent=True) or {}
+    log.info("Headset monitor %s requested", {k: data.get(k) for k in ("on", "mode", "output")})
+    success, msg = set_monitor(data.get("on"), data.get("mode"), data.get("output"))
     return jsonify({"ok": success, "message": msg, "mixer": get_mixer()}), 200 if success else 400
 
 
@@ -1203,6 +1232,7 @@ def initialize():
     if _resume_pending:
         log.info("The app stopped while live; resuming the broadcast once a camera is back")
     load_audio_setting()
+    start_monitor_worker()  # plays in the headset once MediaMTX runs, if listening was on
     threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()
     browser_overlay.start()

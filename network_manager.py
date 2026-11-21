@@ -475,6 +475,28 @@ def _parse_pulse_sources():
         return []
 
 
+def get_audio_outputs() -> list[dict]:
+    """Sound outputs (PulseAudio/PipeWire sinks) for the headset monitor, USB and wireless
+    headsets first. ``bus`` lets the dashboard warn about Bluetooth delay."""
+    ok, output = run_cmd(["pactl", "--format=json", "list", "sinks"], timeout=5)
+    if not ok:
+        return []
+    try:
+        sinks = json.loads(output)
+    except ValueError:
+        return []
+    outputs = []
+    for sink in sinks if isinstance(sinks, list) else []:
+        name = sink.get("name") if isinstance(sink, dict) else None
+        if not isinstance(name, str) or not name:
+            continue
+        properties = sink.get("properties") or {}
+        bus = str(properties.get("device.bus") or ("bluetooth" if name.startswith("bluez") else ""))
+        outputs.append({"id": name, "name": str(sink.get("description") or name), "bus": bus})
+    order = {"usb": 0, "bluetooth": 1}
+    return sorted(outputs, key=lambda o: (order.get(o["bus"], 2), "HDMI" in o["name"], o["name"]))
+
+
 def get_usb_audio_devices() -> list[dict]:
     """
     Detect USB audio capture devices and return a list of dicts::

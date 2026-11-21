@@ -604,6 +604,21 @@ class MediaTests(unittest.TestCase):
         mix.update(channels)
         return patch.object(m,'_mix',mix)
 
+    def test_camera_sound_starts_off(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('fresh_engine', m.__file__)
+        fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
+        self.assertFalse(any(v['on'] for v in fresh._mix.values()))
+        self.assertEqual(fresh.get_audio_source(), 'off')
+        self.assertEqual(fresh._effective_mix('cam1'), {})
+
+    def test_off_preset_silences_every_channel(self):
+        with self.mixer(**{'usb:mic':{'on':True,'gain':0.0}}),patch.object(m,'_follow',True),patch.object(m,'_active_camera',None):
+            self.assertTrue(m.set_audio_source('off')[0])
+            self.assertEqual(m.get_audio_source(),'off')
+            self.assertFalse(m._follow)
+            self.assertEqual(m._effective_mix('cam2'),{})
+
     def test_audio_failure_rolls_back_mode(self):
         with self.mixer(),patch.object(m,'_follow',False),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_proc',None),patch.object(m,'switch_camera',return_value=(False,'bad')):
             self.assertFalse(m.set_audio_source('active')[0])
@@ -733,7 +748,7 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^cam[123]$'}])
             self.assertEqual(users[1]['permissions'],[{'action':'read'}])  # no password: nobody on the LAN may publish
             self.assertEqual(users[2]['ips'],['127.0.0.1','::1'])
-            self.assertIn({'action':'publish','path':'~^(program|final|cam[123])$'},users[2]['permissions'])
+            self.assertIn({'action':'publish','path':'~^(program|final|monitor|cam[123])$'},users[2]['permissions'])
 
     def reconnect_case(self, **extra):
         relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True
@@ -805,7 +820,7 @@ class MediaTests(unittest.TestCase):
         graph=cmd[cmd.index('-filter_complex')+1]
         self.assertEqual(channels,{'cam2':'m0','cam1':'m1','usb:alsa_input.mic':'m2'})
         self.assertIn('[0:a:0]',graph); self.assertIn('[1:a:0]',graph); self.assertIn('[2:a:0]',graph)
-        self.assertIn('[3:a:0][m0][m1][m2]amix=inputs=4',graph)  # silence base first
+        self.assertIn('[3:a:0]asplit=2[silence][silencex];[silence][m0][m1][m2]amix=inputs=4',graph)  # silence base first
         self.assertIn('volume@m0=0.5012',graph)
         self.assertIn('alimiter',graph); self.assertIn('azmq=bind_address=tcp',graph)
         self.assertEqual(cmd[cmd.index('-f',cmd.index('alsa_input.mic')-3)+1],'pulse')
