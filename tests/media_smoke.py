@@ -38,6 +38,8 @@ def run():
         m.recordings.RECORDINGS_DIR = Path(tmp) / 'recordings'
         m.AUDIO_SETTING = Path(tmp) / 'audio.json'  # never the real data/audio.json
         m.CAMERA_SETTING = Path(tmp) / 'cameras.json'
+        m.ENCODER_SETTING = Path(tmp) / 'encoder.json'      # never the operator's real choices
+        m.RECORDING_SETTING = Path(tmp) / 'recording.json'
         m._camera_info.clear()
         def config():
             original_config()
@@ -409,6 +411,33 @@ def run():
             assert m.stop_recording()[0]
             wait(lambda: m.recordings.get(srt_session)['state'] == 'done', seconds=60)
             assert {p['camera'] for p in m.recordings.get(srt_session)['iso']} >= {'cam6'}, m.recordings.get(srt_session)['iso']
+            if m.nvenc_available():
+                # NVIDIA GPU: relays and final encoder on the GPU, H.264 (RTMP) and H.265 (SRT) cameras.
+                assert m.set_hardware_encoding('nvidia')[0]
+                assert m.set_iso_match(True)[0]  # match cameras recorded separately as well
+                assert m.start_recording('720p', 'GPU')[0]
+                wait(lambda: m.get_recording_status()['writing'])
+                status = m.get_encoder_status()
+                assert status['active'] == 'nvidia' and status['relay'] == 'nvidia' and not status['warning'], status
+                for cam, colour in (('cam6', lambda c: c[0] > 150 and c[1] > 150 and c[2] < 90),
+                                    ('cam1', lambda c: c[0] > 150 and c[1] < 90)):
+                    assert m.switch_camera(cam)[0], m.get_stream_status()
+                    time.sleep(1.5)
+                    centre = program_pixels()(80, 40)
+                    assert colour(centre), (cam, centre)
+                gpu_session = m.get_recording_status()['session']
+                assert m.stop_recording()[0]
+                wait(lambda: m.recordings.get(gpu_session)['state'] == 'done', seconds=60)
+                assert not m.get_encoder_status()['warning']
+                saved = m.recordings.get(gpu_session)
+                assert {'cam1', 'cam6'} <= {p['camera'] for p in saved['iso']}, saved['iso']
+                assert all(p['file'].endswith('.mp4') for p in saved['iso']), saved['iso']
+                log = [(c['camera'], c['source']) for c in m.recordings.cuts(gpu_session)]
+                assert log[0][1] == 'start' and ('cam6', 'manual') in log and log[-1] == ('cam1', 'manual'), log
+                m.set_iso_match(False)
+                print(f"PASS: match cameras recorded separately ({len(saved['iso'])} files); cut log {log}", flush=True)
+                assert m.set_hardware_encoding('software')[0]
+                print('PASS: NVIDIA GPU encodes relays and output; H.265 SRT and H.264 RTMP cameras cut cleanly', flush=True)
             assert m.start_youtube_stream('cam3', '1080p')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
             probe = subprocess.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',

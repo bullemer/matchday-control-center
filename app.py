@@ -48,7 +48,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting,
                           resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
                           start_monitor_worker, get_cameras, set_camera_info, load_camera_setting,
-                          REPORT_CAMERAS, get_camera_inputs, QUALITY_LABELS)
+                          REPORT_CAMERAS, get_camera_inputs, QUALITY_LABELS, set_iso_match,
+                          load_recording_setting, nvenc_available)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -593,6 +594,28 @@ def api_recordings():
                     "recording": status})
 
 
+@app.route("/api/recording/match-cameras", methods=["POST"])
+@api_endpoint
+def api_iso_match():
+    """{"on": bool}: also record every match camera on its own (material for automatic cutting)."""
+    data = request.get_json(force=True, silent=True) or {}
+    if type(data.get("on")) is not bool:
+        raise ValueError("on must be true or false")
+    ok, message = set_iso_match(data["on"])
+    return jsonify(ok=ok, message=message, recording=get_recording_status())
+
+
+@app.route("/recordings/<sid>/cuts.csv", methods=["GET"])
+def recording_cuts(sid):
+    """The session's cut log: what was on air when, chosen by whom."""
+    try:
+        body = recordings.cuts_csv(sid)
+    except ValueError:
+        return jsonify({"ok": False, "error": "Unknown recording"}), 404
+    return app.response_class(body, mimetype="text/csv",
+                              headers={"Content-Disposition": f'attachment; filename="{sid}-cuts.csv"'})
+
+
 @app.route("/api/recordings/<sid>/markers/<mid>", methods=["POST"])
 @api_endpoint
 def api_marker_update(sid, mid):
@@ -771,14 +794,14 @@ def api_camera_info(cam_id):
         fields["label"] = text_field(data, "label", 24)
     if "position" in data:
         fields["position"] = text_field(data, "position", 40)
-    for name in ("protocol", "quality"):
+    for name in ("protocol", "quality", "mount"):
         if name in data:
             fields[name] = text_field(data, name, 10)
     if "latency_ms" in data:
         if type(data["latency_ms"]) is not int:
             raise ValueError("latency_ms must be a whole number of milliseconds")
         fields["latency_ms"] = data["latency_ms"]
-    for name in ("encrypt", "new_passphrase"):
+    for name in ("encrypt", "new_passphrase", "wide"):
         if name in data:
             if type(data[name]) is not bool:
                 raise ValueError(f"{name} must be true or false")
@@ -1063,12 +1086,16 @@ def api_scoreboard_get():
 @app.route("/api/encoder", methods=["POST"])
 @api_endpoint
 def api_encoder():
-    """{"hardware": bool}: encode the final picture on the graphics chip or in software."""
+    """{"encoder": "software"|"intel"|"nvidia"} (or the older {"hardware": bool} = intel/software)."""
     data = request.get_json(force=True, silent=True) or {}
-    if type(data.get("hardware")) is not bool:
-        raise ValueError("hardware must be true or false")
-    log.info("%s encoding requested", "Hardware" if data["hardware"] else "Software")
-    success, msg = set_hardware_encoding(data["hardware"])
+    if "encoder" in data:
+        kind = text_field(data, "encoder", 10)
+    elif type(data.get("hardware")) is bool:
+        kind = "intel" if data["hardware"] else "software"
+    else:
+        raise ValueError("encoder must be software, intel or nvidia")
+    log.info("Encoder requested: %s", kind)
+    success, msg = set_hardware_encoding(kind)
     return jsonify({"ok": success, "message": msg, "encoder": get_stream_status()["encoder"]}), 200 if success else 409
 
 
@@ -1284,6 +1311,7 @@ def initialize():
         log.info("The app stopped while live; resuming the broadcast once a camera is back")
     load_audio_setting()
     load_camera_setting()
+    load_recording_setting()
     start_monitor_worker()  # plays in the headset once MediaMTX runs, if listening was on
     threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()

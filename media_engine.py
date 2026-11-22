@@ -482,9 +482,15 @@ QUALITY_LABELS = {"1080p": "1080p · 6 Mbit/s", "720p": "720p · 3 Mbit/s",
                   "720p-low": "720p · 1.8 Mbit/s (weak Wi-Fi)", "480p": "480p · 1 Mbit/s (very weak link)"}
 
 
+MOUNTS = ("fixed", "tracking", "handheld")  # tracking: XbotGo, motorised gimbal
+
+
 def _default_camera(cam):
+    # mount and wide matter for the future auto-director: a fixed camera covers a known part
+    # of the pitch; a tracking camera follows play; the wide camera is the fallback shot.
     return {"label": _default_label(cam), "position": "", "protocol": "rtmp", "latency_ms": 300,
-            "encrypt": False, "passphrase": "", "quality": "720p" if cam in REPORT_CAMERAS else "1080p"}
+            "encrypt": False, "passphrase": "", "quality": "720p" if cam in REPORT_CAMERAS else "1080p",
+            "mount": "handheld" if cam in REPORT_CAMERAS else "fixed", "wide": False}
 
 
 def _clean_camera(cam, entry):
@@ -504,6 +510,9 @@ def _clean_camera(cam, entry):
     clean["encrypt"] = entry.get("encrypt") is True and bool(clean["passphrase"])
     if entry.get("quality") in QUALITIES:
         clean["quality"] = entry["quality"]
+    if entry.get("mount") in MOUNTS:
+        clean["mount"] = entry["mount"]
+    clean["wide"] = entry.get("wide") is True and cam in MATCH_CAMERAS
     return clean
 
 
@@ -542,7 +551,7 @@ def get_cameras():
 
 
 def set_camera_info(cam, label=None, position=None, protocol=None, latency_ms=None, encrypt=None,
-                    quality=None, new_passphrase=False):
+                    quality=None, new_passphrase=False, mount=None, wide=None):
     """Change one camera's settings. Switching encryption (or a new passphrase) changes what
     MediaMTX accepts for that camera: the running server reloads it, only that camera reconnects."""
     if cam not in CAMERA_IDS:
@@ -553,6 +562,10 @@ def set_camera_info(cam, label=None, position=None, protocol=None, latency_ms=No
         return False, f"SRT delay must be {SRT_LATENCY_MIN}-{SRT_LATENCY_MAX} ms"
     if quality is not None and quality not in QUALITIES:
         return False, "Unknown quality"
+    if mount is not None and mount not in MOUNTS:
+        return False, "Mount must be fixed, tracking or handheld"
+    if wide and cam not in MATCH_CAMERAS:
+        return False, "Only a match camera can be the wide camera"
     if not _camera_info:
         load_camera_setting()
     with _lock:
@@ -568,6 +581,13 @@ def set_camera_info(cam, label=None, position=None, protocol=None, latency_ms=No
             info["latency_ms"] = latency_ms
         if quality is not None:
             info["quality"] = quality
+        if mount is not None:
+            info["mount"] = mount
+        if wide is not None:
+            if wide:  # one wide camera: the shot when nobody sees the ball
+                for other in _camera_info.values():
+                    other["wide"] = False
+            info["wide"] = bool(wide)
         if new_passphrase or (encrypt and not info["passphrase"]):
             info["passphrase"] = secrets.token_urlsafe(12)  # 16 characters, SRT allows 10-79
         if encrypt is not None:
@@ -1168,7 +1188,7 @@ def get_recording_status():
     status = {"active": bool(_want_record and session), "session": session,
               "writing": bool(recorder and recorder.healthy()),
               "warning": _record_warning or (_disk_warning if _want_record and session else ""),
-              "iso": get_iso_status()}
+              "iso": get_iso_status(), "iso_match": _iso_match}
     if session:
         try:
             info = recordings.get(session, live_wall=time.time())
@@ -1201,6 +1221,8 @@ def _camera_input(path, audio_only=False):
     options = ["-thread_queue_size", "512", "-probesize", "500000", "-analyzeduration", "500000"]
     if audio_only:
         options += ["-allowed_media_types", "audio"]
+    elif _relay_uses_nvenc() and _NVDEC:
+        options += ["-hwaccel", "cuda"]  # decode on the GPU; frames come back for the filters
     return options + _input(path)
 
 
@@ -1414,14 +1436,30 @@ def _relay_command(cam, wanted, replay=None):
         video[-1] = video[-1][:-len("[vout]")] + f"[live];[live]{_scoreboard_filter(width, height)}[vout]"
         parts += video
     return cmd + ["-filter_complex", ";".join(parts), "-map", "[vout]", "-map", "[aout]",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
+        *_relay_video_codec(), "-pix_fmt", "yuv420p", "-g", "30", "-b:v", bitrate,
         "-c:a", "aac", "-ar", "48000", "-ac", "2",
         "-shortest", "-f", "rtsp", "-rtsp_transport", "tcp", f"{RTSP_BASE}/program",
         # The headset monitor: a failure here must never touch the program output.
         "-map", "[mon]", "-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-ac", "2",
         "-f", "tee", f"[f=rtsp:rtsp_transport=tcp:onfail=ignore]{RTSP_BASE}/monitor"], \
         channels, missing, warning, secondary, video_warning
+
+
+def _relay_video_codec():
+    """The relay re-encodes every cut; on the NVIDIA GPU that costs almost no CPU."""
+    if _relay_uses_nvenc():
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ull", "-bf", "0", "-rc", "cbr"]
+    return ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency"]
+
+
+def _relay_nvenc_failed(problem):
+    """A relay on the NVIDIA encoder did not start: continue in software (until the next start)."""
+    global _relay_hw_failed
+    if problem == SUPERSEDED or not _relay_uses_nvenc():
+        return False
+    _relay_hw_failed = True
+    logger.warning("NVIDIA encoder failed in a relay (%s); using the software encoder", problem)
+    return True
 
 
 def _send_volume(name, volume):
@@ -1563,6 +1601,8 @@ def _replace_relay(cam_id, generation):
     # The current relay stays on air while the new one starts.
     _await_retired()
     candidate, problem = _take_over(cmd, current)
+    if candidate is None and _relay_nvenc_failed(problem):
+        return _replace_relay(cam_id, generation)
     if candidate is None:
         if problem != SUPERSEDED:
             _set_error("relay", problem)
@@ -1590,6 +1630,7 @@ def _replace_relay(cam_id, generation):
     if installed:
         _retire(old)
         _cut_seconds = round(0.5 * _cut_seconds + 0.5 * (time.monotonic() - began), 2)
+        _log_cut()
     if ended_replay:
         _notify_replay(False)
     if installed:
@@ -1664,6 +1705,8 @@ def _install_replay(generation, camera, replay):
         old, slot = _relay_proc, _spare_slot()
     _await_retired()
     candidate, problem = _take_over(cmd, current)  # live stays on air until the replay is ready
+    if candidate is None and _relay_nvenc_failed(problem):
+        return _install_replay(generation, camera, replay)
     if candidate is None:
         return False, problem
     airtime = replay["length"] / replay["speed"]
@@ -1680,6 +1723,7 @@ def _install_replay(generation, camera, replay):
         _kill_process(candidate)
         return False, SUPERSEDED
     _retire(old)
+    _log_cut("replay")
     _notify_replay(True)
     threading.Thread(target=_watch_replay, args=(candidate, generation, camera, airtime, replay["hold"]),
                      daemon=True, name="replay-watcher").start()
@@ -1808,7 +1852,10 @@ def _supervise_live_capture(now):
                     _live_capture["aired"] = aired
 
 
-_iso = {}                 # reporting camera -> {"proc", "session", "path", "noted"}
+_iso = {}                 # camera -> {"proc", "session", "path", "noted"}
+RECORDING_SETTING = BASE / "data/recording.json"
+_iso_match = False        # also record every match camera on its own (material for the auto-director)
+_cut_logged = None        # (session, camera, mode, secondary) last written to the session's cut log
 _iso_retry = {}           # reporting camera -> monotonic time of the next start attempt
 _iso_lock = threading.Lock()
 ISO_RETRY = 3.0
@@ -1819,14 +1866,82 @@ def _iso_command(cam, path):
         "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", path]
 
 
+def load_recording_setting():
+    global _iso_match
+    try:
+        _iso_match = json.loads(RECORDING_SETTING.read_text()).get("match_cameras") is True
+    except (OSError, ValueError, AttributeError):
+        _iso_match = False
+
+
+def set_iso_match(on):
+    """Also record the match cameras on their own (copy only: disk, not CPU)."""
+    global _iso_match
+    _iso_match = bool(on)
+    try:
+        RECORDING_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        RECORDING_SETTING.write_text(json.dumps({"match_cameras": _iso_match}))
+    except OSError:
+        logger.exception("Cannot save the recording setting")
+    return True, "Match cameras are recorded separately too" if _iso_match else "Only reporting cameras are recorded separately"
+
+
+def _iso_cameras():
+    return REPORT_CAMERAS + (MATCH_CAMERAS if _iso_match else [])
+
+
+def _iso_bytes_per_hour():
+    """What the separately recorded cameras add to the disk per hour (measured, else recommended)."""
+    if not _camera_info:
+        load_camera_setting()
+    total = 0
+    for cam in list(_iso):
+        kbps = (_inputs.get(cam) or {}).get("kbps") or QUALITIES[_camera_info[cam]["quality"]][2]
+        total += kbps * 1000 / 8 * 3600
+    return total
+
+
+def _log_cut(source=None):
+    """Write what is on air to the session's cut log when it changed: the operator's cuts
+    are the reference the auto-director is tested against."""
+    global _cut_logged
+    with _lock:
+        session = _recording if _want_record else None
+        if not session:
+            return
+        if _replay:
+            camera, mode, secondary = "replay", "single", None
+        else:
+            camera = get_active_camera()
+            if not camera:
+                return
+            mode = _layout["mode"] if _relay_secondary else "single"
+            secondary = _relay_secondary
+        state = (session, camera, mode, secondary)
+        if state == _cut_logged:
+            return
+        first = _cut_logged is None or _cut_logged[0] != session
+        _cut_logged = state
+        source = "start" if first else source or ("replay" if camera == "replay" else _cut_source)
+    try:
+        recordings.add_cut(session, camera, source, mode, secondary)
+    except (ValueError, OSError) as exc:
+        logger.warning("Cannot log the cut: %s", exc)
+
+
 def _supervise_iso(now):
-    """Record every publishing reporting camera on its own while a recording runs (copy
-    only, on air or not). A camera that drops out ends its part; it continues in a new
-    part when it is back. Serialized with _end_iso_all so STOP never leaves one running."""
+    """Record every publishing reporting camera (and, when chosen, every match camera) on its
+    own while a recording runs (copy only, on air or not). A camera that drops out ends its
+    part; it continues in a new part when it is back. Serialized with _end_iso_all so STOP
+    never leaves one running."""
+    _log_cut()
     with _iso_lock:
         with _lock:
             session = _recording if _want_record else None
-        for cam in REPORT_CAMERAS:
+        wanted_cams = _iso_cameras()
+        for cam in [c for c in _iso if c not in wanted_cams]:
+            _kill_process(_iso.pop(cam)["proc"])
+        for cam in wanted_cams:
             entry = _iso.get(cam)
             wanted = bool(session and _camera_status.get(cam))
             if entry:
@@ -2036,10 +2151,14 @@ def set_mute(muted):
 # Hardware (VAAPI) encoding of the final picture is an option; x264 stays the default and
 # the fallback. The choice applies when the encoder starts.
 ENCODER_SETTING = BASE / "data/encoder.json"
-_hw_wanted = False       # the operator's choice
-_hw_device = None        # render node that passed the test encode
+ENCODERS = ("software", "intel", "nvidia")
+_hw_wanted = "software"  # the operator's choice
+_hw_device = None        # Intel render node that passed the test encode
 _hw_warning = ""         # why the software encoder runs although hardware is chosen
-_encoder_hw = False      # the running encoder uses the graphics chip
+_encoder_hw = False      # the running encoder uses a graphics chip
+_relay_hw_failed = False  # the NVIDIA encoder failed in a relay: relays use software until the next start
+_nvenc_ok = None         # cached result of the NVIDIA test encode
+_NVDEC = os.environ.get("MCC_NVDEC", "1") != "0"
 
 
 def _test_vaapi(device):
@@ -2053,44 +2172,84 @@ def _test_vaapi(device):
         return False
 
 
+def _test_nvenc():
+    try:
+        return subprocess.run(
+            ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-f", "lavfi", "-i",
+             "testsrc2=s=1920x1080:r=30", "-t", "0.5", "-c:v", "h264_nvenc", "-preset", "p1",
+             "-tune", "ull", "-bf", "0", "-b:v", "6000k", "-f", "null", "-"],
+            capture_output=True, timeout=20).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
 def _find_hw_device():
     return next((str(d) for d in sorted(Path("/dev/dri").glob("renderD*")) if _test_vaapi(str(d))), None)
 
 
-def set_hardware_encoding(enabled, save=True):
-    """Choose the graphics chip (far less CPU) or the software encoder for the final picture."""
-    global _hw_wanted, _hw_device, _hw_warning
-    device = _find_hw_device() if enabled else None
-    if enabled and not device:
-        return False, "The graphics chip of this laptop cannot encode the stream; staying on the software encoder"
+def nvenc_available():
+    global _nvenc_ok
+    if _nvenc_ok is None:
+        _nvenc_ok = _test_nvenc()
+    return _nvenc_ok
+
+
+def set_hardware_encoding(kind, save=True):
+    """Encode on the CPU ("software"), the Intel graphics chip (final picture) or the NVIDIA
+    GPU (final picture and every camera relay: frees the most CPU). True means "intel"
+    (the setting before the NVIDIA option existed)."""
+    global _hw_wanted, _hw_device, _hw_warning, _relay_hw_failed
+    kind = {True: "intel", False: "software"}.get(kind, kind)
+    if kind not in ENCODERS:
+        return False, "Choose software, intel or nvidia"
+    device = _find_hw_device() if kind == "intel" else None
+    if kind == "intel" and not device:
+        return False, "The Intel graphics chip cannot encode the stream; staying on the current encoder"
+    if kind == "nvidia" and not nvenc_available():
+        return False, "No working NVIDIA encoder found; staying on the current encoder"
     with _lock:
-        _hw_wanted, _hw_device, _hw_warning = bool(enabled), device, ""
+        _hw_wanted, _hw_device, _hw_warning, _relay_hw_failed = kind, device, "", False
         running = _want_stream
     if save:
         try:
             ENCODER_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            ENCODER_SETTING.write_text(json.dumps({"hardware": bool(enabled)}))
+            ENCODER_SETTING.write_text(json.dumps({"encoder": kind}))
         except OSError:
             logger.exception("Cannot save the encoder setting")
-    return True, ("Hardware encoding on" if enabled else "Software encoding on") + (
-        "; it applies from the next start" if running else "")
+    names = {"software": "Software encoding", "intel": "Intel graphics encoding", "nvidia": "NVIDIA GPU encoding"}
+    note = ""
+    if running:
+        note = "; relays use it from the next cut, the final encoder from the next start" if kind == "nvidia" or \
+            _relay_uses_nvenc() else "; it applies from the next start"
+    return True, names[kind] + " on" + note
 
 
 def load_encoder_setting():
-    """At startup: restore the saved choice if the graphics chip still passes the test."""
+    """At startup: restore the saved choice if that encoder still passes the test."""
     try:
-        wanted = bool(json.loads(ENCODER_SETTING.read_text()).get("hardware"))
+        saved = json.loads(ENCODER_SETTING.read_text())
+        kind = saved.get("encoder") or ("intel" if saved.get("hardware") else "software")
     except (OSError, ValueError, AttributeError):
         return
-    if wanted:
-        ok, message = set_hardware_encoding(True, save=False)
+    if kind != "software":
+        ok, message = set_hardware_encoding(kind, save=False)
         if not ok:
             logger.warning(message)
 
 
+def _relay_uses_nvenc():
+    return _hw_wanted == "nvidia" and not _relay_hw_failed and bool(_nvenc_ok)
+
+
 def get_encoder_status():
-    return {"hardware": _hw_wanted, "warning": _hw_warning if _hw_wanted else "",
-            "active": ("hardware" if _encoder_hw else "software") if _encoder_proc else None}
+    active = None
+    if _encoder_proc:
+        active = (_hw_wanted if _encoder_hw else "software")
+    warning = _hw_warning or ("NVIDIA encoder failed in a camera relay; relays use the software encoder"
+                              if _hw_wanted == "nvidia" and _relay_hw_failed else "")
+    return {"hardware": _hw_wanted != "software", "kind": _hw_wanted, "warning": warning,
+            "active": active, "relay": "nvidia" if _relay_uses_nvenc() else "software",
+            "nvidia": bool(_nvenc_ok), "intel_device": _hw_device}
 
 
 def _launch_encoder():
@@ -2101,15 +2260,19 @@ def _launch_encoder():
     # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
     # Keep composition in the encoder's YUV420 format and bound worker counts:
     # auto-threading added substantial CPU overhead in real-time 1080p/PiP tests.
-    hardware = bool(_hw_wanted and _hw_device and not _hw_warning)
-    upload = ",format=nv12,hwupload" if hardware else ""
+    intel = _hw_wanted == "intel" and bool(_hw_device) and not _hw_warning
+    nvidia = _hw_wanted == "nvidia" and bool(_nvenc_ok) and not _hw_warning
+    hardware = intel or nvidia
+    upload = ",format=nv12,hwupload" if intel else ""
     vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420{upload}[vout]"
-    if hardware:  # no B-frames, like x264's zerolatency
+    if intel:  # no B-frames, like x264's zerolatency
         codec = ["-c:v", "h264_vaapi", "-bf", "0"]
+    elif nvidia:
+        codec = ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "ll", "-bf", "0", "-rc", "cbr", "-pix_fmt", "yuv420p"]
     else:
         codec = ["-c:v", "libx264", "-threads:v", "6", "-preset", "veryfast", "-tune", "zerolatency", "-pix_fmt", "yuv420p"]
     # A deep input queue: the reader must keep draining while the graph is busy.
-    cmd = _ffmpeg() + (["-vaapi_device", _hw_device] if hardware else []) + [
+    cmd = _ffmpeg() + (["-vaapi_device", _hw_device] if intel else []) + [
         "-filter_complex_threads", "2", "-thread_queue_size", "1024"] + _input("program") + [
         "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
         "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0", *codec,
@@ -2265,7 +2428,7 @@ def _start(targets, profile, record, title, session=None):
 
 def _start_output(targets, profile, token, record=False, title="", session=None):
     """Start relay + encoder (and the requested destinations / recording) from cold."""
-    global _want_stream, _state, _profile, _retry_at, _retries, _hw_warning
+    global _want_stream, _state, _profile, _retry_at, _retries, _hw_warning, _relay_hw_failed
     if profile not in PROFILES:
         return False, "Invalid quality profile"
     if _want_stream:
@@ -2310,6 +2473,7 @@ def _start_output(targets, profile, token, record=False, title="", session=None)
         if _want_stream:
             return False, "Stream is already starting or running; stop before changing settings"
         _hw_warning = ""  # every broadcast tries the chosen encoder afresh
+        _relay_hw_failed = False
         try:
             _launch_encoder()
         except OSError:
@@ -2653,7 +2817,7 @@ def _supervise_recorder(now):
             _disk_check_at = now + 10
             # Stop while the parts can still be joined: that needs their size once more.
             room = recordings.room_left(session)
-            minutes = recordings.minutes_left(room, _profile)
+            minutes = recordings.minutes_left(room, _profile, _iso_bytes_per_hour())
             if not room:
                 logger.error("Disk almost full; stopping the recording")
                 stop_recording()

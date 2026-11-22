@@ -95,8 +95,10 @@ def room_left(sid=None):
     return max(0, int((free_bytes() - written - JOIN_MARGIN - MIN_FREE_KEEP) // 2))
 
 
-def minutes_left(room, profile):
-    return int(room / BYTES_PER_HOUR.get(profile, max(BYTES_PER_HOUR.values())) * 60)
+def minutes_left(room, profile, extra_bytes_per_hour=0):
+    """Minutes of recording that fit; extra: cameras recorded on their own as well."""
+    per_hour = BYTES_PER_HOUR.get(profile, max(BYTES_PER_HOUR.values())) + extra_bytes_per_hour
+    return int(room / per_hour * 60)
 
 
 def _slug(text):
@@ -344,6 +346,34 @@ def _live_window_at(session, offset):
                 and window["offset"] <= offset <= window["offset"] + window["duration"]:
             return window
     return None
+
+
+def add_cut(sid, camera, source, mode="single", secondary=None, wall=None):
+    """Log what went on air: camera (or "replay"), who chose it (start, manual, auto, replay)
+    and the layout, at its place on the recording timeline and in wall-clock time."""
+    wall = _now() if wall is None else wall
+    offset = written_duration(sid)
+    with _lock:
+        session = _load(sid)
+        cuts = session.setdefault("cuts", [])
+        cuts.append({"t": round(wall, 3), "offset": round(offset, 2), "camera": camera, "source": source,
+                     "mode": mode, "secondary": secondary})
+        _save(session)
+        return cuts[-1]
+
+
+def cuts(sid):
+    with _lock:
+        return list(_load(sid).get("cuts", []))
+
+
+def cuts_csv(sid):
+    rows = ["time,offset_s,wall_clock,camera,source,layout,second_camera"]
+    for c in cuts(sid):
+        clock = datetime.fromtimestamp(c["t"]).isoformat(timespec="milliseconds")
+        rows.append(f"{_timestamp(c['offset'])},{c['offset']},{clock},{c['camera']},{c['source']},"
+                    f"{c['mode']},{c['secondary'] or ''}")
+    return "\n".join(rows) + "\n"
 
 
 def add_marker(sid, label="Highlight", clock="", score="", wall=None, auto=None):
@@ -674,14 +704,15 @@ def finalize(sid, timeout=3600):
             raise RuntimeError("Joined file is empty")
         os.replace(tmp, folder / name)
         duration = _probe_duration(folder / name)
+        # The side files first: "done" means everything of the session is saved.
+        _finish_live_windows(sid)
+        _finish_iso_parts(sid)
         with _lock:
             session = _load(sid)
             session.update(file=name, state="done", duration=duration, error="")
             _save(session)
         for part in parts:
             (folder / part["file"]).unlink(missing_ok=True)
-        _finish_live_windows(sid)
-        _finish_iso_parts(sid)
         logger.info("Recording %s saved as %s", sid, name)
         return True, name
     except Exception as exc:
@@ -776,6 +807,7 @@ def describe(session, live_wall=None):
             "file": session.get("file"), "duration": round(duration or 0.0, 1),
             "bytes": _size(folder), "markers": markers,
             "reel": "highlights.mp4" if (folder / "highlights.mp4").exists() else None,
+            "cuts": len(session.get("cuts", [])),
             "live": [{"id": w["id"], "camera": w["camera"], "time": _timestamp(w["offset"]),
                       "offset": w["offset"], "duration": w["duration"], "file": w["mp4"] or w["file"]}
                      for w in session.get("live", []) if w["duration"] and (folder / (w["mp4"] or w["file"])).exists()],

@@ -148,7 +148,22 @@ destination and the recorder copy it from there.
   on its own (copy only, on air or not) into `recordings/<id>/iso/`, a new part after
   each reconnect. When the recording is saved they become MP4s, listed under
   "🎤 Reporting cameras" with their start time in the match recording.
-- **Names and positions** of all cameras are edited on their cards in 🎥 Cams.
+- **Names and positions** of all cameras are edited on their cards in 🎥 Cams. Match
+  cameras also have a **mount** (📌 fixed, 🤖 tracking — XbotGo or gimbal, ✋ handheld)
+  and one may be the **🔭 wide shot** (the fallback when nobody sees the ball). Both
+  are for automatic cutting later.
+
+### Material for automatic cutting
+
+- **📹 Also record each match camera separately** (Live Stream & Recording panel, saved
+  in `data/recording.json`): every publishing match camera is recorded as it arrives
+  (copy only, no CPU; about 2.7 GB per hour per camera at 6 Mbit/s) next to the
+  broadcast, like the reporting cameras. The recording-time estimate counts them.
+- **Cut log:** every change of what is on air (camera, replay, layout) is logged in the
+  session with its place on the recording timeline, wall-clock time and who chose it
+  (`start`, `manual`, `auto`, `replay`). Download it as CSV from the recording's card
+  (✂ … cuts logged). Together with the separate camera files these are the reference
+  for testing an automatic camera choice against the operator's.
 - GO LIVE starts on a match camera; a reporting camera only if no match camera publishes.
 
 ### Camera input settings (RTMP or SRT)
@@ -198,10 +213,19 @@ of Facebook's and YouTube's recommended 720p range. With Facebook, depending on 
 key was created, the broadcast may only become public after **Go live** in Live Producer.
 Upload is the limit: three platforms at 720p need about 12.4 Mbps of steady upload.
 
-*Use graphics chip (less CPU)* next to the quality setting encodes on the laptop's graphics
-chip (Intel/AMD, VAAPI) instead of the processor: about a third of the encoder's CPU load,
-a slightly softer picture at the same bitrate. It is tested when you tick it, applies from
-the next start, and a failing chip falls back to the normal encoder automatically.
+**Encoder** next to the quality setting:
+
+- *Software (CPU)* — the default.
+- *Intel graphics* (VAAPI) — the final picture on the Intel/AMD chip: about a third of
+  the encoder's CPU load, a slightly softer picture at the same bitrate.
+- *NVIDIA GPU* (NVENC) — the camera relays (re-encoded at every cut) **and** the final
+  picture on the NVIDIA GPU; cameras are also decoded on the GPU. Measured on this
+  laptop (RTX 2000 Ada, two 1080p cameras, record-only): relay + encoder CPU at 1080p
+  141 % → 41 % of one core, at 720p 103 % → 63 %; cut time unchanged (~1.6 s).
+
+The choice is tested when you pick it. Relays use it from the next cut, the final
+encoder from the next start. A failing hardware encoder falls back to software at once
+(an NVIDIA relay that does not start is retried in software within the same cut).
 
 The final encoder uses two filter threads, six H.264 encoder threads, and explicit
 YUV420 overlay composition to reduce CPU overhead. Resolution, bitrate, the
@@ -371,7 +395,9 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/network/hotspot-start` | Start/update owned hotspot with `ssid`, `password` |
 | POST | `/api/network/hotspot-stop` | Stop owned hotspot only |
 | POST | `/api/stream/start` | `destinations`: `{youtube\|facebook\|twitch\|custom: {key, server?}}` (or legacy `stream_key` = YouTube), optional `profile`: `1080p`, `720p` or `480p`, `record`: also record. While live, adds platforms not yet running |
-| POST | `/api/encoder` | `hardware`: true or false — encode the final picture on the graphics chip (VAAPI) or in software (default). Applies from the next start; falls back to software if the chip fails |
+| POST | `/api/encoder` | `encoder`: `software` (default), `intel` (VAAPI, final picture) or `nvidia` (NVENC: relays + final picture). The older `hardware`: true/false means intel/software. Falls back to software if the chip fails |
+| POST | `/api/recording/match-cameras` | `on`: true/false — also record every match camera separately |
+| GET | `/recordings/<id>/cuts.csv` | The session's cut log |
 | POST | `/api/stream/stop` | Stop all platforms, or one with `destination` (a recording continues) |
 | POST | `/api/recording/start` | Record to this laptop, optional `profile`; adds to a running stream |
 | POST | `/api/recording/stop` | Stop recording and save the MP4 (streaming continues) |

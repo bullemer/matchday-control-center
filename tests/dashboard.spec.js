@@ -697,19 +697,45 @@ test('CAM REPLAY: scrub the recording, play from a moment and stay on air until 
   await page.locator('section[data-tab="main"]').getByRole('button', {name: '⏹ Stop recording'}).click();
 });
 
-test('graphics chip option asks the server and undoes the tick when it is refused', async ({page}) => {
+test('encoder choice asks the server and goes back when it is refused', async ({page}) => {
   await page.goto('/');
-  const box = page.locator('#hw-encode');
-  await expect(box).not.toBeChecked();
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  const select = page.locator('#hw-encode');
+  await expect(select).toHaveValue('software');
   let asked = null;
   await page.route('**/api/encoder', route => {
     asked = route.request().postDataJSON();
-    route.fulfill({status: 409, json: {ok: false, message: 'The graphics chip of this laptop cannot encode the stream; staying on the software encoder'}});
+    route.fulfill({status: 409, json: {ok: false, message: 'No working NVIDIA encoder found; staying on the current encoder'}});
   });
-  await box.click();
-  await expect(page.locator('body')).toContainText('cannot encode the stream');
-  expect(asked).toEqual({hardware: true});
-  await expect(box).not.toBeChecked();
+  await select.selectOption('nvidia');
+  await expect(page.locator('body')).toContainText('No working NVIDIA encoder');
+  expect(asked).toEqual({encoder: 'nvidia'});
+  await expect(select).toHaveValue('software');
+});
+
+test('match camera mount, wide shot, separate recording switch', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('[data-tab-btn="cams"]').click();
+  await expect(page.locator('[data-cam-edit="mount"]')).toHaveCount(4);  // match cameras only
+  const mount = page.waitForRequest(r => r.url().endsWith('/api/cameras/cam3') && r.postDataJSON().mount === 'tracking');
+  await page.locator('[data-cam-edit="mount"][data-cam="cam3"]').selectOption('tracking');
+  await mount;
+  await page.locator('[data-cam-edit="wide"][data-cam="cam1"]').check();
+  await page.locator('[data-cam-edit="wide"][data-cam="cam2"]').check();
+  await expect(page.locator('[data-cam-edit="wide"][data-cam="cam1"]')).not.toBeChecked();  // one wide shot
+  await page.locator('[data-tab-btn="main"]').click();
+  let iso = null;
+  await page.route('**/api/recording/match-cameras', route => {
+    iso = route.request().postDataJSON();
+    route.fulfill({json: {ok: true, message: 'Match cameras are recorded separately too', recording: {active: false, iso_match: true}}});
+  });
+  await page.locator('#iso-match').check();
+  await expect(page.locator('body')).toContainText('recorded separately too');
+  expect(iso).toEqual({on: true});
+  expect(errors).toEqual([]);
 });
 
 test('output preview, added time and microphone delay', async ({page}) => {

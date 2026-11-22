@@ -557,6 +557,21 @@
                    onchange="saveCameraInfo('{{ cam.id }}', 'position', this.value)" class="dest-input text-xs"
                    placeholder="{{ 'Position, e.g. left goal' if role == 'match' else 'e.g. clubhouse' }}">
           </div>
+          {% if role == 'match' %}
+          <div class="grid grid-cols-2 gap-2 mb-2 text-xs items-center">
+            <select data-cam-edit="mount" data-cam="{{ cam.id }}" aria-label="{{ cam.label }} mount"
+                    onchange="saveCameraInfo('{{ cam.id }}', 'mount', this.value)" class="dest-input text-xs py-1"
+                    title="How the camera moves: matters for automatic cutting">
+              <option value="fixed" {{ 'selected' if cam.mount == 'fixed' else '' }}>📌 Fixed</option>
+              <option value="tracking" {{ 'selected' if cam.mount == 'tracking' else '' }}>🤖 Tracking (XbotGo, gimbal)</option>
+              <option value="handheld" {{ 'selected' if cam.mount == 'handheld' else '' }}>✋ Handheld</option>
+            </select>
+            <label class="flex items-center gap-1 text-slate-300" title="The shot to use when nobody sees the ball (one camera)">
+              <input type="checkbox" data-cam-edit="wide" data-cam="{{ cam.id }}" {{ 'checked' if cam.wide else '' }}
+                     onchange="saveCameraInfo('{{ cam.id }}', 'wide', this.checked)"> 🔭 Wide shot
+            </label>
+          </div>
+          {% endif %}
           {% if role == 'report' %}
           <label class="flex items-center gap-2 text-xs text-slate-300 mb-2">
             <input type="checkbox" data-report-sound="{{ cam.id }}" checked onchange="setReportSound('{{ cam.id }}', this.checked)">
@@ -946,10 +961,12 @@
         <div class="flex flex-wrap items-center gap-2">
           <label for="quality-profile" class="text-sm text-slate-400">Quality</label>
           <select id="quality-profile" aria-label="Stream quality" onchange="renderDestinations()" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
-          <label class="flex items-center gap-1.5 text-sm text-slate-300 cursor-pointer" title="Encodes the picture on the graphics chip instead of the processor: much less CPU load, slightly softer picture. Falls back to the normal encoder if it fails.">
-            <input type="checkbox" id="hw-encode" onchange="setHardwareEncoding(this)" class="w-4 h-4 rounded">
-            Use graphics chip (less CPU)
-          </label>
+          <label for="hw-encode" class="text-sm text-slate-400" title="Where the picture is encoded. NVIDIA GPU: the camera relays and the final picture, least CPU. Intel graphics: the final picture only. Falls back to software if it fails.">Encoder</label>
+          <select id="hw-encode" aria-label="Encoder" onchange="setHardwareEncoding(this)" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600">
+            <option value="software">Software (CPU)</option>
+            <option value="intel">Intel graphics (less CPU)</option>
+            <option value="nvidia">NVIDIA GPU (least CPU)</option>
+          </select>
           <span id="hw-encode-note" class="hidden text-xs font-semibold text-brand-amber"></span>
         </div>
         <!-- Streaming destinations: each its own connection, all at the same time -->
@@ -1026,6 +1043,11 @@
             <button data-when-recording onclick="stopRecording()" class="rec-btn hidden">⏹ Stop recording</button>
             <button data-when-recording onclick="markHighlight()" class="mark-btn hidden">⭐ Mark highlight</button>
           </div>
+          <label class="flex items-center gap-2 text-sm text-slate-300 cursor-pointer"
+                 title="For automatic cutting later: each match camera is also saved as it arrives (copy only, no CPU). About 2.7 GB per hour per camera at 6 Mbit/s.">
+            <input id="iso-match" type="checkbox" role="switch" class="overlay-switch" onchange="setIsoMatch(this)">
+            📹 Also record each match camera separately (for automatic cutting)
+          </label>
           <p class="text-xs text-slate-500">Records the broadcast picture with scoreboard. During a replay the live camera is recorded separately. Goals are marked automatically; recordings, clips and chapters are in the 🎬 Recordings tab.</p>
         </div>
         <!-- Duration Timer -->
@@ -1735,6 +1757,8 @@
 
     function renderRecording(rec) {
       const r = state.recording = rec || {active: false};
+      const isoBox = document.getElementById('iso-match');
+      if (isoBox && !isoBox.disabled && 'iso_match' in r) isoBox.checked = !!r.iso_match;
       const live = state.ytLive || ['starting', 'live', 'reconnecting'].includes(state.streamState);
       document.getElementById('status-rec-badge').classList.toggle('hidden', !r.active);
       document.querySelectorAll('[data-rec-badge]').forEach(el => el.classList.toggle('hidden', !r.active));
@@ -1751,15 +1775,17 @@
     }
 
     let hwPending = false;
-    async function setHardwareEncoding(box) {
+    let encoderKind = 'software';
+    async function setHardwareEncoding(select) {
       hwPending = true;
-      box.disabled = true;
+      select.disabled = true;
       try {
-        const {ok, data} = await apiRequest('/api/encoder', {hardware: box.checked});
-        if (!ok) box.checked = !box.checked;
+        const {ok, data} = await apiRequest('/api/encoder', {encoder: select.value});
+        if (!ok) select.value = encoderKind;
+        else encoderKind = select.value;
         showToast(data.message || data.error || 'Could not change the encoder', ok ? 'success' : 'error');
       } finally {
-        box.disabled = false;
+        select.disabled = false;
         hwPending = false;
       }
     }
@@ -1767,10 +1793,22 @@
     function renderEncoder(encoder) {
       if (!encoder) return;
       const box = document.getElementById('hw-encode'), note = document.getElementById('hw-encode-note');
-      if (!hwPending) box.checked = !!encoder.hardware;
-      const pending = encoder.active && (encoder.active === 'hardware') !== !!encoder.hardware && !encoder.warning;
+      encoderKind = encoder.kind || (encoder.hardware ? 'intel' : 'software');
+      if (!hwPending) box.value = encoderKind;
+      const nvidia = box.querySelector('option[value="nvidia"]');
+      if (nvidia) nvidia.disabled = encoder.nvidia === false && encoderKind !== 'nvidia';
+      const pending = encoder.active && encoder.active !== encoderKind && !encoder.warning;
       note.textContent = encoder.warning ? '⚠ ' + encoder.warning : pending ? 'applies from the next start' : '';
       note.classList.toggle('hidden', !note.textContent);
+    }
+
+    async function setIsoMatch(box) {
+      box.disabled = true;
+      try {
+        const {ok, data} = await apiRequest('/api/recording/match-cameras', {on: box.checked});
+        if (!ok) box.checked = !box.checked;
+        showToast(data.message || data.error || 'Could not change the setting', ok ? 'success' : 'error');
+      } finally { box.disabled = false; }
     }
 
     async function startRecording() {
@@ -1948,14 +1986,14 @@
       // Reporting cameras are recorded on their own, on air or not (interviews for later).
       if (!(rec.iso || []).length) return '';
       const rows = rec.iso.map(p => `<li class="marker-row">
-          <span class="text-sm text-white">🎤 ${esc(camLabel(p.camera))}</span>
+          <span class="text-sm text-white">${REPORT_IDS.includes(p.camera) ? '🎤' : '📹'} ${esc(camLabel(p.camera))}</span>
           <span class="text-xs text-slate-400">${p.recording ? 'recording…' : (p.time ? 'from ' + esc(p.time) + ' · ' : '') + fmtDuration(p.duration)}</span>
           ${p.recording ? '' : `<span class="ml-auto flex gap-1">
             <button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, p.file))}')" aria-label="Play reporting camera">▶</button>
             <a class="rec-action" href="${esc(recordingUrl(rec.id, p.file, true))}" aria-label="Download reporting camera">⬇</a></span>`}
         </li>`).join('');
-      return `<h4 class="text-sm font-semibold text-slate-300">🎤 Reporting cameras</h4>
-        <p class="text-xs text-slate-400">Everything the reporting cameras filmed, also when not on air. "from" is the time in the match recording.</p>
+      return `<h4 class="text-sm font-semibold text-slate-300">📹 Cameras recorded separately</h4>
+        <p class="text-xs text-slate-400">What each camera filmed, also when not on air (reporting cameras always, match cameras when chosen). "from" is the time in the match recording.</p>
         <ul class="space-y-1">${rows}</ul>`;
     }
 
@@ -2043,7 +2081,7 @@
         ${actions ? `<div class="flex flex-wrap gap-2">${actions}</div>` : ''}
         <div data-player></div>
         <h4 class="text-sm font-semibold text-slate-300">⭐ Highlights</h4>
-        ${markers}${chapters}${liveWindows(rec)}${isoFiles(rec)}`;
+        ${markers}${chapters}${liveWindows(rec)}${isoFiles(rec)}${rec.cuts ? `<p class="text-xs text-slate-400">✂ ${rec.cuts} cuts logged · <a class="underline" href="${esc('/recordings/' + encodeURIComponent(rec.id) + '/cuts.csv')}">download cut log (CSV)</a></p>` : ''}`;
     }
 
     let recordingsBusy = false;

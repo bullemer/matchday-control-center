@@ -124,7 +124,9 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(self.post('/api/encoder',{'hardware':'yes'}).status_code,400)
         with patch.object(a,'set_hardware_encoding',return_value=(False,'cannot')) as choose:
             self.assertEqual(self.post('/api/encoder',{'hardware':True}).status_code,409)
-            choose.assert_called_once_with(True)
+            choose.assert_called_once_with('intel')  # the older on/off form means the Intel chip
+            self.post('/api/encoder',{'encoder':'nvidia'})
+            choose.assert_called_with('nvidia')
         with patch.object(a,'set_hardware_encoding',return_value=(True,'Hardware encoding on')):
             r=self.post('/api/encoder',{'hardware':True})
             self.assertEqual((r.status_code,r.get_json()['message']),(200,'Hardware encoding on'))
@@ -888,37 +890,42 @@ class MediaTests(unittest.TestCase):
             m._launch_encoder()
             soft=proc.call_args.args[0]
             self.assertIn('libx264',soft); self.assertNotIn('-vaapi_device',soft); self.assertFalse(m._encoder_hw)
-            with patch.object(m,'_hw_wanted',True),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning',''):
+            with patch.object(m,'_hw_wanted','intel'),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning',''):
                 m._launch_encoder()
                 hard=proc.call_args.args[0]
                 self.assertTrue(m._encoder_hw)
-                self.assertEqual(m.get_encoder_status(),{'hardware':True,'warning':'','active':'hardware'})
+                status=m.get_encoder_status()
+                self.assertEqual((status['hardware'],status['kind'],status['warning'],status['active']),(True,'intel','','intel'))
             self.assertEqual(hard[hard.index('-vaapi_device')+1],'/dev/dri/renderD128')
             self.assertLess(hard.index('-vaapi_device'),hard.index('-i'))
             self.assertEqual(hard[hard.index('-c:v')+1],'h264_vaapi'); self.assertNotIn('libx264',hard); self.assertNotIn('-pix_fmt',hard)
             self.assertTrue(hard[hard.index('-filter_complex')+1].endswith('format=nv12,hwupload[vout]'))
             self.assertEqual((hard[hard.index('-b:v')+1],hard[hard.index('-g')+1],hard[-1]),('4000k','60',m.RTSP_BASE+'/final'))
             # a failed hardware encoder is not tried again in this broadcast
-            with patch.object(m,'_hw_wanted',True),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning','failed'):
+            with patch.object(m,'_hw_wanted','intel'),patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_hw_warning','failed'):
                 m._launch_encoder()
             self.assertIn('libx264',proc.call_args.args[0])
 
     def test_hardware_encoding_is_refused_when_the_test_encode_fails(self):
         with tempfile.TemporaryDirectory() as tmp,patch.object(m,'ENCODER_SETTING',Path(tmp)/'encoder.json'),\
-                patch.object(m,'_hw_wanted',False),patch.object(m,'_hw_device',None),patch.object(m,'_hw_warning',''):
+                patch.object(m,'_hw_wanted','software'),patch.object(m,'_hw_device',None),patch.object(m,'_hw_warning',''):
             with patch.object(m,'_find_hw_device',return_value=None):
                 ok,message=m.set_hardware_encoding(True)
-                self.assertFalse(ok); self.assertIn('software encoder',message); self.assertFalse(m._hw_wanted)
+                self.assertFalse(ok); self.assertIn('staying on the current encoder',message); self.assertEqual(m._hw_wanted,'software')
                 self.assertFalse(m.ENCODER_SETTING.exists())
             with patch.object(m,'_find_hw_device',return_value='/dev/dri/renderD129'):
-                self.assertEqual(m.set_hardware_encoding(True),(True,'Hardware encoding on'))
-                self.assertEqual((m._hw_wanted,m._hw_device),(True,'/dev/dri/renderD129'))
-                m._hw_wanted=False
+                self.assertEqual(m.set_hardware_encoding(True),(True,'Intel graphics encoding on'))
+                self.assertEqual((m._hw_wanted,m._hw_device),('intel','/dev/dri/renderD129'))
+                m._hw_wanted='software'
                 m.load_encoder_setting()  # the saved choice comes back after a restart
-                self.assertTrue(m._hw_wanted)
+                self.assertEqual(m._hw_wanted,'intel')
                 with patch.object(m,'_want_stream',True):
                     self.assertIn('next start',m.set_hardware_encoding(False)[1])
-                self.assertFalse(m._hw_wanted)
+                self.assertEqual(m._hw_wanted,'software')
+            m.ENCODER_SETTING.write_text('{"hardware": true}')  # saved before the NVIDIA option existed
+            with patch.object(m,'_find_hw_device',return_value='/dev/dri/renderD129'):
+                m.load_encoder_setting()
+            self.assertEqual(m._hw_wanted,'intel')
 
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
@@ -1034,7 +1041,7 @@ class ConcurrencyRegressionTests(unittest.TestCase):
                       _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _audio_warning='', _generation=0, _stop_generation=0,
                       _pending_camera=None, _follow=False, _profile='720p', _relay_profile='720p',
-                      _errors={}, _error_since={}, _hw_wanted=False, _hw_device=None, _hw_warning='', _encoder_hw=False,
+                      _errors={}, _error_since={}, _hw_wanted='software', _hw_device=None, _hw_warning='', _encoder_hw=False,
                       _mix={c:{'on':c=='cam1','gain':0.0} for c in m.CAMERA_IDS})
         for key, value in values.items():
             self.stack.enter_context(patch.object(m, key, value))
@@ -1132,7 +1139,7 @@ class ConcurrencyRegressionTests(unittest.TestCase):
     def test_failed_hardware_encoder_falls_back_to_software_at_once(self):
         m._want_stream=True
         dead=MagicMock(); dead.healthy.return_value=False; dead.poll.return_value=1; dead.error='vaapi: no device'
-        with patch.object(m,'_encoder_proc',dead),patch.object(m,'_encoder_hw',True),patch.object(m,'_hw_wanted',True),\
+        with patch.object(m,'_encoder_proc',dead),patch.object(m,'_encoder_hw',True),patch.object(m,'_hw_wanted','intel'),\
                 patch.object(m,'_hw_device','/dev/dri/renderD128'),patch.object(m,'_kill_process'),\
                 patch.object(m,'_retry_at',m.time.monotonic()+60),patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'):
             m._supervise_encoder()
@@ -1185,7 +1192,7 @@ class EngineStateCase(unittest.TestCase):
                       _recording=None, _started_at=None, _generation=0,
                       _stop_generation=0, _pending_camera=None, _relay_channels={}, _relay_muted=set(),
                       _relay_missing=set(), _profile='720p', _relay_profile='720p', _record_warning='',
-                      _errors={}, _error_since={}, _hw_wanted=False, _hw_device=None, _hw_warning='', _encoder_hw=False)
+                      _errors={}, _error_since={}, _hw_wanted='software', _hw_device=None, _hw_warning='', _encoder_hw=False)
         for key, value in values.items():
             self.stack.enter_context(patch.object(m, key, value))
         self.kill = self.stack.enter_context(patch.object(m, '_kill_process'))

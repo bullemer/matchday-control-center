@@ -35,7 +35,8 @@ class CameraListTests(unittest.TestCase):
             self.assertFalse(m.set_camera_info('cam9', label='x')[0])
 
     def test_every_camera_may_publish(self):
-        config = json.loads(Path(m.generate_mediamtx_config()).read_text())
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m, 'MEDIAMTX_CONFIG', tmp + '/mtx.yml'):
+            config = json.loads(Path(m.generate_mediamtx_config()).read_text())
         self.assertEqual(config['authInternalUsers'][0]['permissions'][0]['path'], '~^(cam1|cam2|cam3|cam4|cam5|cam6)$')
         self.assertTrue(all(config['paths'][c]['overridePublisher'] for c in m.CAMERA_IDS))
 
@@ -405,6 +406,144 @@ class CameraLinkApiTests(unittest.TestCase):
             self.assertEqual(self.post('/api/cameras/cam5', {'latency_ms': '400'}).status_code, 400)
             self.assertEqual(self.post('/api/cameras/cam5', {'encrypt': 'yes'}).status_code, 400)
         self.assertEqual(self.client.post('/api/cameras/cam5', json={'protocol': 'srt'}).status_code, 401)
+
+
+class NvidiaEncoderTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        for name, value in dict(ENCODER_SETTING=Path(tmp.name) / 'encoder.json', _hw_wanted='software', _hw_device=None,
+                                _hw_warning='', _relay_hw_failed=False, _nvenc_ok=None, _encoder_proc=None,
+                                _encoder_hw=False, _want_stream=False).items():
+            self.enterContext(patch.object(m, name, value))
+
+    def test_nvidia_is_refused_without_a_working_gpu(self):
+        with patch.object(m, '_test_nvenc', return_value=False):
+            ok, message = m.set_hardware_encoding('nvidia')
+        self.assertFalse(ok)
+        self.assertIn('NVIDIA', message)
+        self.assertEqual(m._hw_wanted, 'software')
+        self.assertFalse(m.set_hardware_encoding('quantum')[0])
+
+    def test_nvidia_encodes_final_picture_and_relays(self):
+        with patch.object(m, '_test_nvenc', return_value=True):
+            self.assertTrue(m.set_hardware_encoding('nvidia')[0])
+        self.assertEqual(json.loads(m.ENCODER_SETTING.read_text()), {'encoder': 'nvidia'})
+        with patch.object(m, 'Process') as proc, patch.object(m, 'ensure_frame'):
+            m._launch_encoder()
+        cmd = proc.call_args.args[0]
+        self.assertEqual(cmd[cmd.index('-c:v') + 1], 'h264_nvenc')
+        self.assertNotIn('-vaapi_device', cmd)
+        self.assertEqual(m._relay_video_codec()[:2], ['-c:v', 'h264_nvenc'])
+        with patch.object(m, '_probe', return_value={'video', 'audio'}), \
+                patch.object(m, '_layout', {'mode': 'single', 'main': 'cam1', 'secondary': 'cam5', 'position': 'top-right'}):
+            relay = m._relay_command('cam1', {})[0]
+        self.assertEqual(relay[relay.index('-c:v') + 1], 'h264_nvenc')
+        self.assertEqual(m.get_encoder_status()['relay'], 'nvidia')
+
+    def test_failed_nvidia_relay_retries_in_software(self):
+        with patch.object(m, '_test_nvenc', return_value=True):
+            m.set_hardware_encoding('nvidia')
+        self.assertTrue(m._relay_nvenc_failed('Relay did not produce frames'))
+        self.assertEqual(m._relay_video_codec()[1], 'libx264')
+        self.assertIn('relays use the software encoder', m.get_encoder_status()['warning'])
+        self.assertFalse(m._relay_nvenc_failed('Relay did not produce frames'))  # only once
+
+    def test_relay_failure_falls_back_within_the_same_cut(self):
+        with patch.object(m, '_test_nvenc', return_value=True):
+            m.set_hardware_encoding('nvidia')
+        codecs = []
+
+        def take_over(cmd, current):
+            codecs.append(cmd[cmd.index('-c:v') + 1])
+            return (None, 'nvenc: no capable devices') if len(codecs) == 1 else (MagicMock(), None)
+        with patch.object(m, '_probe', return_value={'video', 'audio'}), patch.object(m, '_take_over', side_effect=take_over), \
+                patch.object(m, '_await_retired'), patch.object(m, '_retire'), patch.object(m, '_log_cut'), \
+                patch.object(m, '_generation', 5), patch.object(m, '_relay_proc', None), patch.object(m, '_active_camera', None), \
+                patch.object(m, '_layout', {'mode': 'single', 'main': 'cam1', 'secondary': 'cam5', 'position': 'top-right'}):
+            ok, _ = m._replace_relay('cam1', 5)
+        self.assertTrue(ok)
+        self.assertEqual(codecs, ['h264_nvenc', 'libx264'])
+
+
+class MatchCameraIsoAndCutLogTests(EngineStateCase):
+    def setUp(self):
+        super().setUp()
+        for name, value in dict(_iso={}, _iso_retry={}, _iso_match=False, _cut_logged=None, _replay=None,
+                                _relay_secondary=None, _cut_source='manual', _layout=dict(m._layout),
+                                _camera_status={'cam1': True, 'cam2': True, 'cam5': True},
+                                RECORDING_SETTING=Path(self.tmp) / 'recording.json').items():
+            self.stack.enter_context(patch.object(m, name, value))
+        self.stack.enter_context(patch.object(m, 'Process', side_effect=lambda cmd, copy=False: MagicMock(
+            poll=MagicMock(return_value=None), first_progress=None, cmd=cmd)))
+        self.active = self.stack.enter_context(patch.object(m, 'get_active_camera', return_value='cam1'))
+
+    def test_match_cameras_recorded_separately_when_chosen(self):
+        self.running()
+        m._supervise_iso(1.0)
+        self.assertEqual(sorted(m._iso), ['cam5'])
+        self.assertTrue(m.set_iso_match(True)[0])
+        self.assertEqual(json.loads(m.RECORDING_SETTING.read_text()), {'match_cameras': True})
+        m._supervise_iso(2.0)
+        self.assertEqual(sorted(m._iso), ['cam1', 'cam2', 'cam5'])
+        self.assertTrue(m.get_recording_status()['iso_match'])
+        m.set_iso_match(False)
+        m._supervise_iso(3.0)
+        self.assertEqual(sorted(m._iso), ['cam5'])  # stopped at once
+        m._iso_match = False
+        m.load_recording_setting()
+        self.assertFalse(m._iso_match)
+
+    def test_separate_cameras_shorten_the_estimated_recording_time(self):
+        room = 10 * m.recordings.GB
+        self.assertLess(m.recordings.minutes_left(room, '720p', 4 * 6000 * 1000 / 8 * 3600),
+                        m.recordings.minutes_left(room, '720p'))
+
+    def test_cut_log_holds_start_cuts_layouts_and_replays(self):
+        self.running()
+        m._log_cut()
+        m._log_cut()  # nothing changed: nothing logged
+        self.active.return_value = 'cam2'
+        m._log_cut()
+        m._relay_secondary, m._layout = 'cam5', {**m._layout, 'mode': 'pip'}
+        m._log_cut()
+        m._replay = {'camera': 'cam2'}
+        m._log_cut('replay')
+        m._replay, m._relay_secondary, m._cut_source = None, None, 'auto'
+        self.active.return_value = 'cam1'
+        m._log_cut()
+        cuts = m.recordings.cuts(m._recording)
+        self.assertEqual([(c['camera'], c['source'], c['mode'], c['secondary']) for c in cuts],
+                         [('cam1', 'start', 'single', None), ('cam2', 'manual', 'single', None),
+                          ('cam2', 'manual', 'pip', 'cam5'), ('replay', 'replay', 'single', None),
+                          ('cam1', 'auto', 'single', None)])
+        csv = m.recordings.cuts_csv(m._recording).splitlines()
+        self.assertEqual(csv[0], 'time,offset_s,wall_clock,camera,source,layout,second_camera')
+        self.assertEqual(len(csv), 6)
+        self.assertEqual(m.recordings.get(m._recording)['cuts'], 5)
+
+    def test_no_cut_log_without_recording(self):
+        m._log_cut()
+        self.assertIsNone(m._cut_logged)
+
+
+class MountSettingTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.enterContext(patch.object(m, 'CAMERA_SETTING', Path(tmp.name) / 'cameras.json'))
+        self.enterContext(patch.object(m, '_camera_info', {}))
+        self.enterContext(patch.object(m, 'get_mediamtx_running', return_value=False))
+
+    def test_mount_and_one_wide_camera(self):
+        cams = {c['id']: c for c in m.get_cameras()}
+        self.assertEqual((cams['cam1']['mount'], cams['cam5']['mount'], cams['cam1']['wide']), ('fixed', 'handheld', False))
+        self.assertTrue(m.set_camera_info('cam3', mount='tracking')[0])
+        self.assertFalse(m.set_camera_info('cam3', mount='drone')[0])
+        m.set_camera_info('cam1', wide=True)
+        m.set_camera_info('cam2', wide=True)  # only one wide shot
+        cams = {c['id']: c for c in m.get_cameras()}
+        self.assertEqual([c for c in m.MATCH_CAMERAS if cams[c]['wide']], ['cam2'])
+        self.assertFalse(m.set_camera_info('cam5', wide=True)[0])
+        self.assertEqual(cams['cam3']['mount'], 'tracking')
 
 
 del ApiTests, EngineStateCase  # run the imported base tests once, in their own module
