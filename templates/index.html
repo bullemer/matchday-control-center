@@ -658,6 +658,8 @@
           <p data-cam-input="{{ cam.id }}" class="text-xs text-slate-400 mb-3 min-h-[1rem]"></p>
           <div data-phone-box="{{ cam.id }}" class="phone-status hidden items-center justify-between gap-2 text-xs mb-3 -mt-2">
             <span data-phone-info class="w-full text-slate-300"></span>
+            <span data-phone-zoom-off class="shrink-0 ml-auto text-slate-500" style="display:none"
+                  title="The phone is in Gimbal mode with auto zoom: the gimbal controls the zoom. For zoom from here choose Fixed wide or Reporter in the app (or switch auto zoom off).">🔒 zoom: gimbal</span>
             <span data-phone-zoom class="flex items-center gap-1 shrink-0 ml-auto" title="Zoom of the phone camera (Chameleon Stream app)">
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {wide: true})" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">Wide</button>
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: -1})" aria-label="{{ cam.label }} zoom out" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
@@ -738,6 +740,8 @@
           </div>
           <div data-phone-box="{{ cam.id }}" data-compact class="phone-status hidden items-center justify-between gap-1 text-xs mt-1">
             <span data-phone-info class="truncate text-slate-400"></span>
+            <span data-phone-zoom-off class="shrink-0 text-slate-500" style="display:none"
+                  title="The phone is in Gimbal mode with auto zoom: the gimbal controls the zoom. For zoom from here choose Fixed wide or Reporter in the app (or switch auto zoom off).">🔒 gimbal</span>
             <span data-phone-zoom class="flex items-center gap-0.5 shrink-0" title="Zoom of the phone camera">
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {wide: true})" title="Widest" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">W</button>
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: -1})" aria-label="{{ cam.label }} zoom out (preview)" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
@@ -2542,6 +2546,8 @@
           info.title = r.warning || '';
           info.className = (compact ? 'truncate ' : 'w-full ') + (r.warning ? 'text-brand-amber font-semibold' : compact ? 'text-slate-400' : 'text-slate-300');
           box.querySelector('[data-phone-zoom]').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
+          // Without remote zoom say why instead of silently hiding the buttons.
+          box.querySelector('[data-phone-zoom-off]').style.display = r.remote_zoom ? 'none' : '';
           const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
           if (shown != null) box.querySelector('[data-phone-zoom-value]').textContent = shown.toFixed(1) + '×';
         });
@@ -2584,6 +2590,7 @@
       // Gimbal with auto zoom: the gimbal decides, so no buttons.
       document.getElementById('match-zoom-buttons').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
       document.getElementById('match-zoom-auto').style.display = r.remote_zoom ? 'none' : '';
+      document.getElementById('match-zoom-auto').textContent = r.mode === 'gimbal' ? '🔒 zoom: gimbal' : 'auto zoom';
     }
     function cycleMatchZoomCam() {
       const phones = reportingPhones();

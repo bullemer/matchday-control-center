@@ -832,6 +832,12 @@ test('four match and two reporting cameras: cut row, keys, layout rule and camer
   await zoomed;
   await expect(panel.locator('#match-zoom-value')).toHaveText('0.8×');
   await expect(panel.locator('#match-zoom-auto')).toBeHidden();
+  // A phone without remote zoom (gimbal with auto zoom): the reason instead of buttons, everywhere.
+  await page.evaluate(() => renderCameraReports({cam1: {battery: 50, charging: false, temp_c: 35, thermal: 'none', mode: 'gimbal',
+    remote_zoom: false, zoom: 1.0, zoom_target: null, warning: '', age_s: 1}}));
+  await expect(panel.locator('#match-zoom-auto')).toHaveText('🔒 zoom: gimbal');
+  await expect(panel.locator('#match-zoom-buttons')).toBeHidden();
+  await expect(page.locator('[data-phone-box="cam1"][data-compact] [data-phone-zoom-off]')).toHaveText('🔒 gimbal');
   await page.screenshot({path:'/tmp/mcc-six-cameras.png'});
   // Keys 1-4 match cameras, 5-6 reporting cameras.
   const cut = page.waitForRequest('**/api/switch/cam5');
