@@ -604,12 +604,12 @@
           <p class="text-xs text-slate-400 mb-1">Set in the app: <span data-cam-recommended="{{ cam.id }}"></span></p>
           <code id="url-{{ cam.id }}" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-2 break-all select-all">rtmp://{{ media_host }}:1935/{{ cam.id }}{{ camera_query }}</code>
           <p data-cam-input="{{ cam.id }}" class="text-xs text-slate-400 mb-3 min-h-[1rem]"></p>
-          <div data-cam-phone="{{ cam.id }}" class="phone-status hidden items-center justify-between gap-2 text-xs mb-3 -mt-2">
-            <span data-cam-phone-info="{{ cam.id }}" class="w-full text-slate-300"></span>
-            <span data-cam-zoom="{{ cam.id }}" class="flex items-center gap-1 shrink-0 ml-auto" title="Zoom of the phone camera (Chameleon Stream app)">
+          <div data-phone-box="{{ cam.id }}" class="phone-status hidden items-center justify-between gap-2 text-xs mb-3 -mt-2">
+            <span data-phone-info class="w-full text-slate-300"></span>
+            <span data-phone-zoom class="flex items-center gap-1 shrink-0 ml-auto" title="Zoom of the phone camera (Chameleon Stream app)">
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {wide: true})" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">Wide</button>
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: -1})" aria-label="{{ cam.label }} zoom out" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
-              <span data-cam-zoom-value="{{ cam.id }}" class="w-12 text-center text-slate-200 font-mono"></span>
+              <span data-phone-zoom-value class="w-12 text-center text-slate-200 font-mono"></span>
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: 1})" aria-label="{{ cam.label }} zoom in" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">+</button>
             </span>
           </div>
@@ -672,6 +672,15 @@
           <div class="webrtc-frame border-2 border-slate-700" id="frame-{{ cam.id }}">
             <div class="preview-offline" data-offline="{{ cam.id }}">Camera offline</div>
             <iframe data-camera="{{ cam.id }}" data-preview="setup" data-src="http://{{ media_host }}:8889/{{ cam.id }}" allow="autoplay" loading="lazy"></iframe>
+          </div>
+          <div data-phone-box="{{ cam.id }}" data-compact class="phone-status hidden items-center justify-between gap-1 text-xs mt-1">
+            <span data-phone-info class="truncate text-slate-400"></span>
+            <span data-phone-zoom class="flex items-center gap-0.5 shrink-0" title="Zoom of the phone camera">
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {wide: true})" title="Widest" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">W</button>
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: -1})" aria-label="{{ cam.label }} zoom out (preview)" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
+              <span data-phone-zoom-value class="w-9 text-center text-slate-300 font-mono"></span>
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: 1})" aria-label="{{ cam.label }} zoom in (preview)" class="px-1.5 py-0.5 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">+</button>
+            </span>
           </div>
         </div>
         {% endfor %}
@@ -2054,29 +2063,32 @@
     // Phone status (battery, temperature) and remote zoom from the Chameleon Stream app.
     function renderCameraReports(reports) {
       for (const cam of CAMERA_IDS) {
-        const box = document.querySelector(`[data-cam-phone="${cam}"]`);
-        if (!box) continue;
         const r = reports[cam];
-        box.classList.toggle('shown', !!r);
-        if (!r) continue;
-        const parts = [];
-        if (r.battery != null) parts.push(`🔋 ${Math.round(r.battery)} %${r.charging ? ' ⚡' : ''}`);
-        if (r.temp_c != null) parts.push(`🌡 ${r.temp_c.toFixed(0)} °C`);
-        if (r.thermal && r.thermal !== 'none') parts.push(`heat: ${r.thermal}`);
-        if (r.mode) parts.push(r.mode === 'fixed' ? 'fixed wide' : r.mode);
-        const info = box.querySelector('[data-cam-phone-info]');
-        info.textContent = '📱 ' + parts.join(' · ') + (r.warning ? ' — ⚠ ' + r.warning : '');
-        info.className = 'w-full ' + (r.warning ? 'text-brand-amber font-semibold' : 'text-slate-300');
-        box.querySelector('[data-cam-zoom]').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
-        const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
-        if (shown != null) box.querySelector('[data-cam-zoom-value]').textContent = shown.toFixed(1) + '×';
+        document.querySelectorAll(`[data-phone-box="${cam}"]`).forEach(box => {
+          box.classList.toggle('shown', !!r);
+          if (!r) return;
+          const compact = 'compact' in box.dataset;  // preview tile: short line
+          const parts = [];
+          if (r.battery != null) parts.push(`🔋${compact ? '' : ' '}${Math.round(r.battery)} %${r.charging ? ' ⚡' : ''}`);
+          if (r.temp_c != null) parts.push(`🌡${compact ? '' : ' '}${r.temp_c.toFixed(0)}°${compact ? '' : ' C'}`);
+          if (!compact && r.thermal && r.thermal !== 'none') parts.push(`heat: ${r.thermal}`);
+          if (!compact && r.mode) parts.push(r.mode === 'fixed' ? 'fixed wide' : r.mode);
+          const info = box.querySelector('[data-phone-info]');
+          info.textContent = (compact ? (r.warning ? '⚠ ' : '') : '📱 ') + parts.join(compact ? ' ' : ' · ')
+            + (!compact && r.warning ? ' — ⚠ ' + r.warning : '');
+          info.title = r.warning || '';
+          info.className = (compact ? 'truncate ' : 'w-full ') + (r.warning ? 'text-brand-amber font-semibold' : compact ? 'text-slate-400' : 'text-slate-300');
+          box.querySelector('[data-phone-zoom]').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
+          const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
+          if (shown != null) box.querySelector('[data-phone-zoom-value]').textContent = shown.toFixed(1) + '×';
+        });
       }
     }
 
     async function cameraZoom(cam, body) {
       const {ok, data} = await apiRequest(`/api/cameras/${cam}/zoom`, body);
       if (!ok) return showToast('❌ ' + (data.error || 'Zoom failed'), 'error');
-      document.querySelector(`[data-cam-zoom-value="${cam}"]`).textContent = data.zoom.toFixed(1) + '×';
+      document.querySelectorAll(`[data-phone-box="${cam}"] [data-phone-zoom-value]`).forEach(el => el.textContent = data.zoom.toFixed(1) + '×');
     }
 
     async function setReportSound(cam, on) {
