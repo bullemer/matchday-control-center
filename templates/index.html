@@ -22,6 +22,10 @@
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
     body.match-mode main { padding-top: .5rem; }
+    /* Match mode on a phone: every pixel goes to the controls. The banner only shows a problem
+       (the header dots already say "connected"), the header is one row without the title. */
+    body.match-mode #connection-status[data-level="ok"] { display: none; }
+    @media (max-width: 639px) { body.match-mode header h1 { display: none; } }
     #match-panel .overlay-control { font-size: .75rem; white-space: nowrap; }
     .preview-offline { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; color: #94a3b8; font-size: .875rem; }
     .preview-offline[hidden] { display: none; }
@@ -3097,6 +3101,7 @@
       const banner = document.getElementById('connection-status');
       banner.textContent = text;
       banner.className = bannerStyles[level];
+      banner.dataset.level = level;
     }
 
     // ──────────────────────── Camera network ────────────────────────

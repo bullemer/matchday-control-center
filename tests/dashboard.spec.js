@@ -62,10 +62,13 @@ test('match mode puts sideline controls on one phone screen', async ({page}) => 
   await page.goto('/');
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await expect(page.locator('#match-panel')).toBeHidden();
-  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /:8889\/cam1$/);
+  // cam1 of the fake server is an H.265 SRT camera: the browser gets its H.264 preview copy.
+  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /:8889\/cam1_preview$/);
   await page.locator('#mode-toggle').click();
   await expect(page.locator('#match-panel')).toBeVisible();
   await expect(page.locator('#hotspot-ssid')).toBeHidden();
+  // A plain "Connected" banner gives way to the controls (the header dots show it); problems still show.
+  await expect(page.locator('#connection-status')).toBeHidden();
   // Hidden setup previews stop playing; only the program preview loads.
   await expect(page.locator('iframe[src]')).toHaveCount(1);
   await expect(page.locator('iframe[data-preview="match"]')).toHaveAttribute('src', /:8889\/program$/);
