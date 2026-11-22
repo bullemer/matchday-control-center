@@ -312,7 +312,8 @@ def api_camera_report(cam_id):
         return jsonify(ok=False, error="Camera password required"), 401
     if request.content_length and request.content_length > 4096:
         return jsonify(ok=False, error="Report too large"), 413
-    answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id))
+    answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id),
+                                          config=lambda: phone_config(cam_id))
     return jsonify(ok=True, **answer)
 
 
@@ -516,6 +517,20 @@ def _tally(cam_id):
         "returning": returning,
         "replay_hold": bool(replay and stream.get("replay", {}).get("hold")),
     }
+
+
+APP_MODES = {"fixed": "fixed", "tracking": "gimbal", "handheld": "reporter"}   # Cams tab mount -> app mode
+
+
+def phone_config(cam_id):
+    """What the dashboard's camera settings ask of a Chameleon Stream phone: app mode from
+    the mount, resolution and bitrate from the quality, SRT latency. (Not the passphrase:
+    the report endpoint needs no login.)"""
+    cam = next(c for c in get_cameras() if c["id"] == cam_id)
+    r = cam["recommended"]
+    width, height = (int(v) for v in r["size"].split("x"))
+    return {"mode": APP_MODES.get(cam.get("mount"), "fixed"), "width": width, "height": height,
+            "kbps": r["kbps"], "fps": r["fps"], "latency_ms": cam["latency_ms"]}
 
 
 def tally_state(cam_id):

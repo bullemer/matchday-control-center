@@ -110,6 +110,39 @@ class TallyLongPollTests(unittest.TestCase):
         self.assertNotIn('tally', cc.record_report('cam3', dict(REPORT), tally=broken))
 
 
+class ConfigLongPollTests(unittest.TestCase):
+    def setUp(self):
+        cc.reset()
+
+    def test_config_is_sent_and_a_change_wakes_the_phone(self):
+        cfg = {'mode': 'gimbal', 'width': 1920, 'height': 1080, 'kbps': 6000, 'fps': 30, 'latency_ms': 300}
+        b = cc._SEQ_BASE
+        first = cc.record_report('cam1', dict(REPORT), config=lambda: dict(cfg))
+        self.assertEqual(first['config'], cfg)
+        key = first['config_key']
+        # same config known: the phone waits
+        t0 = time.monotonic()
+        cc.record_report('cam1', dict(REPORT, wait=True, zoom_seq=b, config_key=key), hold=0.6, config=lambda: dict(cfg))
+        self.assertGreaterEqual(time.monotonic() - t0, 0.55)
+        # operator switches the mount to fixed: answered within the 0.5 s check
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(cc.record_report(
+            'cam1', dict(REPORT, wait=True, zoom_seq=b, config_key=key), hold=5, config=lambda: dict(cfg))))
+        thread.start(); time.sleep(0.2)
+        t1 = time.monotonic()
+        cfg['mode'] = 'fixed'
+        thread.join(3)
+        self.assertLess(time.monotonic() - t1, 1.5)
+        self.assertEqual(result['config']['mode'], 'fixed')
+        self.assertNotEqual(result['config_key'], key)
+
+    def test_phone_without_config_key_gets_it_at_once(self):
+        t0 = time.monotonic()
+        r = cc.record_report('cam1', dict(REPORT, wait=True, zoom_seq=cc._SEQ_BASE), hold=5, config=lambda: {'mode': 'fixed'})
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertEqual(r['config'], {'mode': 'fixed'})
+
+
 class CameraReportApiTests(unittest.TestCase):
     def setUp(self):
         import app as a
@@ -134,6 +167,12 @@ class CameraReportApiTests(unittest.TestCase):
         status = self.client.get('/api/status', headers=auth).get_json()
         self.assertEqual(status['camera_reports']['cam3']['zoom_target'], 0.75)
         self.assertEqual(self.client.post('/api/camera-report/cam3', json=dict(REPORT)).get_json()['tally'], '')
+        cfg = self.client.post('/api/camera-report/cam3', json=dict(REPORT)).get_json()['config']
+        self.assertEqual(set(cfg), {'mode', 'width', 'height', 'kbps', 'fps', 'latency_ms'})
+        with patch.object(self.a, 'get_cameras', return_value=[{'id': 'cam3', 'mount': 'tracking', 'latency_ms': 500,
+                                                                  'recommended': {'size': '1280x720', 'fps': 30, 'kbps': 1800}}]):
+            self.assertEqual(self.a.phone_config('cam3'), {'mode': 'gimbal', 'width': 1280, 'height': 720, 'kbps': 1800,
+                                                           'fps': 30, 'latency_ms': 500})
 
     def test_camera_password_is_required_when_set(self):
         with patch.object(self.a, 'camera_password', return_value='secret'):

@@ -8,6 +8,7 @@ about one request every 30 s, yet zoom and tally react immediately. The answer c
 applies each request once; a pinch on the phone is not undone). Nothing is pushed to the
 phone: it needs no server and works behind any router.
 """
+import json
 import math
 import threading
 import time
@@ -82,14 +83,21 @@ def warnings(report):
 TALLY_CHECK_S = 0.5      # how often a waiting request looks at the tally
 
 
-def record_report(cam, data, hold=None, tally=None):
+def _config_key(config):
+    return json.dumps(config, sort_keys=True) if config is not None else None
+
+
+def record_report(cam, data, hold=None, tally=None, config=None):
     """Store a phone's report; returns the answer for the phone. If the phone says which
     zoom request (zoom_seq) and tally it already has and wants to wait, the answer comes as
     soon as either changes, or after hold seconds. tally: callable returning the camera's
-    tally word (checked every TALLY_CHECK_S; it reads in-memory state only)."""
+    tally word (checked every TALLY_CHECK_S; it reads in-memory state only). config: callable
+    returning the settings the dashboard wants on this phone (mode, resolution, bitrate,
+    latency); a phone that has an older one (config_key) is answered at once."""
     report = clean_report(data)
     known = data.get("zoom_seq")
     known_tally = data.get("tally") if isinstance(data.get("tally"), str) else None
+    known_config = data.get("config_key") if isinstance(data.get("config_key"), str) else None
     wait = HOLD_S if hold is None else hold
     if data.get("wait") is not True or type(known) is not int:
         wait = 0
@@ -103,12 +111,17 @@ def record_report(cam, data, hold=None, tally=None):
             left = deadline - time.monotonic()
             now_tally = _safe_tally(tally)
             tally_changed = known_tally is not None and now_tally is not None and now_tally != known_tally
-            if seq != known or tally_changed or left <= 0:
+            now_config = _safe_tally(config)
+            config_changed = now_config is not None and _config_key(now_config) != known_config
+            if seq != known or tally_changed or config_changed or left <= 0:
                 answer = {"zoom": request["zoom"] if request else None, "zoom_seq": seq}
                 if now_tally is not None:
                     answer["tally"] = now_tally
+                if now_config is not None:
+                    answer["config"] = now_config
+                    answer["config_key"] = _config_key(now_config)
                 return answer
-            _changed.wait(min(left, TALLY_CHECK_S) if tally else left)
+            _changed.wait(min(left, TALLY_CHECK_S) if (tally or config) else left)
 
 
 def _safe_tally(tally):
