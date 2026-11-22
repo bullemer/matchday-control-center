@@ -204,6 +204,9 @@
     .meter-row.on-air .meter-label::before { content: "● "; color: #ef4444; }
     .meter-row.out { border-top: 1px solid #334155; padding-top: .5rem; }
 
+    /* − score + in one row (no Tailwind arbitrary values: the CSS is prebuilt) */
+    .score-row { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: .25rem; }
+
     /* Score button */
     .btn-score {
       min-width: 48px;
@@ -373,6 +376,17 @@
             <button id="match-preview-toggle" onclick="toggleMatchPreview()"
                     class="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-300">Hide preview</button>
           </div>
+          <div id="match-zoom" class="phone-status hidden items-center gap-1 text-xs mb-2" title="Zoom of a phone camera (Chameleon Stream app)">
+            <button type="button" id="match-zoom-cam" onclick="cycleMatchZoomCam()" title="Tap for the next phone camera"
+                    class="px-2 py-1 rounded bg-slate-900 border border-slate-600 text-slate-200 font-semibold">🔍 —</button>
+            <span id="match-zoom-info" class="flex-1 min-w-0 truncate text-slate-400"></span>
+            <span id="match-zoom-buttons" class="flex items-center gap-1 shrink-0">
+              <button type="button" onclick="matchZoom({wide: true})" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">W</button>
+              <button type="button" onclick="matchZoom({step: -1})" aria-label="match zoom out" class="px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
+              <span id="match-zoom-value" class="w-10 text-center text-slate-200 font-mono"></span>
+              <button type="button" onclick="matchZoom({step: 1})" aria-label="match zoom in" class="px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">+</button>
+            </span>
+          </div>
           <div id="match-preview" class="webrtc-frame border-2 border-red-900">
             <iframe data-preview="match" data-program data-src="http://{{ media_host }}:8889/program" allow="autoplay"></iframe>
           </div>
@@ -415,11 +429,12 @@
           {% for team in ['home', 'away'] %}
           <div class="text-center min-w-0">
             <button data-bind="{{ team }}_name" onclick="renameTeam('{{ team }}')" title="Tap to rename"
-                    class="w-full text-sm font-semibold text-slate-300 truncate underline decoration-dotted underline-offset-4">{{ team|upper }}</button>
-            <div data-bind="{{ team }}_score" class="text-5xl font-extrabold tabular-nums text-white my-1">0</div>
-            <div class="grid grid-cols-2 gap-2">
+                    class="w-full text-sm font-semibold text-slate-300 truncate underline decoration-dotted underline-offset-4">{{ 'Home' if team == 'home' else 'Guest' }}</button>
+            <!-- one row: − score + (keeps the match panel on one phone screen) -->
+            <div class="score-row mt-1">
               <button onclick="adjustScore('{{ team }}', -1)" aria-label="{{ team }} minus one"
                       class="btn-score bg-slate-700 hover:bg-slate-600 text-red-400 rounded-lg">−</button>
+              <div data-bind="{{ team }}_score" class="text-5xl font-extrabold tabular-nums text-white leading-none">0</div>
               <button onclick="adjustScore('{{ team }}', 1)" aria-label="{{ team }} goal"
                       class="btn-score bg-brand-green hover:bg-green-600 text-white rounded-lg">+</button>
             </div>
@@ -1717,6 +1732,7 @@
       state.pendingCam = null;
       if (ok) {
         state.activeCam = state.selectedCam = data.active_camera;
+        renderMatchZoom();
         if (/\(.+\)$/.test(data.message || '')) showToast(data.message, 'warning');
       } else if (!data.superseded) {
         showToast(data.message || data.error || 'Cut failed', 'error');
@@ -2066,6 +2082,8 @@
 
     // Phone status (battery, temperature) and remote zoom from the Chameleon Stream app.
     function renderCameraReports(reports) {
+      lastReports = reports;
+      renderMatchZoom();
       for (const cam of CAMERA_IDS) {
         const r = reports[cam];
         document.querySelectorAll(`[data-phone-box="${cam}"]`).forEach(box => {
@@ -2087,6 +2105,53 @@
           if (shown != null) box.querySelector('[data-phone-zoom-value]').textContent = shown.toFixed(1) + '×';
         });
       }
+    }
+
+    // Match mode zoom row: the on-air camera if it is a reporting phone, else the chosen /
+    // first reporting phone; tapping the camera name goes to the next one.
+    let matchZoomChoice = null;
+    let lastReports = {};
+    function zoomablePhones() {
+      return CAMERA_IDS.filter(c => lastReports[c] && lastReports[c].remote_zoom);
+    }
+    function matchZoomCam() {
+      const phones = zoomablePhones();
+      if (!phones.length) return null;
+      if (matchZoomChoice && phones.includes(matchZoomChoice)) return matchZoomChoice;
+      const onAir = state.activeCam;
+      return phones.includes(onAir) ? onAir : phones[0];
+    }
+    function renderMatchZoom() {
+      const row = document.getElementById('match-zoom');
+      const cam = matchZoomCam();
+      row.classList.toggle('shown', !!cam);
+      if (!cam) return;
+      const r = lastReports[cam];
+      const label = document.querySelector(`[data-cam-label="${cam}"]`);
+      document.getElementById('match-zoom-cam').textContent = '🔍 ' + (label ? label.textContent : cam);
+      const info = document.getElementById('match-zoom-info');
+      const parts = [];
+      if (r.battery != null) parts.push(`🔋${Math.round(r.battery)} %${r.charging ? ' ⚡' : ''}`);
+      if (r.temp_c != null) parts.push(`🌡${r.temp_c.toFixed(0)}°`);
+      info.textContent = (r.warning ? '⚠ ' : '') + parts.join(' ');
+      info.title = r.warning || '';
+      info.className = 'flex-1 min-w-0 truncate ' + (r.warning ? 'text-brand-amber font-semibold' : 'text-slate-400');
+      const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
+      document.getElementById('match-zoom-value').textContent = shown != null ? shown.toFixed(1) + '×' : '';
+    }
+    function cycleMatchZoomCam() {
+      const phones = zoomablePhones();
+      if (phones.length < 2) return;
+      const cur = matchZoomCam();
+      matchZoomChoice = phones[(phones.indexOf(cur) + 1) % phones.length];
+      renderMatchZoom();
+    }
+    async function matchZoom(body) {
+      const cam = matchZoomCam();
+      if (!cam) return;
+      await cameraZoom(cam, body);
+      const v = document.querySelector(`[data-phone-box="${cam}"] [data-phone-zoom-value]`);
+      if (v) document.getElementById('match-zoom-value').textContent = v.textContent;
     }
 
     async function cameraZoom(cam, body) {
@@ -3281,6 +3346,7 @@
       state.selectedCam = stream.selected_camera || null;
       state.serverPendingCam = stream.pending_camera || null;
       updateTallyButtons();
+      renderMatchZoom();  // zoom row follows the on-air phone
 
       // --- USB Audio Devices (before the toggle so the picker can restore its value) ---
       if (data.audio_devices !== undefined) {

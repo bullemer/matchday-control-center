@@ -820,6 +820,16 @@ test('four match and two reporting cameras: cut row, keys, layout rule and camer
   const box = await panel.boundingBox();
   console.log('six-camera panel bottom', box.y + box.height, await page.evaluate(() => scrollY));
   expect(box.y + box.height).toBeLessThanOrEqual(844);
+  // The phone camera's zoom row is part of that screen (cam1 reports in the fake server).
+  const zoomRow = panel.locator('#match-zoom');
+  await expect(zoomRow).toBeVisible();
+  await expect(panel.locator('#match-zoom-cam')).toContainText('Cam 1');
+  await expect(panel.locator('#match-zoom-info')).toHaveText('🔋64 % 🌡38°');
+  await expect(panel.locator('#match-zoom-value')).toHaveText('0.6×');
+  const zoomed = page.waitForRequest(r => r.url().endsWith('/api/cameras/cam1/zoom') && r.postDataJSON().step === 1);
+  await panel.getByRole('button', {name: 'match zoom in'}).click();
+  await zoomed;
+  await expect(panel.locator('#match-zoom-value')).toHaveText('0.8×');
   await page.screenshot({path:'/tmp/mcc-six-cameras.png'});
   // Keys 1-4 match cameras, 5-6 reporting cameras.
   const cut = page.waitForRequest('**/api/switch/cam5');

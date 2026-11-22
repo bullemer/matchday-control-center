@@ -61,6 +61,16 @@ m.CAMERA_SETTING=Path(tempfile.mkdtemp())/'cameras.json'
 m.get_mediamtx_running=lambda: False
 a.get_camera_inputs=lambda: {'cam1':{'protocol':'srt','codec':'H265','width':1920,'height':1080,'kbps':5800,
                                      'loss_pct':0.4,'rtt_ms':9,'audio':True,'warning':''}}
+# cam1 is a Chameleon Stream phone that reports battery / temperature and allows remote zoom.
+phone={'battery':64.0,'charging':False,'temp_c':38.0,'thermal':'none','headroom':None,'zoom':0.6,'zoom_min':0.6,
+       'zoom_max':10.0,'remote_zoom':True,'mode':'fixed','app':'chameleon-stream test','age_s':1.0,'warning':'','zoom_target':None}
+zoom_calls=[]
+a.camera_control.get_reports=lambda: {'cam1':dict(phone)}
+def fake_zoom(cam, zoom=None, step=None, wide=False):
+    zoom_calls.append([cam, zoom, step, wide])
+    phone['zoom']=0.6 if wide else round(phone['zoom']*1.25**(step or 0),2) if step else zoom
+    return phone['zoom']
+a.camera_control.request_zoom=fake_zoom
 a.set_audio_source=lambda mode: (True,'Audio updated')
 mic_delay=[]
 a.set_mic_delay=lambda ms: (mic_delay.append(ms) or True,f'Microphone delay {ms/1000:.1f} s')  # never the real data/audio.json
