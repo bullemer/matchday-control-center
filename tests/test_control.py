@@ -219,9 +219,11 @@ class ApiTests(unittest.TestCase):
 
     def test_layout_api_validates_and_applies(self):
         with patch.object(a,'set_layout',return_value=(True,'Layout applied')) as layout:
-            response=self.post('/api/layout',{'mode':'pip','main':'cam1','secondary':'cam2'})
+            response=self.post('/api/layout',{'mode':'pip','main':'cam1','secondary':'cam5'})
             self.assertEqual(response.status_code,200)
-            layout.assert_called_once_with('pip','cam1','cam2','top-right')
+            layout.assert_called_once_with('pip','cam1','cam5','top-right')
+            # Two match cameras are never combined.
+            self.assertEqual(self.post('/api/layout',{'mode':'pip','main':'cam1','secondary':'cam2'}).status_code,400)
             self.assertEqual(self.post('/api/layout',{'mode':'split','main':'cam1','secondary':'cam1'}).status_code,400)
             self.assertEqual(self.post('/api/layout',{'mode':'wrong','main':'cam1'}).status_code,400)
             self.assertEqual(self.post('/api/layout',{'mode':'pip','main':'cam1','position':'wrong'}).status_code,400)
@@ -235,7 +237,7 @@ class ApiTests(unittest.TestCase):
     def test_tally_accessible_without_auth(self):
         r = self.client.get('/tally/cam1')
         self.assertEqual(r.status_code, 200)
-        self.assertIn(b'CAM1', r.data)
+        self.assertIn(b'CAM 1', r.data)
         self.assertIn(b'from the control dashboard', r.data)
 
         self.assertEqual(self.client.get('/tally/cam99').status_code, 404)
@@ -608,7 +610,9 @@ class MediaTests(unittest.TestCase):
         import importlib.util
         spec = importlib.util.spec_from_file_location('fresh_engine', m.__file__)
         fresh = importlib.util.module_from_spec(spec); spec.loader.exec_module(fresh)
-        self.assertFalse(any(v['on'] for v in fresh._mix.values()))
+        self.assertFalse(any(v['on'] for c, v in fresh._mix.items() if c in fresh.MATCH_CAMERAS))
+        # A reporting camera is heard while it is in the picture (the interview's sound).
+        self.assertTrue(all(fresh._mix[c]['on'] for c in fresh.REPORT_CAMERAS))
         self.assertEqual(fresh.get_audio_source(), 'off')
         self.assertEqual(fresh._effective_mix('cam1'), {})
 
@@ -745,10 +749,10 @@ class MediaTests(unittest.TestCase):
             self.assertTrue(Path(tmp,'offline.mp4').stat().st_size>0)
             users=config['authInternalUsers']
             self.assertEqual((users[0]['user'],users[0]['pass']),('camera','cam-secret'))
-            self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^cam[123]$'}])
+            self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^(cam1|cam2|cam3|cam4|cam5|cam6)$'}])
             self.assertEqual(users[1]['permissions'],[{'action':'read'}])  # no password: nobody on the LAN may publish
             self.assertEqual(users[2]['ips'],['127.0.0.1','::1'])
-            self.assertIn({'action':'publish','path':'~^(program|final|monitor|cam[123])$'},users[2]['permissions'])
+            self.assertIn({'action':'publish','path':'~^(program|final|monitor|cam1|cam2|cam3|cam4|cam5|cam6)$'},users[2]['permissions'])
 
     def reconnect_case(self, **extra):
         relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True
@@ -789,7 +793,7 @@ class MediaTests(unittest.TestCase):
                 patch.object(m,'_ensure_offline_card',return_value=False),patch.dict(os.environ,{'MCC_CAMERA_PASSWORD':''}):
             m.generate_mediamtx_config()
             users=json.loads(Path(tmp,'m.json').read_text())['authInternalUsers']
-        self.assertEqual((users[0]['user'],users[0]['permissions']),('any',[{'action':'publish','path':'~^cam[123]$'}]))
+        self.assertEqual((users[0]['user'],users[0]['permissions']),('any',[{'action':'publish','path':'~^(cam1|cam2|cam3|cam4|cam5|cam6)$'}]))
         self.assertNotIn('pass',users[0])
 
     def test_process_requires_progress(self):
@@ -826,13 +830,13 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(cmd[cmd.index('-f',cmd.index('alsa_input.mic')-3)+1],'pulse')
 
     def test_commentary_camera_is_fetched_audio_only(self):
-        layout={'mode':'pip','main':'cam3','secondary':'cam2','position':'top-right'}
+        layout={'mode':'pip','main':'cam3','secondary':'cam5','position':'top-right'}
         with patch.object(m,'_probe',return_value={'video','audio'}),patch.object(m,'_layout',layout):
             cmd, channels, *_ = m._relay_command('cam3',{'cam1':0.0})
         inputs=[i for i,x in enumerate(cmd) if x=='-i']
         cam1=next(i for i in inputs if cmd[i+1].endswith('/cam1'))
         self.assertEqual(cmd[cam1-12:cam1-4],['-thread_queue_size','512','-probesize','500000','-analyzeduration','500000','-allowed_media_types','audio'])
-        for path in ('/cam3','/cam2'):  # main picture and inset keep their video, deep queues too
+        for path in ('/cam3','/cam5'):  # main picture and inset keep their video, deep queues too
             i=next(i for i in inputs if cmd[i+1].endswith(path))
             self.assertEqual(cmd[i-10:i-8],['-thread_queue_size','512'])
             self.assertNotIn('-allowed_media_types',cmd[i-10:i])
@@ -954,22 +958,22 @@ class MediaTests(unittest.TestCase):
 
 class LayoutTests(unittest.TestCase):
     def test_pip_reuses_secondary_for_audio(self):
-        layout=dict(mode='pip',main='cam1',secondary='cam2',position='top-right')
+        layout=dict(mode='pip',main='cam1',secondary='cam5',position='top-right')
         with patch.object(m,'_layout',layout),patch.object(m,'_probe',return_value={'video','audio'}):
-            cmd, channels, _, _, secondary, warning=m._relay_command('cam1',{'cam2':0.0})
-        self.assertEqual(cmd.count(m.RTSP_BASE+'/cam2'),1)
-        self.assertEqual(secondary,'cam2')
+            cmd, channels, _, _, secondary, warning=m._relay_command('cam1',{'cam5':0.0})
+        self.assertEqual(cmd.count(m.RTSP_BASE+'/cam5'),1)
+        self.assertEqual(secondary,'cam5')
         self.assertFalse(warning)
         graph=cmd[cmd.index('-filter_complex')+1]
         self.assertIn('overlay=x=W-w-16:y=16',graph)
         self.assertIn('[1:a:0]',graph)
-        self.assertEqual(list(channels),['cam2'])
+        self.assertEqual(list(channels),['cam5'])
 
     def test_offline_second_camera_keeps_main_video(self):
         def probe(cam):
-            if cam=='cam2': raise ValueError('offline')
+            if cam=='cam5': raise ValueError('offline')
             return {'video','audio'}
-        with patch.object(m,'_layout',dict(mode='split',main='cam1',secondary='cam2',position='top-right')),patch.object(m,'_probe',side_effect=probe):
+        with patch.object(m,'_layout',dict(mode='split',main='cam1',secondary='cam5',position='top-right')),patch.object(m,'_probe',side_effect=probe):
             cmd,_,_,_,secondary,warning=m._relay_command('cam1',{'cam1':0})
         self.assertIsNone(secondary)
         self.assertIn('main camera only',warning)
@@ -985,7 +989,7 @@ class LayoutTests(unittest.TestCase):
         results=[]
         previous=dict(m._layout)
         with patch.object(m,'_switch_lock',WaitingLock()),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None),patch.object(m,'_stop_generation',0),patch.object(m,'_replace_relay') as replace:
-            worker=threading.Thread(target=lambda:results.append(m.set_layout('pip','cam1','cam2')))
+            worker=threading.Thread(target=lambda:results.append(m.set_layout('pip','cam1','cam5')))
             worker.start()
             try:
                 self.assertTrue(entered.wait(2))
@@ -1010,12 +1014,12 @@ class LayoutTests(unittest.TestCase):
     def test_failed_layout_restores_previous_configuration(self):
         previous=dict(mode='single',main='cam1',secondary='cam2',position='top-right')
         with patch.object(m,'_layout',previous),patch.object(m,'_relay_proc',MagicMock()),patch.object(m,'_replace_relay',return_value=(False,'No video')),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None):
-            self.assertFalse(m.set_layout('split','cam1','cam2')[0])
+            self.assertFalse(m.set_layout('split','cam1','cam5')[0])
             self.assertEqual(m._layout,previous)
 
     def test_offline_main_can_be_configured_before_cameras_connect(self):
         with patch.object(m,'_layout',dict(m._layout)),patch.object(m,'_relay_proc',None),patch.object(m,'_camera_status',{}),patch.object(m,'_active_camera',None),patch.object(m,'_generation',0),patch.object(m,'_pending_camera',None):
-            self.assertTrue(m.set_layout('pip','cam3','cam2')[0])
+            self.assertTrue(m.set_layout('pip','cam3','cam5')[0])
             self.assertEqual(m._layout['main'],'cam3')
             self.assertEqual(m._active_camera,'cam3')
 

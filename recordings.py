@@ -10,6 +10,9 @@ While a replay is on air the program shows the replay, so the recording holds th
 not the live game. The live camera is then also recorded (copy only) into live/: each
 "live window" knows where it sits on the recording timeline, and a highlight marked
 inside one is cut from it.
+
+Reporting cameras (interviews, surroundings) are recorded on their own for the whole
+session, on air or not, into iso/ (copy only; a new part after each camera reconnect).
 """
 from __future__ import annotations
 
@@ -79,7 +82,8 @@ def parts_bytes(sid):
         with _lock:
             session = _load(sid)
         folder = _dir(sid)
-        return sum((folder / p["file"]).stat().st_size for p in session["parts"] if (folder / p["file"]).exists())
+        files = [p["file"] for p in session["parts"]] + [p["file"] for p in session.get("iso", []) if not p.get("mp4")]
+        return sum((folder / f).stat().st_size for f in files if (folder / f).exists())
     except (ValueError, OSError, KeyError, json.JSONDecodeError):
         return 0
 
@@ -227,6 +231,61 @@ def new_live_window(sid, camera):
                         "duration": None, "mp4": None})
         _save(session)
         return str(_dir(sid) / name)
+
+
+def new_iso_part(sid, camera):
+    """Register a new part of a reporting camera's own recording; returns its path."""
+    with _lock:
+        session = _load(sid)
+        parts = session.setdefault("iso", [])
+        number = sum(1 for p in parts if p["camera"] == camera) + 1
+        name = f"iso/{camera}-{number:02d}.ts"
+        (_dir(sid) / "iso").mkdir(exist_ok=True)
+        parts.append({"id": f"i{len(parts) + 1}", "file": name, "camera": camera, "start": _now(),
+                      "offset": None, "duration": None, "mp4": None})
+        _save(session)
+        return str(_dir(sid) / name)
+
+
+def iso_started(sid, path, wall_start):
+    """The camera's first frame arrived: that, not the request, is where the part begins."""
+    with _lock:
+        session = _load(sid)
+        for part in session.get("iso", []):
+            if str(_dir(sid) / part["file"]) == path:
+                part["start"] = wall_start
+                _save(session)
+
+
+def _finish_iso_parts(sid):
+    """Measure the reporting camera parts, place them on the recording timeline, save
+    them as MP4 and drop empty ones (a camera that disconnected at once)."""
+    folder = _dir(sid)
+    with _lock:
+        session = _load(sid)
+    parts = session.get("iso", [])
+    if not parts:
+        return
+    kept = []
+    for part in parts:
+        file = folder / part["file"]
+        if part.get("mp4") and (folder / part["mp4"]).exists():
+            kept.append(part)
+            continue
+        if not file.exists():
+            continue
+        if part["duration"] is None:
+            part["duration"] = round(_probe_duration(file) or 0.0, 3)
+        if not part["duration"]:
+            file.unlink(missing_ok=True)
+            continue
+        part["offset"] = round(_position(session, part["start"]), 2)
+        part["mp4"] = _remux_live(sid, part)
+        kept.append(part)
+    with _lock:
+        fresh = _load(sid)
+        fresh["iso"] = kept
+        _save(fresh)
 
 
 def _remux_live(sid, window):
@@ -586,13 +645,15 @@ def finalize(sid, timeout=3600):
             return False, "Already finalizing"
         session = _load(sid)
         parts = [p for p in session["parts"] if (_dir(sid) / p["file"]).exists()]
-        if not parts:
+        if parts:
+            _finalizing.add(sid)
+            session["state"], session["error"] = "finalizing", ""
+        else:
             session["state"] = "empty" if not session.get("file") else "done"
-            _save(session)
-            return False, "Nothing was recorded"
-        _finalizing.add(sid)
-        session["state"], session["error"] = "finalizing", ""
         _save(session)
+    if not parts:
+        _finish_iso_parts(sid)  # the reporting cameras may have recorded on their own
+        return False, "Nothing was recorded"
     folder = _dir(sid)
     name = f"{sid[:8]}_{_slug(session['title'])}.mp4"
     listing = folder / "parts.txt"
@@ -620,6 +681,7 @@ def finalize(sid, timeout=3600):
         for part in parts:
             (folder / part["file"]).unlink(missing_ok=True)
         _finish_live_windows(sid)
+        _finish_iso_parts(sid)
         logger.info("Recording %s saved as %s", sid, name)
         return True, name
     except Exception as exc:
@@ -717,6 +779,11 @@ def describe(session, live_wall=None):
             "live": [{"id": w["id"], "camera": w["camera"], "time": _timestamp(w["offset"]),
                       "offset": w["offset"], "duration": w["duration"], "file": w["mp4"] or w["file"]}
                      for w in session.get("live", []) if w["duration"] and (folder / (w["mp4"] or w["file"])).exists()],
+            "iso": [{"id": p["id"], "camera": p["camera"], "offset": p["offset"],
+                     "time": _timestamp(p["offset"]) if p["offset"] is not None else "",
+                     "duration": p["duration"], "file": p["mp4"] or p["file"],
+                     "recording": session["state"] == "recording" and not p["mp4"]}
+                    for p in session.get("iso", []) if (folder / (p["mp4"] or p["file"])).exists()],
             "chapters": chapters(session)}
 
 

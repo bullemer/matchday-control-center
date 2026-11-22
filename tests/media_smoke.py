@@ -210,8 +210,11 @@ def run():
             def pixel(frame,x,y):
                 i=(y*160+x)*3
                 return frame[i:i+3]
+            # A second picture is always a reporting camera (cam5, blue here).
+            sources.append(source('cam5','blue',990)); reporter=len(sources)-1
+            wait(lambda: m.get_camera_status()['cam5'])
             for mode in ('pip','split'):
-                assert m.set_layout(mode,'cam1','cam2')[0],m.get_stream_status()
+                assert m.set_layout(mode,'cam1','cam5')[0],m.get_stream_status()
                 frame=picture()
                 red=pixel(frame,40,70 if mode=='pip' else 45)
                 blue=pixel(frame,120,22 if mode=='pip' else 45)
@@ -219,15 +222,15 @@ def run():
                 assert blue[2]>150 and blue[0]<80,(mode,blue)
                 assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running()
                 print(f'PASS: {mode} shows both cameras in the expected positions without restarting output',flush=True)
-            sources[1].terminate(); sources[1].wait(timeout=5)
+            sources[reporter].terminate(); sources[reporter].wait(timeout=5)
             wait(lambda: m.get_stream_status()['secondary_camera'] is None and bool(m.get_stream_status()['layout_warning']),seconds=40)
             assert m.get_active_camera()=='cam1' and m._encoder_proc.proc.pid==encoder_pid
             print('PASS: missing second camera falls back to main-only output',flush=True)
-            sources[1]=source('cam2','blue',660)
-            wait(lambda:m.get_stream_status()['secondary_camera']=='cam2',seconds=40)
+            sources[reporter]=source('cam5','blue',990)
+            wait(lambda:m.get_stream_status()['secondary_camera']=='cam5',seconds=40)
             assert m._encoder_proc.proc.pid==encoder_pid
             print('PASS: returning second camera restores the selected layout',flush=True)
-            assert m.set_layout('single','cam1','cam2')[0]
+            assert m.set_layout('single','cam1','cam5')[0]
             def metered():
                 levels = m.get_audio_levels()
                 return all(isinstance(levels.get(k), dict) and levels[k]['peak'] > -40 for k in ('cam1', 'cam2', 'program'))
@@ -331,6 +334,41 @@ def run():
                                    capture_output=True, text=True, timeout=10)
             assert probe.stdout.strip() == '854,480', probe.stdout
             print('PASS: record-only mode records without YouTube and stops the output when done', flush=True)
+            # Reporting camera: the interview small over the game, heard while in the picture,
+            # and recorded on its own the whole time (on air or not).
+            wait(lambda: m.get_camera_status()['cam5'])  # still publishing (blue) from the layout steps
+            assert m.start_recording('720p', 'Interview')[0], m.get_stream_status()
+            wait(lambda: m.get_recording_status()['writing'])
+            interview = m.get_recording_status()['session']
+            wait(lambda: m.get_recording_status()['iso'].get('cam5'), seconds=10)
+            assert m.switch_camera('cam1')[0]
+            assert not m.set_layout('pip', 'cam1', 'cam2')[0]  # two match cameras: never
+            assert m.set_layout('pip', 'cam1', 'cam5', 'top-right')[0], m.get_stream_status()
+            wait(lambda: m.get_stream_status()['secondary_camera'] == 'cam5')
+            time.sleep(1.5)
+            pixel = program_pixels()
+            main, inset = pixel(30, 40), pixel(120, 20)
+            assert main[0] > 150 and main[1] < 90, ('game should be red', main)
+            assert inset[2] > 150 and inset[0] < 90, ('interview inset should be blue', inset)
+            assert 'cam5' in m.get_stream_status()['audio_on_air'], m.get_stream_status()['audio_on_air']
+            print('PASS: picture-in-picture: game big, interview small and heard', flush=True)
+            assert m.switch_camera('cam5')[0]
+            assert m.get_stream_status()['layout']['mode'] == 'single'
+            time.sleep(1.5)
+            centre = program_pixels()(80, 40)
+            assert centre[2] > 150 and centre[0] < 90, ('interview full screen', centre)
+            assert m.switch_camera('cam1')[0]  # back to the game (cam2 was taken away above)
+            assert 'cam5' not in m.get_stream_status()['audio_on_air'], m.get_stream_status()['audio_on_air']
+            print('PASS: cut to the inset interview goes full screen; back on the game it is silent', flush=True)
+            time.sleep(3)
+            assert m.stop_recording()[0]
+            wait(lambda: m.recordings.get(interview)['state'] == 'done', seconds=60)
+            iso = m.recordings.get(interview)['iso']
+            assert len(iso) == 1 and iso[0]['camera'] == 'cam5' and iso[0]['file'].endswith('.mp4'), iso
+            iso_file = m.recordings.RECORDINGS_DIR / interview / iso[0]['file']
+            assert iso[0]['duration'] > 5 and abs(m.recordings._probe_duration(iso_file) - iso[0]['duration']) < 2, iso
+            assert iso[0]['offset'] is not None and iso[0]['offset'] < 5, iso
+            print(f"PASS: reporting camera recorded on its own: {iso[0]['duration']:.0f}s from {iso[0]['time']}", flush=True)
             assert m.start_youtube_stream('cam3', '1080p')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
             probe = subprocess.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',

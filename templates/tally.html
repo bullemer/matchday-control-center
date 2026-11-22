@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>Tally · {{ cam_id|upper }}</title>
+  <title>Tally · {{ title }}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
   <style>
     body {
@@ -71,7 +71,7 @@
   <!-- Giant Tally Center -->
   <main id="tally-box" class="tally-screen tally-offline my-auto py-12 px-6 rounded-3xl border-4 border-slate-700 text-center flex flex-col items-center justify-center gap-4 shadow-2xl">
     <div class="text-7xl sm:text-9xl font-black tracking-tight" id="cam-title">
-      {{ cam_id|upper }}
+      {{ title }}
     </div>
     <div id="tally-status" class="text-2xl sm:text-4xl font-extrabold uppercase tracking-wide">
       SIGNAL OFFLINE
@@ -85,7 +85,7 @@
   <footer class="space-y-3 max-w-lg mx-auto w-full pt-4">
     <div class="bg-slate-800/90 rounded-xl p-3 border border-slate-700 text-center">
       {% if show_url %}
-      <p class="text-xs text-slate-400 mb-1 font-medium">RTMP Publishing URL for {{ cam_id|upper }}</p>
+      <p class="text-xs text-slate-400 mb-1 font-medium">RTMP Publishing URL for {{ title }}</p>
       <code id="rtmp-url" class="block text-xs font-mono text-brand-cyan bg-slate-900 rounded p-2 mb-2 break-all select-all">
         rtmp://{{ media_host }}:1935/{{ cam_id }}
       </code>
@@ -93,7 +93,7 @@
         📋 Copy RTMP URL
       </button>
       {% else %}
-      <p class="text-xs text-slate-400 font-medium">Camera links include a password. Get the link or QR code for {{ cam_id|upper }} from the control dashboard.</p>
+      <p class="text-xs text-slate-400 font-medium">Camera links include a password. Get the link or QR code for {{ title }} from the control dashboard.</p>
       {% endif %}
     </div>
     <p id="wake-status" class="text-center text-xs text-slate-500">Screen lock active</p>

@@ -1,7 +1,7 @@
 # Matchday Control Center
 
 A Linux dashboard for USB internet tethering, an application-owned Wi-Fi hotspot,
-three camera inputs, a live scoreboard, and a supervised encoder that streams to YouTube,
+four match cameras and two reporting cameras, a live scoreboard, and a supervised encoder that streams to YouTube,
 Facebook, Twitch and any other RTMP server at the same time, records and replays.
 
 ## Requirements and first launch
@@ -101,7 +101,7 @@ so try a real stream before relying on a slower laptop.
    “Live”: frame progress is required for live status.
 6. Tap **Match mode** in the header for a one-screen sideline view: program preview
    (can be hidden), cut buttons with tally, audio source, score, clock and stream
-   status. Keys 1–3 cut cameras on a laptop keyboard. The mode is remembered per device,
+   status. Keys 1–4 cut the match cameras, 5–6 the reporting cameras, 0 CAM REPLAY on a laptop keyboard. The mode is remembered per device,
    and hidden previews stop playing to save CPU, battery and Wi-Fi.
    Update scores and clock. Use **Scoreboard on video** in Setup or Match mode to hide
    or show the overlay without interrupting the stream. Scores and the clock continue
@@ -125,12 +125,31 @@ so try a real stream before relying on a slower laptop.
 
 ## Media pipeline and recovery
 
-Camera phones publish RTMP to `cam1`, `cam2`, or `cam3`. A relay normalizes the
+Camera phones publish RTMP to `cam1`…`cam6`. A relay normalizes the
 selected camera to H.264 at the stream resolution and stereo 48 kHz AAC on `program`. MediaMTX 1.21.2's
 always-available program path supplies fallback video and silence when that publisher
 is absent. A separate encoder reads the continuous program over loopback RTSP,
 adds the scoreboard, and publishes the finished picture locally; each streaming
 destination and the recorder copy it from there.
+
+## Match cameras and reporting cameras
+
+`cam1`–`cam4` are **match cameras**: they film the game, one at a time on air. `cam5` and
+`cam6` are **reporting cameras** ("REP 1", "REP 2") for interviews and the surroundings.
+
+- **Picture-in-picture / side by side** always involves a reporting camera: typically the
+  game big and the interview small (Layout → main Cam 1, second Reporter 1). Two match
+  cameras are never combined. Cutting to the camera in the inset shows it full screen;
+  further cuts between match cameras keep the inset.
+- **Sound:** the audio source (Off / Cam 1 / Follow / USB) applies to the match cameras.
+  A reporting camera is heard whenever it is in the picture (full screen or inset) and
+  never otherwise; untick "Sound while in picture" on its card (🎥 Cams) to keep it silent.
+- **Own recording:** while recording, every publishing reporting camera is also recorded
+  on its own (copy only, on air or not) into `recordings/<id>/iso/`, a new part after
+  each reconnect. When the recording is saved they become MP4s, listed under
+  "🎤 Reporting cameras" with their start time in the match recording.
+- **Names and positions** of all cameras are edited on their cards in 🎥 Cams.
+- GO LIVE starts on a match camera; a reporting camera only if no match camera publishes.
 
 ## Streaming destinations
 
@@ -237,7 +256,7 @@ live-stream archive).
 ## Instant replay and CAM REPLAY
 
 **CAM REPLAY** is a fourth source next to the cameras (🎬 CAM REPLAY cut button; REPLAY
-and key 4 in Match mode). In the Multiview panel, choose the moment on its timeline: drag
+and key 0 in Match mode). In the Multiview panel, choose the moment on its timeline: drag
 the slider over the running recording, step with ◀ 10 s · ◀ 1 s · 1 s ▶ · 10 s ▶, jump
 with ⏭ Near live, or tap a ⭐ highlight mark (5 s before it). A still preview shows the
 chosen moment. **▶ Play** or **🐢 Play slow** puts CAM REPLAY on air from there; it
@@ -343,7 +362,8 @@ failed actions use an error HTTP status and `{ "ok": false, ... }`.
 | POST | `/api/recordings/<id>/finalize` | Join an unfinished recording's parts |
 | POST | `/api/recordings/<id>/delete` | Delete a recording with its clips |
 | GET | `/recordings/<id>/<file>` | Watch a recorded file; `?download=1` to download |
-| POST | `/api/switch/<cam_id>` | Select cam1/cam2/cam3 |
+| POST | `/api/switch/<cam_id>` | Select cam1…cam6; optional `source`: `manual` (default) or `auto` (auto-director: match cameras only, not within 10 s of a manual cut) |
+| POST | `/api/cameras/<cam_id>` | `label` (name), `position` (e.g. "Left goal"); saved in `data/cameras.json` |
 | POST | `/api/layout` | `mode`: single/pip/split, `main`, `secondary`, `position`: top-left/top-right/bottom-left/bottom-right |
 | POST | `/api/audio/mute` | `muted`: true/false — master mute of every source, mixer kept |
 | POST | `/api/audio-source` | `mode`: `cam1`, `active`, or `usb:<device id>` |

@@ -62,7 +62,7 @@ test('match mode puts sideline controls on one phone screen', async ({page}) => 
   await page.goto('/');
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await expect(page.locator('#match-panel')).toBeHidden();
-  await expect(page.locator('iframe[data-preview="setup"]').first()).toHaveAttribute('src', /:8889\/cam1$/);
+  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /:8889\/cam1$/);
   await page.locator('#mode-toggle').click();
   await expect(page.locator('#match-panel')).toBeVisible();
   await expect(page.locator('#hotspot-ssid')).toBeHidden();
@@ -417,14 +417,14 @@ test('camera cards show Tally and QR modal with vector SVG and field router inst
 
   const qrDialog = page.locator('#qr-dialog');
   await expect(qrDialog).toBeVisible();
-  await expect(page.locator('#qr-modal-title')).toContainText('CAM1');
+  await expect(page.locator('#qr-modal-title')).toContainText('Cam 1');
   await expect(page.locator('#qr-svg-container svg')).toBeVisible();
   await expect(page.locator('#qr-tally-url')).toContainText('/tally/cam1');
   await expect(page.locator('#qr-rtmp-url')).toContainText('/cam1');
   await expect(page.locator('#qr-network-guide')).toBeVisible();
 
   await page.locator('#qr-tab-cam2').click();
-  await expect(page.locator('#qr-modal-title')).toContainText('CAM2');
+  await expect(page.locator('#qr-modal-title')).toContainText('Cam 2');
   await expect(page.locator('#qr-tally-url')).toContainText('/tally/cam2');
 
   await qrDialog.getByRole('button', {name: 'Done'}).click();
@@ -436,7 +436,7 @@ test('operator mobile tally screen loads without basic auth and displays camera 
   const page = await context.newPage();
 
   await page.goto('/tally/cam1');
-  await expect(page.locator('#cam-title')).toHaveText('CAM1');
+  await expect(page.locator('#cam-title')).toHaveText('CAM 1');
   await expect(page.locator('body')).toContainText('from the control dashboard');
   await expect(page.locator('#tally-box')).toBeVisible();
   await context.close();
@@ -687,7 +687,7 @@ test('CAM REPLAY: scrub the recording, play from a moment and stay on air until 
   await expect(cut.locator('[data-cut-state]')).toHaveText(/^Ready · 0:5\d$/);  // keeps the chosen moment
   // Match mode: REPLAY cut button and key 4 use the same moment and the last speed.
   await page.locator('#mode-toggle').click();
-  await page.keyboard.press('4');
+  await page.keyboard.press('0');
   await expect(page.locator('#match-panel [data-cut-replay] [data-cut-state]')).toHaveText('On air · slow');
   calls = await (await page.request.get('/test/replay-calls')).json();
   expect(calls[calls.length - 1][3]).toBeCloseTo(cue, 0);
@@ -768,5 +768,54 @@ test('noise gate and headset monitor', async ({page}) => {
     ['monitor', true, null, 'alsa_output.usb-headset'], ['monitor', null, 'full', null],
     ['gate', null, -38], ['gate', false, null]]);
   expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  expect(errors).toEqual([]);
+});
+
+test('four match and two reporting cameras: cut row, keys, layout rule and camera cards', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.setViewportSize({width:390,height:844});
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('#mode-toggle').click();
+  const panel = page.locator('#match-panel');
+  for (const label of ['CAM 1', 'CAM 2', 'CAM 3', 'CAM 4', 'REP 1', 'REP 2', 'REPLAY'])
+    await expect(panel.locator('.match-cut-grid').getByText(label, {exact: true})).toBeVisible();
+  // Reporting cameras and replay sit in a second row under the match cameras.
+  const cam1 = await panel.locator('[data-cut="cam1"]').boundingBox();
+  const rep1 = await panel.locator('[data-cut="cam5"]').boundingBox();
+  expect(rep1.y).toBeGreaterThan(cam1.y + cam1.height - 1);
+  expect(await page.evaluate(()=>document.documentElement.scrollWidth <= innerWidth)).toBeTruthy();
+  await page.locator('#match-preview-toggle').click();
+  const box = await panel.boundingBox();
+  console.log('six-camera panel bottom', box.y + box.height, await page.evaluate(() => scrollY));
+  expect(box.y + box.height).toBeLessThanOrEqual(844);
+  await page.screenshot({path:'/tmp/mcc-six-cameras.png'});
+  // Keys 1-4 match cameras, 5-6 reporting cameras.
+  const cut = page.waitForRequest('**/api/switch/cam5');
+  await page.keyboard.press('5');
+  await cut;
+  // Picture-in-picture: two match cameras cannot be combined.
+  await page.locator('#match-panel').getByRole('button', {name: 'Video layout'}).click();
+  await page.locator('#layout-mode').selectOption('pip');
+  await page.locator('#layout-main').selectOption('cam1');
+  const optionOff = cam => page.locator(`#layout-secondary option[value="${cam}"]`).evaluate(o => o.disabled);
+  for (const cam of ['cam2', 'cam3', 'cam4']) expect(await optionOff(cam)).toBe(true);
+  expect(await optionOff('cam5')).toBe(false);
+  await expect(page.locator('#layout-secondary')).toHaveValue(/cam[56]/);
+  await page.locator('#layout-main').selectOption('cam5');  // interview big: any second camera
+  expect(await optionOff('cam2')).toBe(false);
+  await page.keyboard.press('Escape');
+  // Setup: camera cards in two groups, names editable, reporting cameras' sound switch.
+  await page.locator('#mode-toggle').click();
+  await page.locator('[data-tab-btn="cams"]').click();
+  await expect(page.getByText('🎤 Reporting cameras')).toBeVisible();
+  await expect(page.locator('[data-camera-card]')).toHaveCount(6);
+  await expect(page.locator('[data-report-sound]')).toHaveCount(2);
+  await expect(page.locator('#url-cam6')).toContainText(':1935/cam6');
+  const saved = page.waitForRequest(req => req.url().endsWith('/api/cameras/cam2') && req.postDataJSON().position === 'Left goal');
+  await page.locator('[data-cam-edit="position"][data-cam="cam2"]').fill('Left goal');
+  await page.locator('[data-cam-edit="position"][data-cam="cam2"]').press('Tab');
+  await saved;
   expect(errors).toEqual([]);
 });

@@ -43,7 +43,15 @@ DESTINATIONS = {
 }
 SERVER_PATTERN = r"rtmps?://[A-Za-z0-9.-]+(:[0-9]{1,5})?(/[A-Za-z0-9_.~%+/-]*)?"
 SCOREBOARD_PATH = str(BASE / "static/scoreboard.txt")
-CAMERA_IDS = ["cam1", "cam2", "cam3"]
+# Match cameras film the game; reporting cameras are free cameras (interviews, crowd,
+# surroundings). Reporting cameras are heard whenever they are in the picture, may share
+# the picture with a match camera (picture-in-picture, side by side) and are recorded
+# on their own for the whole session, on air or not.
+MATCH_CAMERAS = ["cam1", "cam2", "cam3", "cam4"]
+REPORT_CAMERAS = ["cam5", "cam6"]
+CAMERA_IDS = MATCH_CAMERAS + REPORT_CAMERAS
+CAMERA_SETTING = BASE / "data/cameras.json"
+_camera_info = {}         # camera -> {"label", "position"} (operator's names, data/cameras.json)
 _lock = threading.RLock()
 # Serializes relay replacement. Slow work (probe, waiting for frames) happens under this
 # lock only, never under _lock, so status, STOP and the supervisor stay responsive.
@@ -61,15 +69,20 @@ _encoder_thread = None
 _mediamtx_proc = _encoder_proc = _recorder_proc = _relay_proc = None
 _active_camera = None
 _last_camera = None       # on air at the last STOP: the next GO LIVE starts there again
-_layout = {"mode": "single", "main": "cam1", "secondary": "cam2", "position": "top-right"}
+_layout = {"mode": "single", "main": "cam1", "secondary": REPORT_CAMERAS[0], "position": "top-right"}
+_cut_source = "manual"    # who made the last cut: "manual" (operator), "auto" (a future auto-director)
+_manual_cut_at = -1e9     # when the operator last cut; an auto-director holds off for MANUAL_HOLD
+MANUAL_HOLD = 10.0
 _relay_secondary = None
 _layout_warning = ""
 # Audio mixer. Channels are the cameras and detected microphones ("usb:<device id>");
 # each has on/off and a gain in dB. With _follow, only the on-air camera's channel is on
 # among the cameras (its sound follows the cut). Gains change live over ZMQ; switching a
 # channel on that the running relay does not include rebuilds the relay.
-# Camera sound starts off: the broadcast is silent until the operator picks a source.
-_mix = {c: {"on": False, "gain": 0.0} for c in CAMERA_IDS}
+# Match camera sound starts off: the broadcast is silent until the operator picks a source
+# (open phone mics caught crowd and stadium music, and YouTube blocked the stream).
+# A reporting camera's "on" means "heard while it is in the picture" and starts on.
+_mix = {c: {"on": c in REPORT_CAMERAS, "gain": 0.0} for c in CAMERA_IDS}
 _follow = False
 _muted = False           # master mute: every channel at zero volume, mixer settings kept
 _mic_ids = set()         # detected microphone ids, set by the app
@@ -446,11 +459,63 @@ def camera_password():
     return os.environ.get("MCC_CAMERA_PASSWORD", "")
 
 
+def camera_role(cam):
+    return "report" if cam in REPORT_CAMERAS else "match"
+
+
+def _default_label(cam):
+    if cam in REPORT_CAMERAS:
+        return f"Reporter {REPORT_CAMERAS.index(cam) + 1}"
+    return f"Cam {cam[3:]}"
+
+
+def load_camera_setting():
+    """The operator's camera names and field positions (e.g. "Left goal")."""
+    try:
+        saved = json.loads(CAMERA_SETTING.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    for cam in CAMERA_IDS:
+        entry = saved.get(cam) if isinstance(saved.get(cam), dict) else {}
+        label = str(entry.get("label") or "").strip()[:24]
+        position = str(entry.get("position") or "").strip()[:40]
+        _camera_info[cam] = {"label": label or _default_label(cam), "position": position}
+
+
+def get_cameras():
+    """Every camera with its role, name and field position, in display order."""
+    if not _camera_info:
+        load_camera_setting()
+    return [{"id": c, "role": camera_role(c), "key": str(i + 1), **_camera_info[c],
+             "short": f"REP {REPORT_CAMERAS.index(c) + 1}" if c in REPORT_CAMERAS else f"CAM {c[3:]}"}
+            for i, c in enumerate(CAMERA_IDS)]
+
+
+def set_camera_info(cam, label=None, position=None):
+    if cam not in CAMERA_IDS:
+        return False, "Invalid camera"
+    if not _camera_info:
+        load_camera_setting()
+    with _lock:
+        info = _camera_info[cam]
+        if label is not None:
+            info["label"] = str(label).strip()[:24] or _default_label(cam)
+        if position is not None:
+            info["position"] = str(position).strip()[:40]
+        data = {c: dict(v) for c, v in _camera_info.items()}
+    CAMERA_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = CAMERA_SETTING.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    os.replace(tmp, CAMERA_SETTING)
+    return True, "Camera saved"
+
+
 def generate_mediamtx_config():
     # A continuous program path supplies video + silence during cuts/source loss.
     # Program publishing is loopback-only; phones may publish only camera paths.
     password = camera_password()
-    camera_publish = [{"action": "publish", "path": "~^cam[123]$"}]
+    cameras = "|".join(CAMERA_IDS)
+    camera_publish = [{"action": "publish", "path": f"~^({cameras})$"}]
     config = {
         "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
         "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
@@ -461,7 +526,7 @@ def generate_mediamtx_config():
             if password else {"user": "any", "ips": [], "permissions": camera_publish},
             {"user": "any", "ips": [], "permissions": [{"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
-                {"action": "api"}, {"action": "publish", "path": "~^(program|final|monitor|cam[123])$"}]},
+                {"action": "api"}, {"action": "publish", "path": f"~^(program|final|monitor|{cameras})$"}]},
         ],
         # A camera reconnecting after a Wi-Fi drop replaces its own stale session at once
         # (otherwise it is refused until MediaMTX times the dead one out).
@@ -556,7 +621,7 @@ def get_active_camera():
 
 def get_audio_source():
     """The preset matching the mixer ("off", "cam1", "active", "usb:<id>"), else "mix"."""
-    cams_on = [c for c in CAMERA_IDS if _mix[c]["on"]]
+    cams_on = [c for c in MATCH_CAMERAS if _mix[c]["on"]]
     mics_on = [c for c in _mix if c.startswith("usb:") and _mix[c]["on"]]
     if _follow:
         return "active" if not mics_on else "mix"
@@ -807,17 +872,37 @@ def _follow_channel(cam):
     if _camera_audio.get(cam, True):
         _follow_last = cam
         return cam
-    if _follow_last and _follow_last != cam and _camera_audio.get(_follow_last):
+    if _follow_last in MATCH_CAMERAS and _follow_last != cam and _camera_audio.get(_follow_last):
         return _follow_last
-    return next((c for c in CAMERA_IDS if c != cam and _camera_audio.get(c)), cam)
+    return next((c for c in MATCH_CAMERAS if c != cam and _camera_audio.get(c)), cam)
+
+
+def _effective_layout(cam, layout=None):
+    """The layout a cut to cam really gets. Two pictures need a reporting camera among
+    them (two match cameras are never combined), and cutting to the camera in the inset
+    shows it full screen."""
+    layout = dict(layout or _layout)
+    if layout["mode"] != "single":
+        second = layout["secondary"]
+        if second == cam or not (cam in REPORT_CAMERAS or second in REPORT_CAMERAS):
+            layout["mode"] = "single"
+    return layout
 
 
 def _effective_mix(cam):
-    """Channels that should be on air when cam is cut, with their gain in dB."""
+    """Channels that should be on air when cam is cut, with their gain in dB. A reporting
+    camera is heard while it is in the picture (full screen or inset), never otherwise."""
     wanted = {}
-    follow = _follow_channel(cam) if _follow and cam in CAMERA_IDS else None
+    layout = _effective_layout(cam)
+    visible = {cam} | ({layout["secondary"]} if layout["mode"] != "single" else set())
+    follow = _follow_channel(cam) if _follow and cam in MATCH_CAMERAS else None
     for channel, setting in _mix.items():
-        on = channel == follow if follow and channel in CAMERA_IDS else setting["on"]
+        if channel in REPORT_CAMERAS:
+            on = setting["on"] and channel in visible
+        elif channel in MATCH_CAMERAS and follow:
+            on = channel == follow
+        else:
+            on = setting["on"]
         if on:
             wanted[channel] = setting["gain"]
     return wanted
@@ -882,7 +967,7 @@ def get_stream_status():
     return {"active": active, "state": state,
             "active_camera": get_active_camera(), "selected_camera": _active_camera,
             "pending_camera": _pending_camera,
-            "layout": dict(_layout),
+            "layout": dict(_layout), "cut_source": _cut_source,
             "secondary_camera": _relay_secondary if get_active_camera() else None,
             "layout_warning": _layout_warning if _relay_proc else "",
             "audio_source": get_audio_source(), "muted": _muted,
@@ -921,7 +1006,8 @@ def get_recording_status():
     session, recorder = _recording, _recorder_proc
     status = {"active": bool(_want_record and session), "session": session,
               "writing": bool(recorder and recorder.healthy()),
-              "warning": _record_warning or (_disk_warning if _want_record and session else "")}
+              "warning": _record_warning or (_disk_warning if _want_record and session else ""),
+              "iso": get_iso_status()}
     if session:
         try:
             info = recordings.get(session, live_wall=time.time())
@@ -1073,7 +1159,7 @@ def _relay_command(cam, wanted, replay=None):
         if "video" not in tracks:
             raise ValueError(f"{cam} has no video")
         cmd = _relay_ffmpeg() + _camera_input(cam)
-        layout = dict(_layout)
+        layout = _effective_layout(cam)
         inputs_by_camera = {cam: (0, tracks)}
     sources, missing, notes, next_input = [], set(), [], 1
     secondary, secondary_index, video_warning = None, None, ""
@@ -1246,13 +1332,24 @@ SUPERSEDED = "Superseded by a newer request"
 BUSY = "A cut is already in progress"
 
 
-def switch_camera(cam_id, automatic=False, expected_stop=None, force=False):
-    """Operator cuts supersede any cut in flight. Automatic (supervisor) cuts never wait
-    and never supersede an operator. An operator cut to the camera that is already on
-    air changes nothing (a double tap must not rebuild the relay), unless force."""
-    global _generation, _pending_camera
+CUT_SOURCES = ("manual", "auto")
+
+
+def switch_camera(cam_id, automatic=False, expected_stop=None, force=False, source="manual"):
+    """The one entry point for cuts. Operator cuts supersede any cut in flight. Automatic
+    (supervisor) cuts never wait and never supersede an operator. An operator cut to the
+    camera that is already on air changes nothing (a double tap must not rebuild the
+    relay), unless force. source "auto" is a cut chosen by an auto-director: it may only
+    pick match cameras, and it never overrides a manual cut made in the last few seconds."""
+    global _generation, _pending_camera, _cut_source, _manual_cut_at
     if cam_id not in CAMERA_IDS:
         return False, "Invalid camera"
+    if source not in CUT_SOURCES:
+        return False, "Invalid cut source"
+    if source == "auto" and cam_id not in MATCH_CAMERAS:
+        return False, "An automatic cut may only choose a match camera"
+    if source == "auto" and time.monotonic() - _manual_cut_at < MANUAL_HOLD:
+        return False, "The operator cut a moment ago"
     with _lock:
         if expected_stop is not None and expected_stop != _stop_generation:
             return False, SUPERSEDED
@@ -1264,6 +1361,9 @@ def switch_camera(cam_id, automatic=False, expected_stop=None, force=False):
         if not automatic:
             _generation += 1
             _pending_camera = cam_id
+            _cut_source = source
+            if source == "manual":
+                _manual_cut_at = time.monotonic()
         generation = _generation
     if not _switch_lock.acquire(blocking=not automatic):
         return False, BUSY
@@ -1319,7 +1419,8 @@ def _replace_relay(cam_id, generation):
             _relay_channels, _relay_missing, _audio_warning = channels, missing, warning
             _relay_muted = set(channels) if _muted else set()
             _relay_secondary, _layout_warning = secondary, video_warning
-            _layout = {**_layout, "main": cam_id}
+            # A cut that cannot keep two pictures (see _effective_layout) goes full screen.
+            _layout = {**_layout, "main": cam_id, "mode": _effective_layout(cam_id)["mode"]}
             _relay_failures = 0
             _set_error("relay")
     if not installed:
@@ -1546,6 +1647,64 @@ def _supervise_live_capture(now):
                     _live_capture["aired"] = aired
 
 
+_iso = {}                 # reporting camera -> {"proc", "session", "path", "noted"}
+_iso_retry = {}           # reporting camera -> monotonic time of the next start attempt
+_iso_lock = threading.Lock()
+ISO_RETRY = 3.0
+
+
+def _iso_command(cam, path):
+    return _ffmpeg() + _camera_input(cam) + [
+        "-map", "0:v:0", "-map", "0:a:0?", "-c", "copy", "-flush_packets", "1", "-f", "mpegts", path]
+
+
+def _supervise_iso(now):
+    """Record every publishing reporting camera on its own while a recording runs (copy
+    only, on air or not). A camera that drops out ends its part; it continues in a new
+    part when it is back. Serialized with _end_iso_all so STOP never leaves one running."""
+    with _iso_lock:
+        with _lock:
+            session = _recording if _want_record else None
+        for cam in REPORT_CAMERAS:
+            entry = _iso.get(cam)
+            wanted = bool(session and _camera_status.get(cam))
+            if entry:
+                proc = entry["proc"]
+                died = proc.poll() is not None
+                if not wanted or entry["session"] != session or died:
+                    if died and wanted:
+                        logger.warning("Recording of %s stopped: %s", cam, proc.error)
+                        _iso_retry[cam] = now + ISO_RETRY
+                    _kill_process(_iso.pop(cam)["proc"])
+                    entry = None
+                elif not entry["noted"] and proc.first_progress:
+                    wall, seconds = proc.first_progress
+                    recordings.iso_started(session, entry["path"], wall - seconds)
+                    entry["noted"] = True
+            if wanted and not entry and now >= _iso_retry.get(cam, 0.0):
+                try:
+                    path = recordings.new_iso_part(session, cam)
+                    _iso[cam] = {"proc": Process(_iso_command(cam, path), copy=True),
+                                 "session": session, "path": path, "noted": False}
+                except (OSError, ValueError) as exc:
+                    logger.warning("Cannot record %s: %s", cam, exc)
+                    _iso_retry[cam] = now + ISO_RETRY
+
+
+def _end_iso_all():
+    """Stop every reporting camera recording (before the session is saved)."""
+    with _iso_lock:
+        entries = list(_iso.values())
+        _iso.clear()
+        _iso_retry.clear()
+    for entry in entries:
+        _kill_process(entry["proc"])
+
+
+def get_iso_status():
+    return {cam: bool(entry["proc"].poll() is None) for cam, entry in list(_iso.items())}
+
+
 def stop_replay():
     """Back to live now."""
     global _replay, _relay_proc
@@ -1563,7 +1722,7 @@ def stop_replay():
     return True, "Back to live"
 
 
-def set_layout(mode, main, secondary="cam2", position="top-right"):
+def set_layout(mode, main, secondary=REPORT_CAMERAS[0], position="top-right"):
     """Configure composition; replace only the relay, keeping the output encoder alive."""
     global _layout, _generation, _pending_camera, _active_camera
     if mode not in ("single", "pip", "split"):
@@ -1572,6 +1731,8 @@ def set_layout(mode, main, secondary="cam2", position="top-right"):
         return False, "Invalid camera"
     if mode != "single" and main == secondary:
         return False, "Choose different main and second cameras"
+    if mode != "single" and main not in REPORT_CAMERAS and secondary not in REPORT_CAMERAS:
+        return False, "Two pictures need a reporting camera: match cameras are shown one at a time"
     if position not in ("top-left", "top-right", "bottom-left", "bottom-right"):
         return False, "Invalid picture-in-picture position"
     with _lock:
@@ -1671,7 +1832,8 @@ def set_audio_source(mode):
         if mode.startswith("usb:"):
             _mix.setdefault(mode, {"on": False, "gain": 0.0})
         for channel, setting in _mix.items():
-            setting["on"] = channel == mode
+            if channel not in REPORT_CAMERAS:  # those follow the picture, not the preset
+                setting["on"] = channel == mode
         _follow = mode == "active"
     ok, message = _set_mixer(change)
     return ok, message.replace("Mixer updated", "Audio source updated")
@@ -1973,7 +2135,8 @@ def _start_output(targets, profile, token, record=False, title="", session=None)
         preferred = [c for c in (_active_camera, _last_camera) if c]
         if _layout["mode"] != "single":
             preferred = [_layout["main"]]
-        candidates = preferred if _layout["mode"] != "single" else preferred + CAMERA_IDS
+        # GO LIVE opens on the game: a reporting camera only if nothing else publishes.
+        candidates = preferred if _layout["mode"] != "single" else preferred + MATCH_CAMERAS + REPORT_CAMERAS
         camera = next((c for c in candidates if live.get(c)), None)
         if camera is None:
             return False, "No camera is publishing"
@@ -2091,6 +2254,7 @@ def stop_recording():
         return True, "Recording stopped; saving the file"
     _kill_process(recorder)
     _end_live_capture(background=False)
+    _end_iso_all()
     recordings.close_part(session)
     recordings.finalize_async(session)
     return True, "Recording stopped; saving the file"
@@ -2120,6 +2284,7 @@ def _stop_all(finalize=True):
     for proc in processes:
         _kill_process(proc)
     _end_live_capture(background=False)  # placed before the session is joined
+    _end_iso_all()
     if ended_replay:
         _notify_replay(False)
     if session:
@@ -2361,6 +2526,7 @@ def _watch_encoder():
         try:
             _supervise_encoder()
             _supervise_live_capture(time.monotonic())
+            _supervise_iso(time.monotonic())
         except Exception:
             logger.exception("Encoder supervisor failed")
 

@@ -47,7 +47,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           get_recording_status, play_replay, stop_replay, get_replay_status,
                           add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting,
                           resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
-                          start_monitor_worker)
+                          start_monitor_worker, get_cameras, set_camera_info, load_camera_setting,
+                          REPORT_CAMERAS)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -258,7 +259,7 @@ def index():
     destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
     return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
-                           camera_query=_camera_query())
+                           camera_query=_camera_query(), cameras=get_cameras())
 
 
 @app.route("/tally/<cam_id>")
@@ -269,7 +270,8 @@ def tally_page(cam_id):
     host = urlsplit(request.host_url).hostname or "localhost"
     if ":" in host:
         host = f"[{host}]"
-    return render_template("tally.html", cam_id=cam_id, media_host=host, show_url=not camera_password())
+    title = next(c["short"] for c in get_cameras() if c["id"] == cam_id)  # "CAM 1", "REP 1"
+    return render_template("tally.html", cam_id=cam_id, title=title, media_host=host, show_url=not camera_password())
 
 
 @app.route("/api/tally/<cam_id>")
@@ -298,7 +300,8 @@ def api_tally_status(cam_id):
     return jsonify({
         "ok": True,
         "cam_id": cam_id,
-        "name": f"Camera {cam_id[3:]}" if cam_id.startswith("cam") else cam_id,
+        "name": next(c["label"] for c in get_cameras() if c["id"] == cam_id),
+        "role": "report" if cam_id in REPORT_CAMERAS else "match",
         "publishing": publishing,
         "on_air": on_air,
         "selected": selected,
@@ -328,6 +331,7 @@ def api_status():
         "ok": True,
         "network": network,
         "cameras": cameras,
+        "camera_list": get_cameras(),
         "mediamtx": mediamtx,
         "stream": stream,
         "scoreboard": scoreboard,
@@ -704,13 +708,15 @@ add_replay_listener(_replay_changed)
 @app.route("/api/switch/<cam_id>", methods=["POST"])
 @api_endpoint
 def api_switch_camera(cam_id):
-    """Switch the active (on-air) camera to cam_id (cam1, cam2, cam3)."""
-    valid_cams = ("cam1", "cam2", "cam3")
-    if cam_id not in valid_cams:
-        return jsonify({"ok": False, "error": f"Invalid camera id '{cam_id}'. Use one of {valid_cams}"}), 400
+    """Switch the active (on-air) camera to cam_id. Optional JSON {"source": "auto"} marks
+    a cut chosen by an auto-director (match cameras only; never right after a manual cut)."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify({"ok": False, "error": f"Invalid camera id '{cam_id}'. Use one of {CAMERA_IDS}"}), 400
+    data = request.get_json(force=True, silent=True) or {}
+    source = text_field(data, "source", 10, "manual")
 
-    log.info("Camera switch requested: %s", cam_id)
-    success, msg = switch_camera(cam_id)
+    log.info("Camera switch requested: %s (%s)", cam_id, source)
+    success, msg = switch_camera(cam_id, source=source)
     if not success and msg == SUPERSEDED:
         # A newer cut (or STOP) replaced this one; the client follows the latest request.
         return jsonify({"ok": False, "superseded": True, "message": msg}), 409
@@ -724,16 +730,31 @@ def api_layout():
     data = request.get_json()
     mode = text_field(data, "mode", 10)
     main = text_field(data, "main", 10)
-    secondary = text_field(data, "secondary", 10, "cam2")
+    secondary = text_field(data, "secondary", 10, REPORT_CAMERAS[0])
     position = text_field(data, "position", 20, "top-right")
-    if mode not in ("single", "pip", "split") or main not in ("cam1", "cam2", "cam3") or secondary not in ("cam1", "cam2", "cam3"):
+    if mode not in ("single", "pip", "split") or main not in CAMERA_IDS or secondary not in CAMERA_IDS:
         raise ValueError("Invalid layout or camera")
     if mode != "single" and main == secondary:
         raise ValueError("Choose different main and second cameras")
+    if mode != "single" and main not in REPORT_CAMERAS and secondary not in REPORT_CAMERAS:
+        raise ValueError("Two pictures need a reporting camera: match cameras are shown one at a time")
     if position not in ("top-left", "top-right", "bottom-left", "bottom-right"):
         raise ValueError("Invalid picture-in-picture position")
     ok, message = set_layout(mode, main, secondary, position)
     return jsonify(ok=ok, message=message, stream=get_stream_status()), 200 if ok else 409 if message == SUPERSEDED else 502
+
+
+@app.route("/api/cameras/<cam_id>", methods=["POST"])
+@api_endpoint
+def api_camera_info(cam_id):
+    """Rename a camera or set its field position (e.g. "Left goal")."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    data = request.get_json(force=True, silent=True) or {}
+    label = text_field(data, "label", 24, None) if "label" in data else None
+    position = text_field(data, "position", 40, None) if "position" in data else None
+    ok, message = set_camera_info(cam_id, label, position)
+    return jsonify(ok=ok, message=message, cameras=get_cameras()), 200 if ok else 400
 
 
 # --- Audio source ------------------------------------------------------
@@ -1232,6 +1253,7 @@ def initialize():
     if _resume_pending:
         log.info("The app stopped while live; resuming the broadcast once a camera is back")
     load_audio_setting()
+    load_camera_setting()
     start_monitor_worker()  # plays in the headset once MediaMTX runs, if listening was on
     threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()

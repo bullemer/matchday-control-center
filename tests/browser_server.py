@@ -54,7 +54,8 @@ def replay_calls():
     return a.jsonify(replay['calls'])
 a.start_recording=lambda profile,title='': (recording.update(active=True) or True,'Recording starting')
 a.stop_recording=lambda: (recording.update(active=False) or True,'Recording stopped; saving the file')
-a.switch_camera=lambda camera: (False,'Camera unavailable')
+a.switch_camera=lambda camera, source='manual': (False,'Camera unavailable')
+a.set_camera_info=lambda cam, label=None, position=None: (True,'Camera saved')
 a.set_audio_source=lambda mode: (True,'Audio updated')
 mic_delay=[]
 a.set_mic_delay=lambda ms: (mic_delay.append(ms) or True,f'Microphone delay {ms/1000:.1f} s')  # never the real data/audio.json

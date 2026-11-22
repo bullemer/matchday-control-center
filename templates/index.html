@@ -135,6 +135,10 @@
     @media (max-width: 640px) { .cut-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .match-cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; }
     .match-cut-grid .text-2xl { font-size: 1.2rem; line-height: 1.6rem; }
+    /* Reporting cameras and replay: a second, lower row under the four match cameras */
+    .match-cut.report-cut, .match-cut.row2-cut { min-height: 60px; }
+    .match-cut-grid .replay-wide { grid-column: span 2; }
+    .report-cut { outline: 2px dashed #b45309; outline-offset: -4px; }
     .replay-cut-idle { background: #4c1d95; color: #ede9fe; }
     .replay-cut-air { background: #7c3aed; color: #fff; box-shadow: 0 0 0 3px #c4b5fd; }
     .replay-grid { display: grid; gap: .75rem; }
@@ -369,15 +373,15 @@
           </div>
         </div>
         <div class="match-cut-grid">
-          {% for n in [1, 2, 3] %}
-          <button data-cut="cam{{ n }}" onclick="switchCam('cam{{ n }}')"
-                  data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
-            <span class="text-2xl font-extrabold">CAM {{ n }}</span>
+          {% for cam in cameras %}
+          <button data-cut="{{ cam.id }}" onclick="switchCam('{{ cam.id }}')" title="{{ cam.label }} (key {{ cam.key }})"
+                  data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all {{ 'report-cut' if cam.role == 'report' else '' }}">
+            <span class="text-2xl font-extrabold">{{ cam.short }}</span>
             <span data-cut-state class="text-xs font-semibold uppercase tracking-wider">—</span>
           </button>
           {% endfor %}
-          <button data-cut-replay onclick="cutToReplay()" title="CAM REPLAY (4)"
-                  data-base="cut-btn match-cut rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
+          <button data-cut-replay onclick="cutToReplay()" title="CAM REPLAY (0)"
+                  data-base="cut-btn match-cut row2-cut replay-wide rounded-xl flex flex-col items-center justify-center gap-1 transition-all">
             <span class="text-2xl font-extrabold">REPLAY</span>
             <span data-cut-state class="text-xs font-semibold uppercase tracking-wider">—</span>
           </button>
@@ -386,7 +390,7 @@
           <div class="flex gap-2">
             <button data-mute="compact" onclick="toggleMute()" aria-pressed="false" class="mute-btn mute-compact">🔊 Mute</button>
             <div class="flex-1 grid grid-cols-4 rounded-lg overflow-hidden border border-slate-600">
-              <button data-audio="off" onclick="setAudioSource('off')" title="No camera or mic sound" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🔇 Off</button>
+              <button data-audio="off" onclick="setAudioSource('off')" title="No match camera or mic sound (reporting cameras stay audible while in the picture)" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🔇 Off</button>
               <button data-audio="cam1" onclick="setAudioSource('cam1')" title="Cam 1 mic" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🎙 Cam 1</button>
               <button data-audio="active" onclick="setAudioSource('active')" title="Follow camera" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🔄 Follow</button>
               <button data-audio="usb" onclick="setAudioSource('usb')" title="USB mic" class="px-0.5 py-2.5 text-xs font-medium whitespace-nowrap">🎤 USB</button>
@@ -537,62 +541,43 @@
         <span class="text-xs text-slate-400 font-normal">(Tap to scan QR or copy on camera phones)</span>
         <span id="camera-links-network" class="text-xs text-brand-cyan font-normal"></span>
       </h2>
-      <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-        <!-- Cam 1 -->
-        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-semibold text-white">📹 Cam 1</span>
-            <span id="cam-badge-cam1" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
+      {% for role, title, hint in [('match', '⚽ Match cameras', 'film the game'), ('report', '🎤 Reporting cameras', 'interviews and surroundings · heard while in the picture · recorded on their own')] %}
+      <h3 class="text-sm font-semibold text-slate-300 {{ 'mt-5' if role == 'report' else '' }} mb-2">{{ title }} <span class="text-xs text-slate-500 font-normal">{{ hint }}</span></h3>
+      <div class="grid grid-cols-1 sm:grid-cols-2 {{ 'lg:grid-cols-4' if role == 'match' else '' }} gap-4">
+        {% for cam in cameras if cam.role == role %}
+        <div class="bg-slate-900 rounded-lg p-4 border {{ 'border-amber-700' if role == 'report' else 'border-slate-700' }}" data-camera-card="{{ cam.id }}">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <span class="font-semibold text-white truncate">{{ '🎤' if role == 'report' else '📹' }} <span data-cam-label="{{ cam.id }}">{{ cam.label }}</span> <span class="text-xs text-slate-500 font-normal">key {{ cam.key }}</span></span>
+            <span id="cam-badge-{{ cam.id }}" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
           </div>
-          <code id="url-cam1" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam1{{ camera_query }}</code>
+          <div class="grid grid-cols-2 gap-2 mb-2">
+            <input data-cam-edit="label" data-cam="{{ cam.id }}" value="{{ cam.label }}" maxlength="24" aria-label="{{ cam.label }} name"
+                   onchange="saveCameraInfo('{{ cam.id }}', 'label', this.value)" class="dest-input text-xs" placeholder="Name">
+            <input data-cam-edit="position" data-cam="{{ cam.id }}" value="{{ cam.position }}" maxlength="40" aria-label="{{ cam.label }} position"
+                   onchange="saveCameraInfo('{{ cam.id }}', 'position', this.value)" class="dest-input text-xs"
+                   placeholder="{{ 'Position, e.g. left goal' if role == 'match' else 'e.g. clubhouse' }}">
+          </div>
+          {% if role == 'report' %}
+          <label class="flex items-center gap-2 text-xs text-slate-300 mb-2">
+            <input type="checkbox" data-report-sound="{{ cam.id }}" checked onchange="setReportSound('{{ cam.id }}', this.checked)">
+            🔊 Sound while in picture
+          </label>
+          {% endif %}
+          <code id="url-{{ cam.id }}" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/{{ cam.id }}{{ camera_query }}</code>
           <div class="grid grid-cols-2 gap-2">
-            <button onclick="copyRtmp(cameraUrl('cam1'))"
+            <button onclick="copyRtmp(cameraUrl('{{ cam.id }}'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
               📋 Copy RTMP
             </button>
-            <button onclick="showCameraQR('cam1')"
+            <button onclick="showCameraQR('{{ cam.id }}')"
                     class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
               📱 Tally &amp; QR
             </button>
           </div>
         </div>
-        <!-- Cam 2 -->
-        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-semibold text-white">📹 Cam 2</span>
-            <span id="cam-badge-cam2" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
-          </div>
-          <code id="url-cam2" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam2{{ camera_query }}</code>
-          <div class="grid grid-cols-2 gap-2">
-            <button onclick="copyRtmp(cameraUrl('cam2'))"
-                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
-              📋 Copy RTMP
-            </button>
-            <button onclick="showCameraQR('cam2')"
-                    class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
-              📱 Tally &amp; QR
-            </button>
-          </div>
-        </div>
-        <!-- Cam 3 -->
-        <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
-          <div class="flex items-center justify-between mb-2">
-            <span class="font-semibold text-white">📹 Cam 3</span>
-            <span id="cam-badge-cam3" class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">OFFLINE</span>
-          </div>
-          <code id="url-cam3" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/cam3{{ camera_query }}</code>
-          <div class="grid grid-cols-2 gap-2">
-            <button onclick="copyRtmp(cameraUrl('cam3'))"
-                    class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
-              📋 Copy RTMP
-            </button>
-            <button onclick="showCameraQR('cam3')"
-                    class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
-              📱 Tally &amp; QR
-            </button>
-          </div>
-        </div>
+        {% endfor %}
       </div>
+      {% endfor %}
     </section>
 
     <!-- ─────────────────────────────────────────────────────────────────
@@ -604,41 +589,8 @@
         <button onclick="openLayoutEditor()" aria-label="Video layout" class="ml-auto text-sm px-3 py-2 rounded bg-brand-blue text-white">Layout</button>
       </h2>
 
-      <!-- 2x2 WebRTC Grid -->
-      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
-        <!-- Cam 1 Preview -->
-        <div>
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 1</span>
-            <span id="mv-badge-cam1" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
-          </div>
-          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam1">
-            <div class="preview-offline" data-offline="cam1">Camera offline</div>
-            <iframe data-camera="cam1" data-preview="setup" data-src="http://{{ media_host }}:8889/cam1" allow="autoplay" loading="lazy"></iframe>
-          </div>
-        </div>
-        <!-- Cam 2 Preview -->
-        <div>
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 2</span>
-            <span id="mv-badge-cam2" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
-          </div>
-          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam2">
-            <div class="preview-offline" data-offline="cam2">Camera offline</div>
-            <iframe data-camera="cam2" data-preview="setup" data-src="http://{{ media_host }}:8889/cam2" allow="autoplay" loading="lazy"></iframe>
-          </div>
-        </div>
-        <!-- Cam 3 Preview -->
-        <div>
-          <div class="flex items-center justify-between mb-1">
-            <span class="text-xs font-semibold text-slate-400 uppercase tracking-wider">Cam 3</span>
-            <span id="mv-badge-cam3" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
-          </div>
-          <div class="webrtc-frame border-2 border-slate-700" id="frame-cam3">
-            <div class="preview-offline" data-offline="cam3">Camera offline</div>
-            <iframe data-camera="cam3" data-preview="setup" data-src="http://{{ media_host }}:8889/cam3" allow="autoplay" loading="lazy"></iframe>
-          </div>
-        </div>
+      <!-- Program + output, then every camera -->
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-3">
         <!-- Program Output -->
         <div>
           <div class="flex items-center justify-between mb-1">
@@ -661,24 +613,30 @@
           </div>
         </div>
       </div>
+      <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
+        {% for cam in cameras %}
+        <div>
+          <div class="flex items-center justify-between gap-1 mb-1">
+            <span class="text-xs font-semibold {{ 'text-amber-400' if cam.role == 'report' else 'text-slate-400' }} uppercase tracking-wider truncate" data-cam-label="{{ cam.id }}">{{ cam.label }}</span>
+            <span id="mv-badge-{{ cam.id }}" class="text-xs px-1.5 py-0.5 rounded bg-slate-700 text-slate-500">—</span>
+          </div>
+          <div class="webrtc-frame border-2 border-slate-700" id="frame-{{ cam.id }}">
+            <div class="preview-offline" data-offline="{{ cam.id }}">Camera offline</div>
+            <iframe data-camera="{{ cam.id }}" data-preview="setup" data-src="http://{{ media_host }}:8889/{{ cam.id }}" allow="autoplay" loading="lazy"></iframe>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
 
       <!-- Tally / Cut Buttons -->
       <div class="cut-grid mb-4">
-        <button id="btn-cut-cam1" data-cut="cam1" onclick="switchCam('cam1')"
-                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
-          <span>🎥 CUT TO CAM 1</span>
+        {% for cam in cameras %}
+        <button id="btn-cut-{{ cam.id }}" data-cut="{{ cam.id }}" onclick="switchCam('{{ cam.id }}')" title="{{ cam.label }} (key {{ cam.key }})"
+                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center {{ 'report-cut' if cam.role == 'report' else '' }}">
+          <span class="truncate max-w-full px-1">{{ '🎤' if cam.role == 'report' else '🎥' }} <span data-cam-label="{{ cam.id }}">{{ cam.label }}</span></span>
           <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
         </button>
-        <button id="btn-cut-cam2" data-cut="cam2" onclick="switchCam('cam2')"
-                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
-          <span>🎥 CUT TO CAM 2</span>
-          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
-        </button>
-        <button id="btn-cut-cam3" data-cut="cam3" onclick="switchCam('cam3')"
-                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
-          <span>🎥 CUT TO CAM 3</span>
-          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
-        </button>
+        {% endfor %}
         <button id="btn-cut-replay" data-cut-replay onclick="cutToReplay()"
                 data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
           <span>🎬 CAM REPLAY</span>
@@ -734,7 +692,7 @@
             <option value="15">last 15 s</option><option value="20">last 20 s</option>
           </select>
         </div>
-        <p data-when-replay-off class="text-xs text-slate-500">Replays need the recording on (⏺ in the Live Stream &amp; Recording panel). Keys in Match mode: 4 CAM REPLAY, R replay, S slow-mo.</p>
+        <p data-when-replay-off class="text-xs text-slate-500">Replays need the recording on (⏺ in the Live Stream &amp; Recording panel). Keys in Match mode: 0 CAM REPLAY, R replay, S slow-mo.</p>
       </div>
 
       <!-- Audio Source Toggle -->
@@ -761,6 +719,7 @@
             </button>
           </div>
         </div>
+        <p class="text-xs text-slate-500">The source applies to the match cameras. Reporting cameras are heard whenever they are in the picture (full screen or inset); untick "Sound while in picture" on its card (🎥 Cams) to keep it silent.</p>
         <!-- USB Audio Device Selector (shown when USB mode active) -->
         <div id="usb-audio-selector" data-usb-picker class="hidden">
           <div class="flex items-center gap-2">
@@ -1091,12 +1050,12 @@
       </label>
       <label class="block text-sm">Main camera
         <select aria-label="Main camera" id="layout-main" onchange="updateLayoutFields()" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
-          <option value="cam1">Cam 1</option><option value="cam2">Cam 2</option><option value="cam3">Cam 3</option>
+          {% for cam in cameras %}<option value="{{ cam.id }}">{{ cam.label }}{{ ' (reporting)' if cam.role == 'report' else '' }}</option>{% endfor %}
         </select>
       </label>
       <label id="layout-secondary-row" class="block text-sm">Second camera
         <select aria-label="Second camera" id="layout-secondary" class="w-full mt-2 bg-slate-900 border border-slate-600 rounded-lg p-3">
-          <option value="cam1">Cam 1</option><option value="cam2">Cam 2</option><option value="cam3">Cam 3</option>
+          {% for cam in cameras %}<option value="{{ cam.id }}">{{ cam.label }}{{ ' (reporting)' if cam.role == 'report' else '' }}</option>{% endfor %}
         </select>
       </label>
       <label id="layout-position-row" class="block text-sm">Inset corner
@@ -1151,9 +1110,7 @@
 
       <!-- Quick camera tab switcher -->
       <div class="grid grid-cols-3 gap-1 bg-slate-900 p-1 rounded-lg text-xs font-semibold">
-        <button type="button" id="qr-tab-cam1" onclick="showCameraQR('cam1')" class="py-1.5 rounded text-center">Cam 1</button>
-        <button type="button" id="qr-tab-cam2" onclick="showCameraQR('cam2')" class="py-1.5 rounded text-center">Cam 2</button>
-        <button type="button" id="qr-tab-cam3" onclick="showCameraQR('cam3')" class="py-1.5 rounded text-center">Cam 3</button>
+        {% for cam in cameras %}<button type="button" id="qr-tab-{{ cam.id }}" onclick="showCameraQR('{{ cam.id }}')" class="py-1.5 rounded text-center truncate">{{ cam.label }}</button>{% endfor %}
       </div>
 
       <!-- Network guidance for the phone -->
@@ -1209,6 +1166,13 @@
        JAVASCRIPT
        ═══════════════════════════════════════════════════════════════════ -->
   <script>
+    // Cameras in display order: four match cameras, then the reporting cameras.
+    const CAMERAS = {{ cameras|tojson }};
+    const CAMERA_IDS = CAMERAS.map(c => c.id);
+    const REPORT_IDS = CAMERAS.filter(c => c.role === 'report').map(c => c.id);
+    const camInfo = id => state.cameraList.find(c => c.id === id) || {id, label: id, role: 'match', key: ''};
+    const camLabel = id => camInfo(id).label;
+
     // ──────────────────────── State ────────────────────────
     let state = {
       homeScore: 0,
@@ -1218,6 +1182,7 @@
       pendingCam: null,            // cut requested from this device, awaiting the server
       serverPendingCam: null,      // cut in flight from any device
       cameras: {},
+      cameraList: CAMERAS,         // [{id, role, key, label, position, short}]
       audioSource: 'off',          // 'off', 'cam1', 'active', or 'usb:<device_id>'
       audioDevices: [],            // detected USB audio devices from server
       selectedUsbDevice: null,     // currently selected USB device id
@@ -1290,7 +1255,7 @@
       const dialog = document.getElementById('qr-dialog');
       if (!dialog) return;
 
-      for (const c of ['cam1', 'cam2', 'cam3']) {
+      for (const c of CAMERA_IDS) {
         const tab = document.getElementById('qr-tab-' + c);
         if (tab) {
           if (c === cam) {
@@ -1303,7 +1268,7 @@
 
       const qrUrl = tallyUrl(cam);
       const rtmp = cameraUrl(cam);
-      document.getElementById('qr-modal-title').textContent = `📱 Camera Setup · ${cam.toUpperCase()}`;
+      document.getElementById('qr-modal-title').textContent = `📱 Camera Setup · ${camLabel(cam)}`;
       document.getElementById('qr-tally-url').textContent = qrUrl;
       document.getElementById('qr-tally-link').href = qrUrl;
       document.getElementById('qr-rtmp-url').textContent = rtmp;
@@ -1573,12 +1538,14 @@
       (firstEmpty || destRow('youtube')).querySelector('[data-dest-key]').focus();
     }
 
-    // Match-mode keys (laptop keyboard): 1–3 cut, 4 CAM REPLAY, M mute, H highlight, R replay, S slow-motion replay.
+    // Match-mode keys (laptop keyboard): 1–4 match cameras, 5–6 reporting cameras, 0 CAM REPLAY,
+    // M mute, H highlight, R replay, S slow-motion replay.
     document.addEventListener('keydown', event => {
       if (!state.matchMode || document.getElementById('clock-editor').open || document.getElementById('layout-editor').open || event.repeat || event.ctrlKey || event.metaKey || event.altKey) return;
       if (event.target.closest('input, select, textarea')) return;
-      if (['1', '2', '3'].includes(event.key)) switchCam('cam' + event.key);
-      if (event.key === '4') cutToReplay();
+      const keyed = CAMERAS.find(c => c.key === event.key);
+      if (keyed) switchCam(keyed.id);
+      if (event.key === '0') cutToReplay();
       if ((event.key === 'h' || event.key === 'H') && state.recording && state.recording.active) markHighlight();
       if ((event.key === 'r' || event.key === 'R') && state.replay.available) playReplay(1);
       if ((event.key === 's' || event.key === 'S') && state.replay.available) playReplay(0.5);
@@ -1586,7 +1553,7 @@
     });
 
     function openLayoutEditor() {
-      const layout = state.videoLayout || {mode:'single', main:state.selectedCam || 'cam1', secondary:'cam2', position:'top-right'};
+      const layout = state.videoLayout || {mode:'single', main:state.selectedCam || CAMERA_IDS[0], secondary:REPORT_IDS[0], position:'top-right'};
       for (const key of ['mode','main','secondary','position']) document.getElementById('layout-' + key).value = layout[key];
       document.getElementById('layout-error').textContent = '';
       updateLayoutFields();
@@ -1597,13 +1564,15 @@
       const mode = document.getElementById('layout-mode').value;
       const main = document.getElementById('layout-main').value;
       const secondary = document.getElementById('layout-secondary');
-      for (const option of secondary.options) option.disabled = option.value === main;
-      if (secondary.value === main) secondary.value = [...secondary.options].find(option => !option.disabled).value;
+      // Two pictures need a reporting camera: match cameras are never combined.
+      const mainIsReport = REPORT_IDS.includes(main);
+      for (const option of secondary.options) option.disabled = option.value === main || (!mainIsReport && !REPORT_IDS.includes(option.value));
+      if (secondary.selectedOptions[0]?.disabled) secondary.value = [...secondary.options].find(option => !option.disabled).value;
       document.getElementById('layout-secondary-row').classList.toggle('hidden', mode === 'single');
       document.getElementById('layout-position-row').classList.toggle('hidden', mode !== 'pip');
       document.getElementById('layout-description').textContent = {
         single:'The main camera fills the screen.',
-        pip:'The main camera fills the screen. The second camera takes one-quarter of the image in the selected corner.',
+        pip:'The main camera fills the screen. The second camera takes one-quarter of the image in the selected corner. Typical: the game big, the interview small. One of the two must be a reporting camera; its sound is on while it is in the picture.',
         split:'Main camera on the left, second camera on the right. Each gets half the screen; pictures are fitted without stretching or cropping.'
       }[mode];
     }
@@ -1633,10 +1602,7 @@
     // ──────────────────────── Camera Switching ────────────────────────
     let cutSequence = 0;
     async function switchCam(camId) {
-      if (state.videoLayout && state.videoLayout.mode !== 'single' && camId === state.videoLayout.secondary) {
-        showToast('Use Video layout to swap the main and second cameras', 'info');
-        return;
-      }
+      // Cutting to the camera in the inset shows it full screen (the server ends the layout).
       const sequence = ++cutSequence;
       state.pendingCam = camId;
       updateTallyButtons();
@@ -1689,7 +1655,7 @@
         btn.disabled = !r.available;
         btn.querySelector('[data-cut-state]').textContent = label;
       });
-      ['cam1', 'cam2', 'cam3'].forEach(c => {
+      CAMERA_IDS.forEach(c => {
         const frame = document.getElementById('frame-' + c);
         if (!frame) return;
         frame.classList.toggle('border-red-500', c === state.activeCam);
@@ -1907,7 +1873,7 @@
       if (!(rec.live || []).length) return '';
       const rows = rec.live.map(w => `<li class="marker-row">
           <span class="font-mono text-sm text-white">${esc(w.time)}</span>
-          <span class="text-xs text-slate-400">${esc(w.camera.replace('cam', 'Cam '))} · ${fmtDuration(w.duration)}</span>
+          <span class="text-xs text-slate-400">${esc(camLabel(w.camera))} · ${fmtDuration(w.duration)}</span>
           <span class="ml-auto flex gap-1">
             <button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, w.file))}')" aria-label="Play live footage">▶</button>
             <a class="rec-action" href="${esc(recordingUrl(rec.id, w.file, true))}" aria-label="Download live footage">⬇</a></span>
@@ -1915,6 +1881,51 @@
       return `<h4 class="text-sm font-semibold text-slate-300">📹 Live during replays</h4>
         <p class="text-xs text-slate-400">The recording shows the replays at these times; this is what the camera filmed meanwhile. Highlights marked during a replay are cut from it.</p>
         <ul class="space-y-1">${rows}</ul>`;
+    }
+
+    function isoFiles(rec) {
+      // Reporting cameras are recorded on their own, on air or not (interviews for later).
+      if (!(rec.iso || []).length) return '';
+      const rows = rec.iso.map(p => `<li class="marker-row">
+          <span class="text-sm text-white">🎤 ${esc(camLabel(p.camera))}</span>
+          <span class="text-xs text-slate-400">${p.recording ? 'recording…' : (p.time ? 'from ' + esc(p.time) + ' · ' : '') + fmtDuration(p.duration)}</span>
+          ${p.recording ? '' : `<span class="ml-auto flex gap-1">
+            <button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, p.file))}')" aria-label="Play reporting camera">▶</button>
+            <a class="rec-action" href="${esc(recordingUrl(rec.id, p.file, true))}" aria-label="Download reporting camera">⬇</a></span>`}
+        </li>`).join('');
+      return `<h4 class="text-sm font-semibold text-slate-300">🎤 Reporting cameras</h4>
+        <p class="text-xs text-slate-400">Everything the reporting cameras filmed, also when not on air. "from" is the time in the match recording.</p>
+        <ul class="space-y-1">${rows}</ul>`;
+    }
+
+    function renderCameraNames(list) {
+      state.cameraList = list;
+      for (const cam of list) {
+        document.querySelectorAll(`[data-cam-label="${cam.id}"]`).forEach(el => { el.textContent = cam.label; });
+        document.querySelectorAll(`[data-cam-edit][data-cam="${cam.id}"]`).forEach(el => {
+          if (document.activeElement !== el) el.value = cam[el.dataset.camEdit];
+        });
+      }
+    }
+
+    async function setReportSound(cam, on) {
+      const {ok, data} = await apiRequest('/api/audio/mix', {channel: cam, on});
+      if (!ok) showToast(data.error || data.message || 'Could not change the sound', 'error');
+      if (data.mixer) showReportSound(data.mixer);
+    }
+
+    function showReportSound(mixer) {
+      for (const cam of REPORT_IDS) {
+        const box = document.querySelector(`[data-report-sound="${cam}"]`);
+        const channel = mixer.channels && mixer.channels[cam];
+        if (box && channel && document.activeElement !== box) box.checked = !!channel.on;
+      }
+    }
+
+    async function saveCameraInfo(cam, field, value) {
+      const {ok, data} = await apiRequest('/api/cameras/' + cam, {[field]: value});
+      if (ok) { renderCameraNames(data.cameras); showToast(data.message, 'success'); }
+      else showToast(data.error || data.message || 'Could not save camera', 'error');
     }
 
     function recordingCard(rec) {
@@ -1947,7 +1958,7 @@
         ${actions ? `<div class="flex flex-wrap gap-2">${actions}</div>` : ''}
         <div data-player></div>
         <h4 class="text-sm font-semibold text-slate-300">⭐ Highlights</h4>
-        ${markers}${chapters}${liveWindows(rec)}`;
+        ${markers}${chapters}${liveWindows(rec)}${isoFiles(rec)}`;
     }
 
     let recordingsBusy = false;
@@ -2716,7 +2727,7 @@
 
     function meterName(key) {
       if (key === 'program') return 'Program audio';
-      if (key.startsWith('cam')) return 'Cam ' + key.slice(3);
+      if (key.startsWith('cam')) return (REPORT_IDS.includes(key) ? '🎤 ' : '') + camLabel(key);
       const dev = state.audioDevices.find(d => d.pulse_source === key.slice(4) || deviceId(d) === key.slice(4));
       return '🎤 ' + (dev ? dev.name : 'Microphone');
     }
@@ -2850,6 +2861,7 @@
 
     function renderMeters(info) {
       if (info.mixer) showMicDelay(info.mixer.mic_delay_ms);
+      if (info.mixer) showReportSound(info.mixer);
       if (info.mixer) showGate(info.mixer.gate);
       if (info.mixer && info.mixer.monitor) showMonitor(info.mixer.monitor);
       if (info.mixer && !mutePending && state.muted !== !!info.mixer.muted) {
@@ -2973,7 +2985,7 @@
       else setBanner('Connected', 'ok');
 
       if (network.camera_ip) cameraHost = network.camera_ip;
-      for (const cam of ['cam1', 'cam2', 'cam3']) document.getElementById('url-' + cam).textContent = cameraUrl(cam);
+      for (const cam of CAMERA_IDS) document.getElementById('url-' + cam).textContent = cameraUrl(cam);
       renderCameraNetwork(network);
 
       // --- USB Internet ---
@@ -3017,7 +3029,8 @@
       state.cameras = data.cameras || {};
       state.connectionLost = false;
       syncPreviews();
-      ['cam1', 'cam2', 'cam3'].forEach(c => {
+      if (data.camera_list) renderCameraNames(data.camera_list);
+      CAMERA_IDS.forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);
         const isLive = state.cameras[c];
