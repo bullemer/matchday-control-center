@@ -380,6 +380,7 @@
             <button type="button" id="match-zoom-cam" onclick="cycleMatchZoomCam()" title="Tap for the next phone camera"
                     class="px-2 py-1 rounded bg-slate-900 border border-slate-600 text-slate-200 font-semibold">🔍 —</button>
             <span id="match-zoom-info" class="flex-1 min-w-0 truncate text-slate-400"></span>
+            <span id="match-zoom-auto" class="shrink-0 text-slate-400" style="display:none" title="The gimbal controls the zoom (auto zoom on in the app)">auto zoom</span>
             <span id="match-zoom-buttons" class="flex items-center gap-1 shrink-0">
               <button type="button" onclick="matchZoom({wide: true})" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">W</button>
               <button type="button" onclick="matchZoom({step: -1})" aria-label="match zoom out" class="px-2.5 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
@@ -2111,15 +2112,17 @@
     // first reporting phone; tapping the camera name goes to the next one.
     let matchZoomChoice = null;
     let lastReports = {};
-    function zoomablePhones() {
-      return CAMERA_IDS.filter(c => lastReports[c] && lastReports[c].remote_zoom);
+    // Every reporting phone (battery / temperature); zoom buttons only where remote zoom is allowed.
+    function reportingPhones() {
+      return CAMERA_IDS.filter(c => lastReports[c]);
     }
     function matchZoomCam() {
-      const phones = zoomablePhones();
+      const phones = reportingPhones();
       if (!phones.length) return null;
       if (matchZoomChoice && phones.includes(matchZoomChoice)) return matchZoomChoice;
       const onAir = state.activeCam;
-      return phones.includes(onAir) ? onAir : phones[0];
+      if (phones.includes(onAir)) return onAir;
+      return phones.find(c => lastReports[c].remote_zoom) || phones[0];
     }
     function renderMatchZoom() {
       const row = document.getElementById('match-zoom');
@@ -2138,9 +2141,12 @@
       info.className = 'flex-1 min-w-0 truncate ' + (r.warning ? 'text-brand-amber font-semibold' : 'text-slate-400');
       const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
       document.getElementById('match-zoom-value').textContent = shown != null ? shown.toFixed(1) + '×' : '';
+      // Gimbal with auto zoom: the gimbal decides, so no buttons.
+      document.getElementById('match-zoom-buttons').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
+      document.getElementById('match-zoom-auto').style.display = r.remote_zoom ? 'none' : '';
     }
     function cycleMatchZoomCam() {
-      const phones = zoomablePhones();
+      const phones = reportingPhones();
       if (phones.length < 2) return;
       const cur = matchZoomCam();
       matchZoomChoice = phones[(phones.indexOf(cur) + 1) % phones.length];
@@ -2148,7 +2154,7 @@
     }
     async function matchZoom(body) {
       const cam = matchZoomCam();
-      if (!cam) return;
+      if (!cam || !lastReports[cam].remote_zoom) return;
       await cameraZoom(cam, body);
       const v = document.querySelector(`[data-phone-box="${cam}"] [data-phone-zoom-value]`);
       if (v) document.getElementById('match-zoom-value').textContent = v.textContent;

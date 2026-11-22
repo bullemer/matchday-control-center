@@ -830,6 +830,7 @@ test('four match and two reporting cameras: cut row, keys, layout rule and camer
   await panel.getByRole('button', {name: 'match zoom in'}).click();
   await zoomed;
   await expect(panel.locator('#match-zoom-value')).toHaveText('0.8×');
+  await expect(panel.locator('#match-zoom-auto')).toBeHidden();
   await page.screenshot({path:'/tmp/mcc-six-cameras.png'});
   // Keys 1-4 match cameras, 5-6 reporting cameras.
   const cut = page.waitForRequest('**/api/switch/cam5');
