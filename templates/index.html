@@ -25,6 +25,7 @@
     #match-panel .overlay-control { font-size: .75rem; white-space: nowrap; }
     .preview-offline { position: absolute; inset: 0; display: grid; place-content: center; text-align: center; color: #94a3b8; font-size: .875rem; }
     .preview-offline[hidden] { display: none; }
+    .phone-status.shown { display: flex; flex-wrap: wrap; }
     .overlay-switch { appearance: none; flex-shrink: 0; width: 36px; height: 22px;
       border-radius: 12px; background: #475569; position: relative; cursor: pointer; }
     .overlay-switch::before { content: ''; position: absolute; width: 16px; height: 16px;
@@ -603,6 +604,15 @@
           <p class="text-xs text-slate-400 mb-1">Set in the app: <span data-cam-recommended="{{ cam.id }}"></span></p>
           <code id="url-{{ cam.id }}" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-2 break-all select-all">rtmp://{{ media_host }}:1935/{{ cam.id }}{{ camera_query }}</code>
           <p data-cam-input="{{ cam.id }}" class="text-xs text-slate-400 mb-3 min-h-[1rem]"></p>
+          <div data-cam-phone="{{ cam.id }}" class="phone-status hidden items-center justify-between gap-2 text-xs mb-3 -mt-2">
+            <span data-cam-phone-info="{{ cam.id }}" class="w-full text-slate-300"></span>
+            <span data-cam-zoom="{{ cam.id }}" class="flex items-center gap-1 shrink-0 ml-auto" title="Zoom of the phone camera (Chameleon Stream app)">
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {wide: true})" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">Wide</button>
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: -1})" aria-label="{{ cam.label }} zoom out" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">−</button>
+              <span data-cam-zoom-value="{{ cam.id }}" class="w-12 text-center text-slate-200 font-mono"></span>
+              <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: 1})" aria-label="{{ cam.label }} zoom in" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">+</button>
+            </span>
+          </div>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('{{ cam.id }}'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
@@ -2041,6 +2051,34 @@
       }
     }
 
+    // Phone status (battery, temperature) and remote zoom from the Chameleon Stream app.
+    function renderCameraReports(reports) {
+      for (const cam of CAMERA_IDS) {
+        const box = document.querySelector(`[data-cam-phone="${cam}"]`);
+        if (!box) continue;
+        const r = reports[cam];
+        box.classList.toggle('shown', !!r);
+        if (!r) continue;
+        const parts = [];
+        if (r.battery != null) parts.push(`🔋 ${Math.round(r.battery)} %${r.charging ? ' ⚡' : ''}`);
+        if (r.temp_c != null) parts.push(`🌡 ${r.temp_c.toFixed(0)} °C`);
+        if (r.thermal && r.thermal !== 'none') parts.push(`heat: ${r.thermal}`);
+        if (r.mode) parts.push(r.mode === 'fixed' ? 'fixed wide' : r.mode);
+        const info = box.querySelector('[data-cam-phone-info]');
+        info.textContent = '📱 ' + parts.join(' · ') + (r.warning ? ' — ⚠ ' + r.warning : '');
+        info.className = 'w-full ' + (r.warning ? 'text-brand-amber font-semibold' : 'text-slate-300');
+        box.querySelector('[data-cam-zoom]').style.display = r.remote_zoom ? '' : 'none';  // class flex beats [hidden]
+        const shown = r.zoom_target != null ? r.zoom_target : r.zoom;
+        if (shown != null) box.querySelector('[data-cam-zoom-value]').textContent = shown.toFixed(1) + '×';
+      }
+    }
+
+    async function cameraZoom(cam, body) {
+      const {ok, data} = await apiRequest(`/api/cameras/${cam}/zoom`, body);
+      if (!ok) return showToast('❌ ' + (data.error || 'Zoom failed'), 'error');
+      document.querySelector(`[data-cam-zoom-value="${cam}"]`).textContent = data.zoom.toFixed(1) + '×';
+    }
+
     async function setReportSound(cam, on) {
       const {ok, data} = await apiRequest('/api/audio/mix', {channel: cam, on});
       if (!ok) showToast(data.error || data.message || 'Could not change the sound', 'error');
@@ -3165,6 +3203,7 @@
       syncPreviews();
       if (data.camera_list) renderCameraNames(data.camera_list);
       renderCameraInputs(data.camera_inputs || {});
+      renderCameraReports(data.camera_reports || {});
       CAMERA_IDS.forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);

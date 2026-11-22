@@ -23,6 +23,7 @@ from functools import wraps
 
 from flask import Flask, jsonify, render_template, request, send_file
 import recordings
+import camera_control
 
 from browser_overlay import BrowserOverlay, normalize_url
 
@@ -86,6 +87,7 @@ def protect_controls():
         request.path.startswith("/static/")
         or request.path.startswith("/tally/")
         or request.path.startswith("/api/tally/")
+        or request.path.startswith("/api/camera-report/")  # phones; checked in the route
     ):
         return None
     password = app.config.get("OPERATOR_PASSWORD")
@@ -289,6 +291,34 @@ def tally_page(cam_id):
                            protocol=cam["protocol"], stream_url=stream_url, recommended=recommended)
 
 
+@app.route("/api/camera-report/<cam_id>", methods=["POST"])
+@api_endpoint
+def api_camera_report(cam_id):
+    """Status from the Chameleon Stream phone app (no operator login); answers with the zoom
+    the operator wants. With a camera password set, the phone must send it."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    password = camera_password()
+    if password and not secrets.compare_digest(request.headers.get("X-Camera-Password", "").encode(), password.encode()):
+        return jsonify(ok=False, error="Camera password required"), 401
+    if request.content_length and request.content_length > 4096:
+        return jsonify(ok=False, error="Report too large"), 413
+    answer = camera_control.record_report(cam_id, request.get_json(silent=True))
+    return jsonify(ok=True, **answer)
+
+
+@app.route("/api/cameras/<cam_id>/zoom", methods=["POST"])
+@api_endpoint
+def api_camera_zoom(cam_id):
+    """Operator zoom for a phone camera: {"zoom": 2.0} | {"step": 1 / -1} | {"wide": true}."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    data = request.get_json()
+    target = camera_control.request_zoom(cam_id, zoom=data.get("zoom"), step=data.get("step"),
+                                         wide=data.get("wide") is True)
+    return jsonify(ok=True, zoom=target)
+
+
 @app.route("/api/tally/<cam_id>")
 @api_endpoint
 def api_tally_status(cam_id):
@@ -348,6 +378,7 @@ def api_status():
         "cameras": cameras,
         "camera_list": get_cameras(),
         "camera_inputs": get_camera_inputs(),
+        "camera_reports": camera_control.get_reports(),
         "mediamtx": mediamtx,
         "stream": stream,
         "scoreboard": scoreboard,
