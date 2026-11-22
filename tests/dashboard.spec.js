@@ -7,7 +7,8 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await expect(page.locator('#net-hotspot-status')).toHaveText('Active');
   await expect(page.locator('#net-usb-status')).toHaveText('Phone connected');
-  await expect(page.locator('#url-cam1')).toHaveText('rtmp://10.55.0.1:1935/cam1?user=camera&pass=browser-camera');
+  // SRT is the default camera protocol.
+  await expect(page.locator('#url-cam1')).toHaveText('srt://10.55.0.1:8890?streamid=publish%3Acam1%3Acamera%3Abrowser-camera&latency=300000');
   await expect(page.locator('#audio-follow')).toHaveClass(/bg-brand-blue/);
   await page.locator('#home-name').fill('Test FC');
   await page.waitForTimeout(2200);
@@ -112,7 +113,7 @@ test('laptop on Wi-Fi without tether or hotspot gives cameras the Wi-Fi address'
   });
   await page.goto('/');
   await page.getByRole('tab', {name: /Cams/}).click();
-  await expect(page.locator('#url-cam1')).toHaveText('rtmp://192.168.1.50:1935/cam1?user=camera&pass=browser-camera');
+  await expect(page.locator('#url-cam1')).toHaveText('srt://192.168.1.50:8890?streamid=publish%3Acam1%3Acamera%3Abrowser-camera&latency=300000');
   await page.getByRole('tab', {name: /Network/}).click();
   await expect(page.locator('#camera-network-title')).toContainText('same Wi-Fi “Club WiFi”');
   await expect(page.locator('#status-hotspot-ip')).toHaveText('192.168.1.50');
@@ -424,7 +425,7 @@ test('camera cards show Tally and QR modal with vector SVG and field router inst
   await expect(page.locator('#qr-modal-title')).toContainText('Cam 1');
   await expect(page.locator('#qr-svg-container svg')).toBeVisible();
   await expect(page.locator('#qr-tally-url')).toContainText('/tally/cam1');
-  await expect(page.locator('#qr-rtmp-url')).toContainText('/cam1');
+  await expect(page.locator('#qr-rtmp-url')).toContainText('publish%3Acam1');
   await expect(page.locator('#qr-network-guide')).toBeVisible();
 
   await page.locator('#qr-tab-cam2').click();
@@ -853,7 +854,7 @@ test('four match and two reporting cameras: cut row, keys, layout rule and camer
   await expect(page.getByText('🎤 Reporting cameras')).toBeVisible();
   await expect(page.locator('[data-camera-card]')).toHaveCount(6);
   await expect(page.locator('[data-report-sound]')).toHaveCount(2);
-  await expect(page.locator('#url-cam6')).toContainText(':1935/cam6');
+  await expect(page.locator('#url-cam6')).toContainText(':8890?streamid=publish%3Acam6');
   const saved = page.waitForRequest(req => req.url().endsWith('/api/cameras/cam2') && req.postDataJSON().position === 'Left goal');
   await page.locator('[data-cam-edit="position"][data-cam="cam2"]').fill('Left goal');
   await page.locator('[data-cam-edit="position"][data-cam="cam2"]').press('Tab');
@@ -868,12 +869,16 @@ test('camera input settings: SRT with delay and encryption, recommended quality,
   await expect(page.locator('#connection-status')).toHaveText('Connected');
   await page.locator('[data-tab-btn="cams"]').click();
   const card = page.locator('[data-camera-card="cam5"]');
-  await expect(card.locator('[data-cam-recommended]')).toHaveText('1280x720 · 30 fps · 3 Mbit/s · keyframe 1 s · H.264');
-  await expect(page.locator('#url-cam5')).toHaveText(/^rtmp:\/\/.*:1935\/cam5\?user=camera&pass=browser-camera$/);
-  await expect(card.locator('[data-srt-settings]')).toBeHidden();
-  await card.getByRole('button', {name: 'SRT'}).click();
+  // SRT by default: its settings show; RTMP is one click away (only H.264 there).
+  await expect(card.locator('[data-cam-recommended]')).toHaveText('1280x720 · 30 fps · 3 Mbit/s · keyframe 1 s · H.264 or H.265');
   await expect(card.locator('[data-srt-settings]')).toBeVisible();
   await expect(page.locator('#url-cam5')).toHaveText(/^srt:\/\/.*:8890\?streamid=publish%3Acam5%3Acamera%3Abrowser-camera&latency=300000$/);
+  await card.getByRole('button', {name: 'RTMP'}).click();
+  await expect(card.locator('[data-srt-settings]')).toBeHidden();
+  await expect(page.locator('#url-cam5')).toHaveText(/^rtmp:\/\/.*:1935\/cam5\?user=camera&pass=browser-camera$/);
+  await expect(card.locator('[data-cam-recommended]')).toHaveText('1280x720 · 30 fps · 3 Mbit/s · keyframe 1 s · H.264');
+  await card.getByRole('button', {name: 'SRT'}).click();
+  await expect(card.locator('[data-srt-settings]')).toBeVisible();
   await card.locator('[data-cam-edit="latency_ms"]').fill('500');
   await card.locator('[data-cam-edit="latency_ms"]').press('Tab');
   await expect(page.locator('#url-cam5')).toHaveText(/latency=500000$/);

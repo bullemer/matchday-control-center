@@ -490,7 +490,8 @@ MOUNTS = ("fixed", "tracking", "handheld")  # tracking: XbotGo, motorised gimbal
 def _default_camera(cam):
     # mount and wide matter for the future auto-director: a fixed camera covers a known part
     # of the pitch; a tracking camera follows play; the wide camera is the fallback shot.
-    return {"label": _default_label(cam), "position": "", "protocol": "rtmp", "latency_ms": 300,
+    # SRT by default: steadier on weak Wi-Fi, H.265, encryption (RTMP stays accepted too).
+    return {"label": _default_label(cam), "position": "", "protocol": "srt", "latency_ms": 300,
             "encrypt": False, "passphrase": "", "quality": "720p" if cam in REPORT_CAMERAS else "1080p",
             "mount": "handheld" if cam in REPORT_CAMERAS else "fixed", "wide": False}
 

@@ -260,8 +260,8 @@ class CameraInputSettingTests(unittest.TestCase):
     def cam(self, cam):
         return next(c for c in m.get_cameras() if c['id'] == cam)
 
-    def test_defaults_rtmp_and_quality_by_role(self):
-        self.assertEqual((self.cam('cam1')['protocol'], self.cam('cam1')['quality']), ('rtmp', '1080p'))
+    def test_defaults_srt_and_quality_by_role(self):
+        self.assertEqual((self.cam('cam1')['protocol'], self.cam('cam1')['quality']), ('srt', '1080p'))
         self.assertEqual(self.cam('cam5')['quality'], '720p')
         self.assertEqual(self.cam('cam5')['recommended'], {'size': '1280x720', 'fps': 30, 'kbps': 3000,
                                                           'keyframe_s': 1, 'label': '720p · 3 Mbit/s'})
@@ -290,7 +290,7 @@ class CameraInputSettingTests(unittest.TestCase):
                                                   'passphrase': 'short', 'quality': '8k'}}))
         m.load_camera_setting()
         cam = self.cam('cam2')
-        self.assertEqual((cam['protocol'], cam['latency_ms'], cam['encrypt'], cam['quality']), ('rtmp', 300, False, '1080p'))
+        self.assertEqual((cam['protocol'], cam['latency_ms'], cam['encrypt'], cam['quality']), ('srt', 300, False, '1080p'))
 
     def test_encryption_change_reloads_the_running_server(self):
         self.running.return_value = True
