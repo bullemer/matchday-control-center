@@ -34,3 +34,4 @@ ai-venv/
 models/*.pt
 models/*.engine
 models/*.onnx
+models/old/

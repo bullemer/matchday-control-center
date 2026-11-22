@@ -43,6 +43,7 @@ class Reader(threading.Thread):
         super().__init__(daemon=True)
         self.cam, self.url, self.fps, self.hwaccel = cam, url, fps, hwaccel
         self.frame, self.frame_t, self.online = None, 0.0, False
+        self.picture, self.picture_t, self.grey = ds.Picture(), 0.0, None
         self.error = ""
         self.lock = threading.Lock()
         self.proc = None
@@ -74,16 +75,25 @@ class Reader(threading.Thread):
                 if len(buf) < size:
                     break
                 got += 1
+                frame = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
+                now = time.time()
+                # Sharpness / exposure / freeze here, not in the main loop (OpenCV releases the GIL).
+                if now - self.picture_t >= PICTURE_EVERY_S:
+                    picture, self.grey = picture_metrics(frame, self.grey)
+                    self.picture_t = now
+                else:
+                    picture = None
                 with self.lock:
-                    self.frame = np.frombuffer(buf, np.uint8).reshape(H, W, 3)
-                    self.frame_t = time.time()
-                    self.online = True
+                    self.frame, self.frame_t, self.online = frame, now, True
+                    if picture is not None:
+                        self.picture = picture
             err = self.proc.stderr.read().decode(errors="replace").strip()[-300:] if self.proc.stderr else ""
             self.proc.kill()
             self.proc.wait()
             with self.lock:
                 self.online = False
                 self.error = err
+                self.picture, self.grey = ds.Picture(), None
             if self.stopped:
                 break
             if got == 0 and hw and time.monotonic() - started < 10:
@@ -94,6 +104,10 @@ class Reader(threading.Thread):
     def latest(self):
         with self.lock:
             return self.frame, self.frame_t, self.online
+
+    def latest_picture(self):
+        with self.lock:
+            return self.picture
 
     def stop(self):
         self.stopped = True
@@ -233,6 +247,8 @@ def ball_hint(pmap, ball):
     return ds.Detection(q[0], q[1] - r, 2 * r, 2 * r, ball["conf"]), ball["age"]
 
 
+PERSON_CONF_MIN, BALL_CONF_MIN = 0.3, 0.15
+STATUS_EVERY_S = 0.2                   # state.json for the dashboard: 5x per second is plenty
 MAX_PLAYERS, MAX_BALLS = 50, 5        # detections kept per frame (Ultralytics default 300: costly post-processing)
 PICTURE_EVERY_S = 0.2                  # sharpness / exposure / freeze measured 5x per second is plenty
 PERSON_SIZE, BALL_SIZE = (544, 960), (736, 1280)   # input h, w for 16:9 frames (TensorRT engines: exactly these)
@@ -251,6 +267,96 @@ def load_model(YOLO, models, name, size, device):
         except Exception as exc:  # built for another GPU / TensorRT version: fall back
             print(f"{engine.name} not usable ({exc}); using PyTorch", file=sys.stderr)
     return YOLO(str(models / f"{name}.pt")), "PyTorch"
+
+
+def to_detections(boxes):
+    return [ds.Detection(x, y, w, h, conf) for x, y, w, h, conf in boxes]
+
+
+class DirectDetector:
+    """TensorRT engines called directly (trt_runner.py): letterbox, inference and box
+    conversion on the GPU, no Ultralytics in the frame loop."""
+
+    def __init__(self, models, device):
+        import trt_runner
+        self.tr = trt_runner
+        self.person = trt_runner.EngineRunner(str(models / "yolo26s.engine"), PERSON_SIZE, device)
+        self.ball = trt_runner.EngineRunner(str(models / "box2boxcam-ball-v1.0.engine"), BALL_SIZE, device)
+        self.device, self.buffer = device, None
+        self.name = "TensorRT direct"
+        frames = [np.zeros((H, W, 3), np.uint8)]          # warm-up: CUDA kernels, TensorRT tactics
+        for _ in range(2):
+            self.detect(frames, [0])
+
+    def detect(self, frames, need):
+        """-> (players per needed frame, balls per frame). Both engines run at the same time."""
+        import torch
+        gpu, self.buffer = self.tr.upload(frames, self.device, self.buffer)
+        people_job = self.person.submit(gpu[torch.tensor(need, device=gpu.device)]) if need else None
+        ball_job = self.ball.submit(gpu)
+        balls = self.ball.collect(ball_job, BALL_CONF_MIN, None, MAX_BALLS)
+        people = self.person.collect(people_job, PERSON_CONF_MIN, {0}, MAX_PLAYERS)
+        return [to_detections(p) for p in people], [to_detections(b) for b in balls]
+
+
+class UltralyticsDetector:
+    """Fallback: Ultralytics predictors (PyTorch, or TensorRT engines without the NMS-free head)."""
+
+    def __init__(self, models, device):
+        from ultralytics import YOLO
+        self.person, pe = load_model(YOLO, models, "yolo26s", PERSON_SIZE, device)
+        self.ball, be = load_model(YOLO, models, "box2boxcam-ball-v1.0", BALL_SIZE, device)
+        self.name = pe if pe == be else f"{pe} + {be}"
+        self.p_kw = dict(quantize=16) if pe == "PyTorch" and device == 0 else {}
+        self.b_kw = dict(quantize=16) if be == "PyTorch" and device == 0 else {}
+        self.device = device
+        self.pool = ThreadPoolExecutor(1, thread_name_prefix="players")
+
+    def detect(self, frames, need):
+        run_people = (lambda: self.person.predict([frames[i] for i in need], imgsz=PERSON_SIZE, classes=[0],
+                                                  conf=PERSON_CONF_MIN, max_det=MAX_PLAYERS, device=self.device,
+                                                  verbose=False, **self.p_kw)) if need else (lambda: [])
+        people_job = self.pool.submit(run_people)     # in parallel with the ball model
+        balls = self.ball.predict(frames, imgsz=BALL_SIZE, conf=BALL_CONF_MIN, max_det=MAX_BALLS, device=self.device,
+                                  verbose=False, **self.b_kw)
+        return [detections(pr, keep={0}) for pr in people_job.result()], [detections(br) for br in balls]
+
+
+def make_detector(models, device):
+    """Direct TensorRT when the engines have the NMS-free head (MCC_AI_DIRECT=0 disables it),
+    else Ultralytics (TensorRT or PyTorch)."""
+    if device == 0 and os.environ.get("MCC_AI_TENSORRT", "1") != "0" and os.environ.get("MCC_AI_DIRECT", "1") != "0":
+        try:
+            return DirectDetector(models, device)
+        except Exception as exc:  # old engine, other GPU, missing tensorrt ...
+            print(f"direct TensorRT not available ({exc}); using Ultralytics", file=sys.stderr)
+    return UltralyticsDetector(models, device)
+
+
+class Thumbnails(threading.Thread):
+    """Annotated thumbnails are drawn and written off the frame loop (newest per camera wins)."""
+
+    def __init__(self, out):
+        super().__init__(daemon=True, name="thumbnails")
+        self.out, self.jobs, self.cond = out, {}, threading.Condition()
+
+    def put(self, cam, *args):
+        with self.cond:
+            self.jobs[cam] = args
+            self.cond.notify()
+
+    def run(self):
+        while True:
+            with self.cond:
+                while not self.jobs:
+                    self.cond.wait()
+                cam, args = self.jobs.popitem()
+            try:
+                jpg = thumbnail(*args)
+                if jpg:
+                    write_atomic(self.out / f"{cam}.jpg", jpg)
+            except Exception as exc:  # a drawing problem must not stop the analysis
+                print(f"thumbnail {cam}: {exc}", file=sys.stderr)
 
 
 def write_atomic(path, data):
@@ -283,21 +389,18 @@ def main():
 
     status(phase="loading", cams={})
     import torch
-    from ultralytics import YOLO
     device = 0 if torch.cuda.is_available() else "cpu"
     gpu = torch.cuda.get_device_name(0) if device == 0 else "CPU (no CUDA: slow)"
-    person_model, person_engine = load_model(YOLO, Path(args.models), "yolo26s", PERSON_SIZE, device)
-    ball_model, ball_engine = load_model(YOLO, Path(args.models), "box2boxcam-ball-v1.0", BALL_SIZE, device)
-    engine = person_engine if person_engine == ball_engine else f"{person_engine} + {ball_engine}"
-    p_kw = dict(quantize=16) if person_engine == "PyTorch" and device == 0 else {}
-    b_kw = dict(quantize=16) if ball_engine == "PyTorch" and device == 0 else {}
+    detector = make_detector(Path(args.models), device)
+    engine = detector.name
+    thumbs = Thumbnails(out)
+    thumbs.start()
 
     readers = {c: Reader(c, f"{args.rtsp}/{c}", args.fps, not args.no_hwaccel) for c in cams}
     for r in readers.values():
         r.start()
     states = {c: ds.CameraState() for c in cams}
     last_seen = {c: 0.0 for c in cams}
-    greys = {c: None for c in cams}
     results = {}
     thumbs_t = {c: 0.0 for c in cams}
     recommender = ds.Recommender()
@@ -308,9 +411,8 @@ def main():
     period = 1.0 / args.fps
     person_period = period * (2 if args.fps > 10 else 1)
     person_cache, person_t = {}, {}
-    pics, pic_t = {}, {}
-    pool = ThreadPoolExecutor(1, thread_name_prefix="players")
     loop_times = []
+    status_t = 0.0
 
     while not stop.is_set():
         t0 = time.time()
@@ -321,7 +423,6 @@ def main():
                 results[c] = {"online": False, "error": r.error[-160:]}
                 person_cache.pop(c, None)
                 states[c] = ds.CameraState()
-                greys[c] = None
                 continue
             if frame is not None and ft > last_seen[c]:
                 last_seen[c] = ft
@@ -331,18 +432,15 @@ def main():
             # Above 10 frames/s players are detected at half the rate (they move slower than the
             # ball; the ball model is the expensive one): the other frames reuse the last players.
             need = [i for i, (c, _) in enumerate(batch) if t0 - person_t.get(c, 0.0) >= person_period - 0.5 * period]
-            run_people = (lambda: person_model.predict([frames[i] for i in need], imgsz=PERSON_SIZE, classes=[0], conf=0.3,
-                                                       max_det=MAX_PLAYERS, device=device, verbose=False, **p_kw)) if need else (lambda: [])
-            people_job = pool.submit(run_people)     # in parallel with the ball model
-            balls = ball_model.predict(frames, imgsz=BALL_SIZE, conf=0.15, max_det=MAX_BALLS, device=device, verbose=False, **b_kw)
-            for i, pr in zip(need, people_job.result()):
+            people, balls = detector.detect(frames, need)
+            for i, persons in zip(need, people):
                 c = batch[i][0]
-                person_cache[c], person_t[c] = detections(pr, keep={0}), t0
+                person_cache[c], person_t[c] = persons, t0
             now = time.time()
             rounds = []
             sightings = []
-            for (c, frame), br in zip(batch, balls):
-                persons, ball_dets = person_cache.get(c, []), detections(br)
+            for (c, frame), ball_dets in zip(batch, balls):
+                persons = person_cache.get(c, [])
                 pmap = pitch_maps.get(c)
                 rounds.append((c, frame, persons, ball_dets, pmap))
                 if pmap is None:
@@ -360,25 +458,24 @@ def main():
                         sightings.append((c, pos[0], pos[1], b.conf))
             ball_now = pitch_ball.update(now, sightings)
             for c, frame, persons, ball_dets, pmap in rounds:
-                if now - pic_t.get(c, 0.0) >= PICTURE_EVERY_S or c not in pics:
-                    pics[c], greys[c] = picture_metrics(frame, greys[c])
-                    pic_t[c] = now
-                pic = pics[c]
+                pic = readers[c].latest_picture()
                 fence = None if pmap else fences.get(c)
                 hint = ball_hint(pmap, ball_now) if ball_now and ball_now["cam"] != c else None
                 info = ds.rate(states[c], now, W, H, persons, ball_dets, pic, fence,
                                area=pitch_area(pmap) if pmap else None, ball_hint=hint)
                 results[c] = {"online": True, **info}
                 if now - thumbs_t[c] >= THUMB_EVERY_S:
-                    jpg = thumbnail(frame, persons, ball_dets, info, fence, pmap, hint if info["ball"]["from_pitch"] else None)
-                    if jpg:
-                        write_atomic(out / f"{c}.jpg", jpg)
-                        thumbs_t[c] = now
+                    thumbs.put(c, frame, persons, ball_dets, info, fence, pmap, hint if info["ball"]["from_pitch"] else None)
+                    thumbs_t[c] = now
                 results[c]["image_t"] = thumbs_t[c]
         scores = {c: r["score"] for c, r in results.items() if r.get("online")}
         recommended = recommender.update(time.time(), scores)
         loop_times.append(time.time() - t0)
         loop_times = loop_times[-50:]
+        if time.time() - status_t < STATUS_EVERY_S:
+            stop.wait(max(0.0, period - (time.time() - t0)))
+            continue
+        status_t = time.time()
         status(phase="running", gpu=gpu, engine=engine, fps=args.fps, recommended=recommended,
                busy=round(sum(loop_times) / len(loop_times) / period, 2), cams=results,
                pitch={"ball": pitch_ball.current(time.time()),

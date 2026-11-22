@@ -44,7 +44,8 @@ if [ "${1:-}" = "--tensorrt" ]; then
 from ultralytics import YOLO
 # Rectangular 16:9 inputs and at most 4 match cameras at once keep the engines' GPU memory small.
 for name, size in (("yolo26s", (544, 960)), ("box2boxcam-ball-v1.0", (736, 1280))):
-    print("engine:", YOLO(f"models/{name}.pt").export(format="engine", half=True, dynamic=True, batch=4,
+    # nms=False: the NMS-free YOLO26 head (end2end): finished boxes, no NMS on the CPU.
+    print("engine:", YOLO(f"models/{name}.pt").export(format="engine", half=True, dynamic=True, batch=4, nms=False,
                                                      imgsz=size, device=0, workspace=1, verbose=False))
 PYEOF
 fi
