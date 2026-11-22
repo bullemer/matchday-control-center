@@ -678,6 +678,18 @@ def get_camera_inputs():
     return result
 
 
+PREVIEW_HEIGHT = 360
+PREVIEW_KBPS = 800
+
+
+def preview_command(cam):
+    """ffmpeg for the dashboard preview of one camera: H.264 360p, no sound (WebRTC previews are muted)."""
+    return (f"ffmpeg -hide_banner -nostdin -loglevel error -rtsp_transport tcp -i rtsp://127.0.0.1:8554/{cam} "
+            f"-an -vf scale=-2:{PREVIEW_HEIGHT} -c:v libx264 -preset ultrafast -tune zerolatency "
+            f"-b:v {PREVIEW_KBPS}k -maxrate {PREVIEW_KBPS}k -bufsize {PREVIEW_KBPS}k -g 30 -pix_fmt yuv420p "
+            f"-f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/{cam}_preview")
+
+
 def generate_mediamtx_config():
     # A continuous program path supplies video + silence during cuts/source loss.
     # Program publishing is loopback-only; phones may publish only camera paths.
@@ -694,7 +706,7 @@ def generate_mediamtx_config():
             if password else {"user": "any", "ips": [], "permissions": camera_publish},
             {"user": "any", "ips": [], "permissions": [{"action": "read"}]},
             {"user": "any", "ips": ["127.0.0.1", "::1"], "permissions": [
-                {"action": "api"}, {"action": "publish", "path": f"~^(program|final|monitor|{cameras})$"}]},
+                {"action": "api"}, {"action": "publish", "path": f"~^(program|final|monitor|{cameras})(_preview)?$"}]},
         ],
         # A camera reconnecting after a Wi-Fi drop replaces its own stale session at once
         # (otherwise it is refused until MediaMTX times the dead one out).
@@ -706,6 +718,13 @@ def generate_mediamtx_config():
     for cam in CAMERA_IDS:
         if _camera_info[cam]["encrypt"]:
             config["paths"][cam]["srtPublishPassphrase"] = _camera_info[cam]["passphrase"]
+    # Browsers often cannot play H.265 over WebRTC ("codecs not supported by client"), so the
+    # dashboard shows H.265 cameras via camN_preview: a small H.264 copy made by ffmpeg only
+    # while someone watches it (MediaMTX starts it on the first viewer, stops it 10 s after the last).
+    for cam in CAMERA_IDS:
+        config["paths"][f"{cam}_preview"] = {
+            "runOnDemand": preview_command(cam), "runOnDemandRestart": True,
+            "runOnDemandStartTimeout": "15s", "runOnDemandCloseAfter": "10s"}
     program = {"alwaysAvailable": True}
     if _ensure_offline_card():
         program["alwaysAvailableFile"] = OFFLINE_CARD

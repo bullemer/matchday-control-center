@@ -2024,6 +2024,16 @@
         const el = document.querySelector(`[data-cam-input="${cam}"]`);
         if (!el) continue;
         const input = inputs[cam];
+        // H.265 cameras: most browsers cannot play H.265 over WebRTC, so the tile shows the
+        // laptop's small H.264 copy (camN_preview, made only while watched).
+        const frame = document.querySelector(`iframe[data-camera="${cam}"]`);
+        if (frame && input && input.codec) {
+          const path = input.codec === 'H265' ? cam + '_preview' : cam;
+          if (!frame.dataset.src.endsWith('/' + path)) {
+            frame.dataset.src = frame.dataset.src.replace(/[^/]+$/, path);
+            syncPreviews();
+          }
+        }
         el.textContent = input ? inputText(input) + (input.warning ? ' — ⚠ ' + input.warning : '') : '';
         el.className = 'text-xs mb-3 min-h-[1rem] ' + (input && input.warning ? 'text-brand-amber font-semibold' : 'text-slate-400');
         const badge = document.getElementById('mv-badge-' + cam);
