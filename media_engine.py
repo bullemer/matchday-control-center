@@ -701,10 +701,19 @@ PREVIEW_HEIGHT = 360
 PREVIEW_KBPS = 800
 
 
-def preview_command(cam):
-    """ffmpeg for the dashboard preview of one camera: H.264 360p, no sound (WebRTC previews are muted)."""
-    return (f"ffmpeg -hide_banner -nostdin -loglevel error -rtsp_transport tcp -i rtsp://127.0.0.1:8554/{cam} "
-            f"-an -vf scale=-2:{PREVIEW_HEIGHT} -c:v libx264 -preset ultrafast -tune zerolatency "
+def preview_command(cam, gpu=None):
+    """ffmpeg for the dashboard preview of one camera: H.264 360p, no sound (WebRTC previews are muted).
+    With a working NVIDIA card the (often 4K H.265) camera is decoded and scaled on the GPU:
+    measured 24 % instead of 232 % of a CPU core for a 2160p H.265 phone."""
+    if gpu is None:
+        gpu = _NVDEC and nvenc_available()
+    if gpu:
+        source, scale = ("-hwaccel cuda -hwaccel_output_format cuda ",
+                         f"scale_cuda=-2:{PREVIEW_HEIGHT}:format=nv12,hwdownload,format=nv12")
+    else:
+        source, scale = "", f"scale=-2:{PREVIEW_HEIGHT}"
+    return (f"ffmpeg -hide_banner -nostdin -loglevel error {source}-rtsp_transport tcp -i rtsp://127.0.0.1:8554/{cam} "
+            f"-an -vf {scale} -c:v libx264 -preset ultrafast -tune zerolatency "
             f"-b:v {PREVIEW_KBPS}k -maxrate {PREVIEW_KBPS}k -bufsize {PREVIEW_KBPS}k -g 30 -pix_fmt yuv420p "
             f"-f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/{cam}_preview")
 
@@ -2302,12 +2311,14 @@ def set_hardware_encoding(kind, save=True):
 
 
 def load_encoder_setting():
-    """At startup: restore the saved choice if that encoder still passes the test."""
+    """At startup: restore the saved choice if that encoder still passes the test. Nothing
+    saved yet: the NVIDIA GPU when it works (camera relays then decode and encode on the card,
+    which frees most of the CPU), else software."""
     try:
         saved = json.loads(ENCODER_SETTING.read_text())
         kind = saved.get("encoder") or ("intel" if saved.get("hardware") else "software")
     except (OSError, ValueError, AttributeError):
-        return
+        kind = "nvidia" if nvenc_available() else "software"
     if kind != "software":
         ok, message = set_hardware_encoding(kind, save=False)
         if not ok:

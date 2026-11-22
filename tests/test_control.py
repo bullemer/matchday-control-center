@@ -964,6 +964,24 @@ class MediaTests(unittest.TestCase):
                 m.load_encoder_setting()
             self.assertEqual(m._hw_wanted,'intel')
 
+    def test_nvidia_is_the_default_when_nothing_is_saved(self):
+        with tempfile.TemporaryDirectory() as tmp,patch.object(m,'ENCODER_SETTING',Path(tmp)/'encoder.json'),\
+                patch.object(m,'_hw_wanted','software'),patch.object(m,'_hw_device',None),patch.object(m,'_hw_warning',''),\
+                patch.object(m,'_nvenc_ok',None):
+            with patch.object(m,'_test_nvenc',return_value=True):
+                m.load_encoder_setting()
+                self.assertEqual(m._hw_wanted,'nvidia')
+                self.assertFalse(m.ENCODER_SETTING.exists())          # a default, not a saved choice
+            m._hw_wanted='software'; m._nvenc_ok=None
+            with patch.object(m,'_test_nvenc',return_value=False):
+                m.load_encoder_setting()
+                self.assertEqual(m._hw_wanted,'software')            # no NVIDIA card: software
+            m._nvenc_ok=None
+            m.ENCODER_SETTING.write_text('{"encoder": "software"}')   # an explicit choice wins
+            with patch.object(m,'_test_nvenc',return_value=True):
+                m.load_encoder_setting()
+                self.assertEqual(m._hw_wanted,'software')
+
     def test_profile_change_rebuilds_relay_before_live(self):
         with patch.object(m,'_want_stream',False),patch.object(m.shutil,'which',return_value='/bin/tool'),patch.object(m,'get_mediamtx_running',return_value=True),patch.object(m,'get_active_camera',return_value='cam1'),patch.object(m,'_active_camera','cam1'),patch.object(m,'_relay_profile','720p'),patch.object(m,'_profile','720p'),patch.object(m,'switch_camera',return_value=(True,'ok')) as cut,patch.object(m,'_launch_encoder'),patch.object(m.Path,'is_file',return_value=True):
             self.assertTrue(m.start_youtube_stream('key','1080p')[0])

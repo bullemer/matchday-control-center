@@ -92,16 +92,22 @@ def fence_pixels(fence, width, height):
     return [(x * width, y * height) for x, y in fence]
 
 
-def on_pitch(polygon, person):
-    """A person counts when the feet (bottom centre of the box) are on the pitch."""
-    return polygon is None or inside(polygon, person.x, person.y + person.h / 2)
+def area_of(polygon):
+    """Fence polygon (pixels) -> "is this image point on the pitch?" (None = no limit)."""
+    return None if polygon is None else (lambda x, y: inside(polygon, x, y))
 
 
-def ball_on_pitch(polygon, ball, height):
-    """Inside the fence, or above it (a high ball): checked as the point lowered by BALL_AIR."""
-    if polygon is None:
+def on_pitch(area, person):
+    """A person counts when the feet (bottom centre of the box) are on the pitch.
+    area: callable (x, y) -> bool (fence or pitch map), or None."""
+    return area is None or area(person.x, person.y + person.h / 2)
+
+
+def ball_on_pitch(area, ball, height):
+    """On the pitch, or above it (a high ball): checked as the point lowered by BALL_AIR."""
+    if area is None:
         return True
-    return inside(polygon, ball.x, ball.y) or inside(polygon, ball.x, ball.y + BALL_AIR * height)
+    return area(ball.x, ball.y) or area(ball.x, ball.y + BALL_AIR * height)
 
 
 def ball_part(ball, age_s, width, height):
@@ -157,16 +163,24 @@ def quality_part(pic, frozen):
     return clamp(0.6 * sharp + 0.4 * exposure), {"sharp": round(sharp, 2), "exposure": round(exposure, 2), "frozen": False}
 
 
-def rate(state, now, width, height, persons, balls, pic, fence=None):
+def rate(state, now, width, height, persons, balls, pic, fence=None, area=None, ball_hint=None):
     """One analysed frame -> score details. Updates state (ball memory, freeze, smoothing).
-    fence: relative polygon around the pitch (or None): people and balls outside are ignored."""
+    fence: relative polygon around the pitch (or None): people and balls outside are ignored.
+    area: callable (x, y) -> on the pitch (a pitch map); used instead of the fence.
+    ball_hint: (Detection, age_s) where the ball is in this picture according to the pitch
+    map (seen by another camera); used when this camera has no ball of its own."""
     polygon = fence_pixels(fence, width, height)
-    balls = [b for b in balls if ball_on_pitch(polygon, b, height)]
+    if area is None:
+        area = area_of(polygon)
+    balls = [b for b in balls if ball_on_pitch(area, b, height)]
     ball = max((b for b in balls if b.conf >= BALL_CONF), key=lambda b: b.conf, default=None)
     if ball is not None:
         state.last_ball, state.last_ball_t = ball, now
     age = now - state.last_ball_t
     remembered = state.last_ball if age <= BALL_MEMORY_S else None
+    from_pitch = False
+    if remembered is None and ball_hint is not None and ball_hint[1] <= BALL_MEMORY_S:
+        remembered, age, from_pitch = ball_hint[0], ball_hint[1], True
 
     if pic.change < FROZEN_DIFF:
         state.frozen_since = state.frozen_since if state.frozen_since is not None else now
@@ -175,7 +189,7 @@ def rate(state, now, width, height, persons, balls, pic, fence=None):
     frozen = state.frozen_since is not None and now - state.frozen_since >= FROZEN_S
 
     sized = players(persons, height)
-    people = [p for p in sized if on_pitch(polygon, p)]
+    people = [p for p in sized if on_pitch(area, p)]
     b, b_info = ball_part(remembered, age, width, height)
     a, a_info = action_part(people, remembered, width, height)
     q, q_info = quality_part(pic, frozen)
@@ -191,10 +205,11 @@ def rate(state, now, width, height, persons, balls, pic, fence=None):
     state.smooth_t = now
     return {
         "score": round(state.smooth, 1), "raw": round(raw, 1),
-        "ball": {"seen": ball is not None, "remembered": remembered is not None and ball is None,
+        "ball": {"seen": ball is not None, "remembered": remembered is not None and ball is None and not from_pitch,
+                 "from_pitch": from_pitch,
                  "conf": round(ball.conf, 2) if ball else None, "part": round(b, 2), **b_info},
         "action": {"part": round(a, 2), "players": len(people), "off_pitch": len(sized) - len(people), **a_info},
-        "fence": polygon is not None,
+        "fence": polygon is not None, "mapped": area is not None and polygon is None,
         "quality": {"part": round(q, 2), **q_info},
     }
 

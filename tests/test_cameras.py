@@ -550,3 +550,18 @@ del ApiTests, EngineStateCase  # run the imported base tests once, in their own 
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PreviewCommandTests(unittest.TestCase):
+    def test_gpu_preview_decodes_and_scales_on_the_card(self):
+        import media_engine as m
+        gpu = m.preview_command('cam3', gpu=True)
+        self.assertIn('-hwaccel cuda -hwaccel_output_format cuda', gpu)
+        self.assertIn('scale_cuda=-2:360', gpu)
+        cpu = m.preview_command('cam3', gpu=False)
+        self.assertNotIn('cuda', cpu)
+        self.assertIn('-vf scale=-2:360', cpu)
+        for cmd in (gpu, cpu):
+            self.assertTrue(cmd.endswith('rtsp://127.0.0.1:8554/cam3_preview'))
+        with patch.object(m, '_NVDEC', False):
+            self.assertNotIn('cuda', m.preview_command('cam3'))

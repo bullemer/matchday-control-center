@@ -202,6 +202,42 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(ad.status()['fences'], {'cam2': square})
             ad._fences.clear()
 
+    def test_pitch_maps_saved_previewed_and_only_for_fixed_cameras(self):
+        from tests.test_pitch_map import points
+        import pitch_map as pm
+        keys = ['box_l_f', 'box_l_n', 'half_f', 'half_n', 'centre']
+        good = points(pm.clean_pitch({}), keys)
+        with patch.object(ad, 'PITCH', ad.SETTINGS.parent / 'pitch.json'), \
+                patch.object(ad, 'FENCES', ad.SETTINGS.parent / 'fences.json'), \
+                patch.object(ad, '_mounts', return_value={'cam1': 'fixed', 'cam2': 'tracking'}):
+            ad._pitch.update(pitch=dict(pm.DEFAULT_PITCH), cams={})
+            self.assertEqual(ad.preview_pitch_map('cam1', good[:2]), {'ready': False, 'need': 2})
+            pv = ad.preview_pitch_map('cam1', good)
+            self.assertTrue(pv['ready'] and pv['checked'] and pv['lines'] and pv['view'])
+            for bad in (good[:3], good + [dict(good[0])], [dict(good[0], mark='nope')] + good[1:], 'x'):
+                with self.assertRaises(ValueError):
+                    ad.set_pitch_map('cam1', bad)
+            with self.assertRaises(ValueError):
+                ad.set_pitch_map('cam5', good)
+            ad.set_pitch_map('cam1', good)
+            ad.set_pitch_map('cam2', good)
+            worker = json.loads((ad.OUT / 'pitch.json').read_text())
+            self.assertEqual(set(worker['cams']), {'cam1'})            # cam2 moves: not used
+            st = ad.status()['pitch']
+            self.assertTrue(st['maps']['cam1']['active'])
+            self.assertFalse(st['maps']['cam2']['active'])
+            self.assertEqual(len(st['landmarks']), len(pm.landmarks(pm.DEFAULT_PITCH)))
+            # A smaller pitch: the clicked markings now mean other metres; maps are refitted.
+            ad.set_pitch_size({'length': 90, 'width': 60})
+            self.assertEqual(json.loads((ad.OUT / 'pitch.json').read_text())['pitch']['length'], 90)
+            with self.assertRaises(ValueError):
+                ad.set_pitch_size({'length': 500})
+            ad._pitch['cams'] = {}
+            self.assertEqual(set(ad.load_pitch()['maps']), {'cam1', 'cam2'})
+            ad.set_pitch_map('cam1', [])
+            self.assertEqual(set(json.loads((ad.OUT / 'pitch.json').read_text())['cams']), set())
+            ad._pitch.update(pitch=dict(pm.DEFAULT_PITCH), cams={})
+
     def test_suggestions_from_worker_scores_and_on_air_camera(self):
         ad.OUT.mkdir(parents=True)
         def state(c1, c3):

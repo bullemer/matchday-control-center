@@ -32,3 +32,5 @@ recordings/
 static/scoreboard.txt
 ai-venv/
 models/*.pt
+models/*.engine
+models/*.onnx

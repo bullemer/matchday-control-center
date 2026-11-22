@@ -18,6 +18,7 @@ from pathlib import Path
 
 import director_scoring
 import media_engine
+import pitch_map
 
 log = logging.getLogger(__name__)
 
@@ -30,8 +31,9 @@ OUT = BASE / "data" / "ai-director"
 SETTINGS = BASE / "data" / "ai-director.json"
 FENCES = BASE / "data" / "ai-director-fences.json"   # all fences the operator drew
 FENCE_MAX_POINTS = 16
+PITCH = BASE / "data" / "ai-director-pitch.json"     # pitch size + all pitch maps
 SNAPSHOT_W, SNAPSHOT_H = 1280, 720                  # same framing as the worker's analysis frames
-FPS_CHOICES = (2, 5, 10)
+FPS_CHOICES = (2, 5, 10, 15, 20)
 STALE_S = 6.0            # worker state older than this = not running
 RESTART_MAX_S = 60.0
 
@@ -43,6 +45,7 @@ _stop = threading.Event()
 _last_error = ""
 _restarts = 0
 _fences = {}
+_pitch = {"pitch": dict(pitch_map.DEFAULT_PITCH), "cams": {}}   # cams: {cam: [{"x", "y", "mark"}]}
 # Suggest mode (operator decides): current suggestion, on-air tracking, outcome counts.
 _suggester = director_scoring.Suggester()
 _suggestion = None
@@ -118,7 +121,7 @@ def configure(enabled=None, fps=None, suggest=None):
 def _command():
     return [str(VENV_PYTHON), str(WORKER), "--cams", ",".join(match_cameras()),
             "--fps", str(_settings["fps"]), "--out", str(OUT), "--models", str(MODELS),
-            "--fences", str(OUT / "fences.json")]
+            "--fences", str(OUT / "fences.json"), "--pitch", str(OUT / "pitch.json")]
 
 
 # --- Field fences ----------------------------------------------------------------------
@@ -187,9 +190,13 @@ def effective_fences():
 
 
 def sync_fences():
-    """Write the worker's fence file when it differs (fence edited or camera mount changed)."""
-    path = OUT / "fences.json"
-    text = json.dumps(effective_fences(), sort_keys=True)
+    """Write the worker's fence and pitch map files when they differ (edited, or a camera's
+    mount changed)."""
+    _write_if_changed(OUT / "fences.json", json.dumps(effective_fences(), sort_keys=True))
+    _write_if_changed(OUT / "pitch.json", json.dumps(effective_pitch(), sort_keys=True))
+
+
+def _write_if_changed(path, text):
     try:
         if path.read_text() == text:
             return
@@ -199,6 +206,133 @@ def sync_fences():
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text)
     tmp.replace(path)
+
+
+# --- Pitch maps ------------------------------------------------------------------------
+# Per fixed match camera: four or more pitch markings clicked on a still -> a mapping between
+# the picture and metres on the pitch (pitch_map.py). Like fences, only fixed cameras use it.
+
+def load_pitch():
+    try:
+        data = json.loads(PITCH.read_text())
+    except (OSError, ValueError):
+        data = {}
+    try:
+        pitch = pitch_map.clean_pitch(data.get("pitch") or {})
+    except (ValueError, AttributeError):
+        pitch = dict(pitch_map.DEFAULT_PITCH)
+    cams = {}
+    for cam, points in ((data.get("cams") or {}).items() if isinstance(data, dict) else []):
+        try:
+            if cam in match_cameras():
+                cams[cam] = _clean_pitch_points(points, pitch)
+        except ValueError:
+            pass
+    with _lock:
+        _pitch["pitch"], _pitch["cams"] = pitch, {c: p for c, p in cams.items() if p}
+    return pitch_state()
+
+
+def _clean_pitch_points(points, pitch):
+    if not isinstance(points, list) or len(points) > pitch_map.MAX_POINTS:
+        raise ValueError(f"At most {pitch_map.MAX_POINTS} points")
+    marks = pitch_map.landmarks(pitch)
+    clean, seen = [], set()
+    for pt in points:
+        if not isinstance(pt, dict) or pt.get("mark") not in marks:
+            raise ValueError("Every point needs a known pitch marking")
+        if pt["mark"] in seen:
+            raise ValueError(f"{marks[pt['mark']][0]} is used twice")
+        seen.add(pt["mark"])
+        x, y = pt.get("x"), pt.get("y")
+        if not all(type(v) in (int, float) and math.isfinite(v) and -0.05 <= v <= 1.05 for v in (x, y)):
+            raise ValueError("Points must be between 0 and 1")
+        clean.append({"x": round(float(x), 4), "y": round(float(y), 4), "mark": pt["mark"]})
+    if clean:
+        pitch_map.PitchMap.from_points(clean, pitch)   # raises with a readable message
+    return clean
+
+
+def _save_pitch():
+    PITCH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = PITCH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(_pitch, indent=1))
+    tmp.replace(PITCH)
+
+
+def preview_pitch_map(cam, points, pitch=None):
+    """Fit without saving: error in metres, the pitch lines in the picture, the view area."""
+    if cam not in match_cameras():
+        raise ValueError("Pitch maps are for match cameras (Cam 1-4)")
+    with _lock:
+        pitch = pitch_map.clean_pitch(pitch) if pitch is not None else dict(_pitch["pitch"])
+    clean = _clean_pitch_points(points, pitch) if len(points or []) >= pitch_map.MIN_POINTS else None
+    if not clean:
+        return {"ready": False, "need": pitch_map.MIN_POINTS - len(points or [])}
+    m, info = pitch_map.PitchMap.from_points(clean, pitch)
+    return {"ready": True, **info, "lines": m.lines(), "view": m.view()}
+
+
+def set_pitch_map(cam, points):
+    """Store (or with [] remove) the pitch map of one match camera."""
+    if cam not in match_cameras():
+        raise ValueError("Pitch maps are for match cameras (Cam 1-4)")
+    with _lock:
+        pitch = dict(_pitch["pitch"])
+    if points and len(points) < pitch_map.MIN_POINTS:
+        raise ValueError(f"A pitch map needs at least {pitch_map.MIN_POINTS} points (or none to remove it)")
+    clean = _clean_pitch_points(points or [], pitch)
+    with _lock:
+        if clean:
+            _pitch["cams"][cam] = clean
+        else:
+            _pitch["cams"].pop(cam, None)
+        _save_pitch()
+    sync_fences()
+    return clean
+
+
+def set_pitch_size(data):
+    """Pitch length/width and markings (all maps are refitted with them)."""
+    pitch = pitch_map.clean_pitch(data)
+    with _lock:
+        for cam, points in _pitch["cams"].items():
+            try:
+                pitch_map.PitchMap.from_points(points, pitch)
+            except ValueError as exc:
+                raise ValueError(f"{cam}: {exc}")
+        _pitch["pitch"] = pitch
+        _save_pitch()
+    sync_fences()
+    return pitch
+
+
+def pitch_state():
+    """Pitch size, markings, the maps with their error and view area (for the dashboard)."""
+    mounts = _mounts()
+    with _lock:
+        pitch = dict(_pitch["pitch"])
+        cams = {c: [dict(p) for p in pts] for c, pts in _pitch["cams"].items()}
+    maps = {}
+    for cam, points in cams.items():
+        try:
+            m, info = pitch_map.PitchMap.from_points(points, pitch)
+            maps[cam] = {"points": points, **info, "view": m.view(),
+                         "active": mounts.get(cam, "fixed") == "fixed"}
+        except ValueError as exc:
+            maps[cam] = {"points": points, "problem": str(exc), "active": False}
+    marks = pitch_map.landmarks(pitch)
+    return {"size": pitch, "maps": maps,
+            "landmarks": [{"key": k, "label": v[0], "x": v[1], "y": v[2]} for k, v in marks.items()],
+            "lines": [[[round(x, 2), round(y, 2)] for x, y in line] for line in pitch_map.pitch_lines(pitch)]}
+
+
+def effective_pitch():
+    """What the worker uses: pitch size + maps of fixed cameras."""
+    mounts = _mounts()
+    with _lock:
+        return {"pitch": dict(_pitch["pitch"]),
+                "cams": {c: p for c, p in _pitch["cams"].items() if mounts.get(c, "fixed") == "fixed"}}
 
 
 def snapshot(cam):
@@ -361,6 +495,7 @@ def autostart():
     """At app start: run if it was enabled last time (and the environment is ready)."""
     load_settings()
     load_fences()
+    load_pitch()
     try:
         sync_fences()
     except OSError:
@@ -398,10 +533,12 @@ def status():
     return {
         "enabled": enabled, "fps": fps, "fps_choices": list(FPS_CHOICES), "phase": phase,
         "setup_problem": setup_problem(), "gpu": state.get("gpu") if fresh else None,
+        "engine": state.get("engine") if fresh else None,
         "busy": state.get("busy") if fresh else None, "recommended": state.get("recommended") if fresh else None,
         "cameras": match_cameras(), "cams": state.get("cams", {}) if fresh else {},
         "error": _last_error if enabled else "", "restarts": _restarts,
         "fences": dict(_fences), "mounts": _mounts(),
+        "pitch": {**pitch_state(), "live": state.get("pitch") if fresh else None},
         "suggest": _settings["suggest"], "suggestion": suggestion(), "suggest_stats": dict(_stats),
     }
 

@@ -86,7 +86,7 @@ def fake_director_status():
     cam=lambda score, ball, near: {'online':True,'score':score,'raw':score,'image_t':1.0,'fence':False,
         'ball':{'seen':ball,'remembered':False,'conf':0.62 if ball else None,'part':0.8 if ball else 0.0},
         'action':{'part':0.75,'players':9,'near':near,'off_pitch':4 if fences.get('cam1') else 0},'quality':{'part':0.9,'sharp':0.95,'exposure':0.9,'frozen':False}}
-    return {'enabled':on,'fps':director['fps'],'fps_choices':[2,5,10],'suggest':director.get('suggest',False),
+    return {'enabled':on,'fps':director['fps'],'fps_choices':[2,5,10,15,20],'suggest':director.get('suggest',False),
             'suggestion':a.ai_director.suggestion(),'suggest_stats':{'accepted':2,'ignored':1,'timed out':0,'lead lost':3},'phase':'running' if on else 'off','setup_problem':None,
             'gpu':'Test GPU' if on else None,'busy':0.31 if on else None,'recommended':'cam1' if on else None,
             'cameras':['cam1','cam2','cam3','cam4'],'error':'','restarts':0,

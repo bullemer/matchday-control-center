@@ -23,6 +23,14 @@
       border: 1px solid #475569; border-radius: 1rem; background: #1e293b; color: #fff; }
     #fence-editor::backdrop { background: rgb(0 0 0 / .65); }
     #fence-box { cursor: crosshair; }
+    #pitch-editor { width: min(84rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); margin: auto; padding: 1rem;
+      background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: .75rem; }
+    #pitch-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #pitch-box { cursor: crosshair; }
+    .pitch-layout { display: grid; gap: .75rem; grid-template-columns: 1fr; }
+    @media (min-width: 1024px) { .pitch-layout { grid-template-columns: minmax(0, 1fr) 20rem; } }
+    .pitch-mark { cursor: pointer; }
+    .pitch-mark:hover circle { stroke: #fff; }
     section[data-tab="settings"] :disabled { opacity: .45; cursor: not-allowed; }
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
@@ -1227,6 +1235,26 @@
       <p id="director-suggest-info" class="text-xs text-slate-400 mb-4">💡 Suggest cuts: when a match camera is clearly better (10 points ahead for 2 s, at least 35,
         current camera on air for 8 s) it glows cyan on the Main tab and in match mode — click it to cut, or ignore it. Never during replays,
         with a reporting camera on air or in PiP / split layouts.</p>
+      <div class="bg-slate-900 rounded-lg border border-slate-700 p-3 mb-3" id="director-pitch">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-2">
+          <h3 class="font-semibold text-white">📐 Pitch view</h3>
+          <span id="pitch-live-info" class="text-xs text-slate-400">—</span>
+        </div>
+        <p class="text-xs text-slate-400 mb-2">Fixed cameras with a pitch map: what each one sees (coloured areas), players (dots) and the ball (white),
+          seen from the cameras' side. A mapped camera ignores people off the pitch by itself (no fence needed) and gets the ball's
+          position from the other cameras when its own detector misses it.</p>
+        <svg id="pitch-radar" viewBox="-57 -38 114 76" class="w-full rounded bg-green-900" style="max-height: 22rem"
+             role="img" aria-label="Pitch with camera views, players and ball"></svg>
+        <form id="pitch-size-form" onsubmit="event.preventDefault(); savePitchSize();" class="flex flex-wrap items-end gap-3 mt-3 text-xs text-slate-300">
+          <label>Length (m) <input id="pitch-length" type="number" min="20" max="130" step="0.5" class="dest-input text-sm w-24 block"></label>
+          <label>Width (m) <input id="pitch-width" type="number" min="12" max="100" step="0.5" class="dest-input text-sm w-24 block"></label>
+          <details class="text-slate-400">
+            <summary class="cursor-pointer select-none">Markings (11-a-side defaults)</summary>
+            <div class="flex flex-wrap gap-3 mt-2" id="pitch-markings"></div>
+          </details>
+          <button type="submit" class="px-3 py-2 rounded-lg bg-brand-blue hover:bg-blue-600 text-white font-semibold">Save pitch size</button>
+        </form>
+      </div>
       <div id="director-grid" class="grid gap-3 sm:grid-cols-2">
         {% for cam in cameras if cam.role == 'match' %}
         <div class="bg-slate-900 rounded-lg border-2 border-slate-700 p-3" data-director-card="{{ cam.id }}">
@@ -1248,6 +1276,11 @@
             <span data-director-fence class="text-slate-400">🥅 —</span>
             <button type="button" data-director-fence-btn onclick="openFenceEditor('{{ cam.id }}')"
                     class="shrink-0 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">✏️ Draw fence</button>
+          </div>
+          <div class="flex items-center justify-between gap-2 text-xs mt-2">
+            <span data-director-pitch class="text-slate-400">📐 —</span>
+            <button type="button" data-director-pitch-btn onclick="openPitchEditor('{{ cam.id }}')"
+                    class="shrink-0 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">📐 Map pitch</button>
           </div>
         </div>
         {% endfor %}
@@ -1321,6 +1354,42 @@
       <div class="flex gap-2">
         <button type="button" onclick="document.getElementById('fence-editor').close()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
         <button type="button" id="fence-save" onclick="saveFence()" class="px-4 py-2 rounded-lg bg-brand-green hover:bg-green-600 text-white font-semibold text-sm">Save</button>
+      </div>
+    </div>
+  </dialog>
+
+  <dialog id="pitch-editor" aria-labelledby="pitch-editor-title">
+    <div class="flex items-center justify-between gap-2 mb-2">
+      <h3 id="pitch-editor-title" class="text-base font-semibold">📐 Pitch map</h3>
+      <span id="pitch-result" class="text-xs text-slate-400" role="status"></span>
+    </div>
+    <p class="text-xs text-slate-300 mb-2">1. Pick a marking on the small pitch (or in the list). 2. Click exactly where it is in the picture
+      (for flags and posts: where they stand on the grass). At least 4 markings spread over the picture, not all on one line;
+      5 or more also check each other. The green lines show the result — they should lie on the real lines.</p>
+    <div class="pitch-layout">
+      <div>
+        <div id="pitch-box" class="relative aspect-video bg-black rounded overflow-hidden" onclick="placePitchPoint(event)">
+          <img id="pitch-img" alt="Still of the camera for mapping the pitch" class="w-full h-full object-contain">
+          <svg id="pitch-svg" viewBox="0 0 1280 720" preserveAspectRatio="none" class="absolute inset-0 w-full h-full pointer-events-none"></svg>
+          <div id="pitch-loading" class="absolute inset-0 grid place-content-center text-sm text-slate-400">Loading picture…</div>
+        </div>
+      </div>
+      <div class="space-y-2 text-xs">
+        <svg id="pitch-picker" viewBox="-57 -38 114 76" class="w-full rounded bg-green-900" role="group" aria-label="Pitch markings: pick one"></svg>
+        <label class="block text-slate-300">Marking
+          <select id="pitch-mark" class="dest-input text-xs w-full mt-1" onchange="pitchEdit.mark = this.value; renderPitchEditor()"></select>
+        </label>
+        <ol id="pitch-points" class="space-y-1 max-h-48 overflow-auto"></ol>
+      </div>
+    </div>
+    <div class="flex flex-wrap justify-between gap-2 mt-3">
+      <div class="flex gap-2">
+        <button type="button" onclick="removePitchPoint(pitchEdit.mark)" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">✕ Remove marking</button>
+        <button type="button" onclick="pitchEdit.points = []; pitchChanged()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Remove all</button>
+      </div>
+      <div class="flex gap-2">
+        <button type="button" onclick="document.getElementById('pitch-editor').close()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+        <button type="button" id="pitch-save" onclick="savePitchMap()" class="px-4 py-2 rounded-lg bg-brand-green hover:bg-green-600 text-white font-semibold text-sm">Save</button>
       </div>
     </div>
   </dialog>
@@ -1858,6 +1927,12 @@
         return;
       }
       button.disabled = false; button.classList.remove('opacity-50');
+      const pmap = ((d.pitch || {}).maps || {})[cam];
+      if (pmap && pmap.active && !pmap.problem) {
+        line.textContent = '🥅 Not used: the pitch map knows where the pitch is' + (pts ? ` (fence of ${pts.length} points kept)` : '');
+        line.className = 'text-slate-500';
+        return;
+      }
       if (pts) {
         const off = c && c.online && c.action ? c.action.off_pitch : null;
         line.textContent = `🥅 Field fence: ${pts.length} points` + (off ? ` · ${off} outside ignored` : '');
@@ -1919,8 +1994,178 @@
       pollDirector();
     }
 
+    // ──────────────── Pitch maps (fixed match cameras) ────────────────
+    const PITCH_COLORS = {cam1: '#38bdf8', cam2: '#f472b6', cam3: '#facc15', cam4: '#a78bfa'};
+    const PITCH_MARKINGS = [['box_depth', 'Penalty box depth'], ['box_width', 'Penalty box width'], ['six_depth', 'Goal area depth'],
+                            ['six_width', 'Goal area width'], ['spot', 'Penalty spot'], ['circle', 'Centre circle radius'], ['goal_width', 'Goal width']];
+    function svgEsc(t) { return String(t).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c])); }
+    function pitchViewBox(size) {
+      const L = size.length / 2 + 4, W = size.width / 2 + 4;
+      return `${-L} ${-W} ${2 * L} ${2 * W}`;
+    }
+    function pitchLinesSvg(lines, width = 0.3) {
+      return lines.map(l => `<polyline points="${l.map(([x, y]) => `${x},${y}`).join(' ')}" fill="none" stroke="#e2e8f0" stroke-opacity=".75" stroke-width="${width}"/>`).join('');
+    }
+    function renderPitchLine(d, cam) {
+      const card = document.querySelector(`[data-director-card="${cam}"]`);
+      const line = card.querySelector('[data-director-pitch]');
+      const button = card.querySelector('[data-director-pitch-btn]');
+      const mount = (d.mounts || {})[cam] || 'fixed';
+      const m = ((d.pitch || {}).maps || {})[cam];
+      button.textContent = m ? '📐 Edit map' : '📐 Map pitch';
+      button.disabled = mount !== 'fixed'; button.classList.toggle('opacity-50', button.disabled);
+      if (mount !== 'fixed') { line.textContent = `📐 Pitch map only for fixed cameras (this one: ${mount})`; line.className = 'text-slate-500'; return; }
+      if (!m) { line.textContent = '📐 No pitch map'; line.className = 'text-slate-400'; return; }
+      if (m.problem) { line.textContent = '📐 ⚠ ' + m.problem; line.className = 'text-brand-amber'; return; }
+      line.textContent = `📐 Pitch map: ${m.points.length} markings · ` + (m.checked ? `fits within ${m.error_m} m` : 'not checked (add a 5th marking)')
+        + ' · replaces the fence';
+      line.className = m.checked && m.error_m > 1.5 ? 'text-brand-amber' : 'text-slate-300';
+    }
+    function renderPitchRadar(d) {
+      const p = d.pitch;
+      if (!p) return;
+      const svg = document.getElementById('pitch-radar');
+      svg.setAttribute('viewBox', pitchViewBox(p.size));
+      let html = '';
+      for (const [cam, m] of Object.entries(p.maps)) {
+        if (!m.active || !m.view || m.view.length < 3) continue;
+        const c = PITCH_COLORS[cam] || '#94a3b8';
+        html += `<polygon points="${m.view.map(([x, y]) => `${x},${y}`).join(' ')}" fill="${c}" fill-opacity=".14" stroke="${c}" stroke-width=".4" stroke-dasharray="1.2 .8"/>`;
+      }
+      html += pitchLinesSvg(p.lines, 0.35);
+      for (const [cam, m] of Object.entries(p.maps)) {
+        if (!m.active || !m.view || m.view.length < 3) continue;
+        const cx = m.view.reduce((a, q) => a + q[0], 0) / m.view.length, cy = m.view.reduce((a, q) => a + q[1], 0) / m.view.length;
+        html += `<text x="${cx}" y="${cy}" font-size="3.2" fill="${PITCH_COLORS[cam] || '#fff'}" text-anchor="middle" font-weight="700">${svgEsc(camLabel(cam))}</text>`;
+      }
+      const live = p.live || {};
+      let players = 0;
+      for (const [cam, pts] of Object.entries(live.players || {})) {
+        players += pts.length;
+        html += pts.map(([x, y]) => `<circle cx="${x}" cy="${y}" r=".9" fill="${PITCH_COLORS[cam] || '#fff'}" stroke="#0f172a" stroke-width=".25"/>`).join('');
+      }
+      if (live.ball) html += `<circle cx="${live.ball.x}" cy="${live.ball.y}" r="1.2" fill="#fff" stroke="#f97316" stroke-width=".5" opacity="${Math.max(.35, 1 - live.ball.age)}"/>`;
+      svg.innerHTML = html;
+      const mapped = Object.values(p.maps).filter(m => m.active && !m.problem).length;
+      document.getElementById('pitch-live-info').textContent = mapped
+        ? `${mapped} mapped camera${mapped === 1 ? '' : 's'} · ${players} players` + (live.ball ? ` · ⚽ at ${live.ball.x > 0 ? '+' : ''}${live.ball.x} m (${camLabel(live.ball.cam)})` : ' · no ball')
+        : 'No camera mapped yet: use 📐 Map pitch on a fixed camera';
+      const lengthInput = document.getElementById('pitch-length');
+      if (!document.getElementById('pitch-size-form').contains(document.activeElement)) {
+        lengthInput.value = p.size.length; document.getElementById('pitch-width').value = p.size.width;
+        const box = document.getElementById('pitch-markings');
+        if (!box.children.length) box.innerHTML = PITCH_MARKINGS.map(([k, label]) =>
+          `<label>${label} (m) <input data-pitch-size="${k}" type="number" step="0.01" min="0" class="dest-input text-sm w-24 block"></label>`).join('');
+        box.querySelectorAll('[data-pitch-size]').forEach(el => el.value = p.size[el.dataset.pitchSize]);
+      }
+    }
+    async function savePitchSize() {
+      const body = {length: parseFloat(document.getElementById('pitch-length').value), width: parseFloat(document.getElementById('pitch-width').value)};
+      document.querySelectorAll('[data-pitch-size]').forEach(el => body[el.dataset.pitchSize] = parseFloat(el.value));
+      const {ok, data} = await apiRequest('/api/director/pitch-size', body);
+      showToast(ok ? '📐 Pitch size saved' : '❌ ' + (data.error || 'Saving failed'), ok ? 'success' : 'error');
+      if (ok) { document.activeElement.blur(); pollDirector(); }
+    }
+
+    // Pitch map editor: pick a marking, click it in the picture; the server fits and draws the lines.
+    const pitchEdit = {cam: null, points: [], mark: 'corner_ln', preview: null, timer: null};
+    function openPitchEditor(cam) {
+      const p = (lastDirector || {}).pitch;
+      if (!p) return;
+      pitchEdit.cam = cam;
+      pitchEdit.points = ((p.maps[cam] || {}).points || []).map(q => ({...q}));
+      pitchEdit.preview = null;
+      document.getElementById('pitch-editor-title').textContent = `📐 Pitch map · ${camLabel(cam)}`;
+      const sel = document.getElementById('pitch-mark');
+      sel.innerHTML = p.landmarks.map(m => `<option value="${m.key}">${svgEsc(m.label)}</option>`).join('');
+      const img = document.getElementById('pitch-img');
+      const loading = document.getElementById('pitch-loading');
+      loading.hidden = false; loading.textContent = 'Loading picture…';
+      img.onload = () => { loading.hidden = true; };
+      img.onerror = async () => {
+        loading.hidden = false;
+        try { loading.textContent = '⚠ ' + ((await (await fetch(img.src)).json()).error || 'No picture'); }
+        catch (err) { loading.textContent = '⚠ No picture'; }
+      };
+      img.src = `/api/director/snapshot/${cam}?t=${Date.now()}`;
+      document.getElementById('pitch-editor').showModal();
+      pitchChanged();
+    }
+    function placePitchPoint(event) {
+      const r = document.getElementById('pitch-box').getBoundingClientRect();
+      const x = Math.round((event.clientX - r.left) / r.width * 10000) / 10000, y = Math.round((event.clientY - r.top) / r.height * 10000) / 10000;
+      const existing = pitchEdit.points.find(q => q.mark === pitchEdit.mark);
+      if (existing) Object.assign(existing, {x, y}); else pitchEdit.points.push({x, y, mark: pitchEdit.mark});
+      // Next: the first marking not placed yet, in list order (saves clicks on the small pitch).
+      const marks = lastDirector.pitch.landmarks.map(m => m.key);
+      const start = marks.indexOf(pitchEdit.mark);
+      const next = marks.slice(start + 1).concat(marks.slice(0, start)).find(k => !pitchEdit.points.some(q => q.mark === k));
+      if (!existing && next) pitchEdit.mark = next;
+      pitchChanged();
+    }
+    function removePitchPoint(mark) { pitchEdit.points = pitchEdit.points.filter(q => q.mark !== mark); pitchChanged(); }
+    function pickPitchMark(mark) { pitchEdit.mark = mark; renderPitchEditor(); }
+    function pitchChanged() {
+      renderPitchEditor();
+      clearTimeout(pitchEdit.timer);
+      pitchEdit.timer = setTimeout(async () => {
+        const {ok, data} = await apiRequest(`/api/director/pitch/${pitchEdit.cam}`, {points: pitchEdit.points, preview: true});
+        pitchEdit.preview = ok ? data : {ready: false, error: data.error};
+        renderPitchEditor();
+      }, 150);
+    }
+    function renderPitchEditor() {
+      const p = lastDirector.pitch;
+      const labels = Object.fromEntries(p.landmarks.map(m => [m.key, m.label]));
+      document.getElementById('pitch-mark').value = pitchEdit.mark;
+      // Picker: the pitch with every marking as a dot (placed = green, selected = yellow ring).
+      const picker = document.getElementById('pitch-picker');
+      picker.setAttribute('viewBox', pitchViewBox(p.size));
+      picker.innerHTML = pitchLinesSvg(p.lines, 0.4) + p.landmarks.map(m => {
+        const placed = pitchEdit.points.some(q => q.mark === m.key), sel = m.key === pitchEdit.mark;
+        return `<g class="pitch-mark" onclick="pickPitchMark('${m.key}')"><title>${svgEsc(m.label)}</title>
+          <circle cx="${m.x}" cy="${m.y}" r="${sel ? 2.4 : 1.6}" fill="${placed ? '#22c55e' : '#0f172a'}" stroke="${sel ? '#facc15' : '#cbd5e1'}" stroke-width="${sel ? .8 : .35}"/></g>`;
+      }).join('');
+      // Picture overlay: fitted pitch lines (green), the clicked markings (numbered).
+      const pv = pitchEdit.preview;
+      let html = '';
+      if (pv && pv.ready) html += pv.lines.map(l => `<polyline points="${l.map(([x, y]) => `${x * 1280},${y * 720}`).join(' ')}" fill="none" stroke="#4ade80" stroke-width="3" stroke-opacity=".9"/>`).join('');
+      html += pitchEdit.points.map((q, i) => {
+        const sel = q.mark === pitchEdit.mark;
+        return `<circle cx="${q.x * 1280}" cy="${q.y * 720}" r="${sel ? 13 : 10}" fill="${sel ? '#facc15' : '#22d3ee'}" stroke="#0f172a" stroke-width="3"/>
+          <text x="${q.x * 1280}" y="${q.y * 720 + 5}" font-size="14" font-weight="700" text-anchor="middle" fill="#0f172a">${i + 1}</text>`;
+      }).join('');
+      document.getElementById('pitch-svg').innerHTML = html;
+      document.getElementById('pitch-points').innerHTML = pitchEdit.points.map((q, i) =>
+        `<li class="flex items-center justify-between gap-2 ${q.mark === pitchEdit.mark ? 'text-brand-amber' : 'text-slate-300'}">
+          <button type="button" class="text-left flex-1" onclick="pickPitchMark('${q.mark}')">${i + 1}. ${svgEsc(labels[q.mark] || q.mark)}</button>
+          <button type="button" aria-label="Remove ${svgEsc(labels[q.mark] || q.mark)}" onclick="removePitchPoint('${q.mark}')" class="px-1 text-slate-400 hover:text-white">✕</button></li>`).join('')
+        || '<li class="text-slate-500">No markings yet</li>';
+      const res = document.getElementById('pitch-result');
+      const n = pitchEdit.points.length;
+      if (pv && pv.error) { res.textContent = '⚠ ' + pv.error; res.className = 'text-xs text-brand-amber'; }
+      else if (pv && pv.ready) {
+        res.textContent = pv.checked ? `Fits within ${pv.error_m} m` + (pv.worst_m > 2 ? ` · check “${labels[pv.worst]}” (${pv.worst_m} m off)` : '')
+          : 'Fitted (4 markings: add a 5th to check)';
+        res.className = 'text-xs ' + (pv.checked && pv.error_m > 1.5 ? 'text-brand-amber' : 'text-green-400');
+      } else { res.textContent = n ? `${n} marking${n === 1 ? '' : 's'} · ${Math.max(0, 4 - n)} more needed` : 'Pick a marking, then click it in the picture';
+        res.className = 'text-xs text-slate-400'; }
+      const save = document.getElementById('pitch-save');
+      save.disabled = (n > 0 && n < 4) || !!(pv && pv.error);
+      save.classList.toggle('opacity-50', save.disabled);
+      save.textContent = n === 0 ? 'Save (no map)' : 'Save';
+    }
+    async function savePitchMap() {
+      const {ok, data} = await apiRequest(`/api/director/pitch/${pitchEdit.cam}`, {points: pitchEdit.points});
+      if (!ok) return showToast('❌ ' + (data.error || 'Saving the pitch map failed'), 'error');
+      showToast(pitchEdit.points.length ? `📐 Pitch map saved for ${camLabel(pitchEdit.cam)}` : `Pitch map removed for ${camLabel(pitchEdit.cam)}`, 'success');
+      document.getElementById('pitch-editor').close();
+      pollDirector();
+    }
+
     function renderDirector(d) {
       lastDirector = d;
+      renderPitchRadar(d);
       const toggle = document.getElementById('director-enabled');
       if (document.activeElement !== toggle) toggle.checked = d.enabled;
       const suggest = document.getElementById('director-suggest');
@@ -1941,7 +2186,7 @@
       const phaseText = {running: '🟢 Running', loading: '⏳ Loading models…', starting: '⏳ Starting…', crashed: '🔴 Stopped with an error — restarting', off: '⚪ Off', stopped: '⚪ Stopped'};
       let text = phaseText[d.phase] || d.phase;
       if (d.phase === 'running') {
-        text += ` · ${d.gpu || ''} · ${d.fps} frames/s per camera · GPU budget used ${Math.round((d.busy || 0) * 100)} %`;
+        text += ` · ${d.gpu || ''}${d.engine ? ' (' + d.engine + ')' : ''} · ${d.fps} frames/s per camera · GPU budget used ${Math.round((d.busy || 0) * 100)} %`;
         if (d.recommended) text += ` · ⭐ best now: ${camLabel(d.recommended)}`;
       }
       if (d.setup_problem) text = '⚠ ' + d.setup_problem;
@@ -1952,6 +2197,7 @@
         if (!card) continue;
         const c = d.cams[cam];
         renderFenceLine(d, cam, c);
+        renderPitchLine(d, cam);
         const badge = card.querySelector('[data-director-badge]');
         const recommended = d.recommended === cam;
         card.classList.toggle('border-brand-green', recommended);
@@ -1973,7 +2219,8 @@
         score.textContent = Math.round(c.score);
         bar.style.width = Math.max(0, Math.min(100, c.score)) + '%';
         bar.className = 'h-full ' + (c.score >= 60 ? 'bg-brand-green' : c.score >= 35 ? 'bg-brand-amber' : 'bg-brand-red');
-        const ball = c.ball.seen ? `⚽ ball ${Math.round(c.ball.conf * 100)} %` : c.ball.remembered ? '⚽ ball just seen' : '⚽ no ball';
+        const ball = c.ball.seen ? `⚽ ball ${Math.round(c.ball.conf * 100)} %` : c.ball.from_pitch ? '⚽ ball via pitch map'
+          : c.ball.remembered ? '⚽ ball just seen' : '⚽ no ball';
         const parts = [ball, `👥 ${c.action.players} players, ${c.action.near} in the play`,
                        c.quality.frozen ? '⏸ FROZEN picture' : `🔍 sharp ${Math.round(c.quality.sharp * 100)} % · 💡 exposure ${Math.round(c.quality.exposure * 100)} %`];
         detail.textContent = parts.join(' · ') + `  (ball ${Math.round(c.ball.part * 100)} · play ${Math.round(c.action.part * 100)} · picture ${Math.round(c.quality.part * 100)})`;

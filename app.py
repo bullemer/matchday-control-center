@@ -439,7 +439,7 @@ def api_director_status():
 @app.route("/api/director", methods=["POST"])
 @api_endpoint
 def api_director_configure():
-    """{"enabled": true/false, "fps": 2|5|10}"""
+    """{"enabled": true/false, "fps": 2|5|10|15|20}"""
     data = request.get_json()
     result = ai_director.configure(enabled=data.get("enabled"), fps=data.get("fps"), suggest=data.get("suggest"))
     return jsonify(ok=True, **result)
@@ -458,6 +458,26 @@ def api_director_fence(cam_id):
     """Field fence of a match camera: {"points": [[x, y], ...]} relative 0..1; [] removes it."""
     points = ai_director.set_fence(cam_id, request.get_json().get("points"))
     return jsonify(ok=True, points=points)
+
+
+@app.route("/api/director/pitch/<cam_id>", methods=["POST"])
+@api_endpoint
+def api_director_pitch_map(cam_id):
+    """Pitch map of a fixed match camera: {"points": [{"x", "y", "mark"}, ...]} (relative 0..1,
+    mark = pitch marking key, at least 4); [] removes it. {"preview": true} only fits."""
+    data = request.get_json()
+    if data.get("preview"):
+        return jsonify(ok=True, **ai_director.preview_pitch_map(cam_id, data.get("points") or [], data.get("pitch")))
+    points = ai_director.set_pitch_map(cam_id, data.get("points"))
+    return jsonify(ok=True, points=points, pitch=ai_director.pitch_state())
+
+
+@app.route("/api/director/pitch-size", methods=["POST"])
+@api_endpoint
+def api_director_pitch_size():
+    """Pitch length/width and markings in metres (missing values: 11-a-side)."""
+    ai_director.set_pitch_size(request.get_json())
+    return jsonify(ok=True, pitch=ai_director.pitch_state())
 
 
 @app.route("/api/director/snapshot/<cam_id>")
