@@ -145,9 +145,41 @@ def run():
             px = program_pixels()  # the live relay draws the scoreboard box (bottom left) itself
             assert px(80, 45)[2] > 200 and px(4, 85)[2] < 160, (px(80, 45), px(4, 85))
             print('PASS: the live relay draws the scoreboard into the live picture', flush=True)
+            # Score67 overlay: a new picture must reach the stream quickly (the old looped-image
+            # input queued pictures and showed every score change ~10 s late).
+            import struct, zlib
+            from browser_overlay import BLANK, write_frame
+            def box_png(rgba):
+                w, h = 1920, 1080
+                row_box = bytes(rgba) * 400 + bytes(4 * (w - 400))
+                raw = b''.join(b'\0' + (row_box if y < 250 else bytes(4 * w)) for y in range(h))
+                chunk = lambda k, d: struct.pack('!I', len(d)) + k + d + struct.pack('!I', zlib.crc32(k + d))
+                return (b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('!2I5B', w, h, 8, 6, 0, 0, 0))
+                        + chunk(b'IDAT', zlib.compress(raw, 1)) + chunk(b'IEND', b''))
+            reader = subprocess.Popen(['ffmpeg','-v','error','-rtsp_transport','tcp','-i',f'{m.RTSP_BASE}/final','-an',
+                '-vf','scale=160:90','-pix_fmt','rgb24','-f','rawvideo','-'], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            try:
+                reader.stdout.read(160*90*3)                      # the reader is up
+                changed = time.monotonic()
+                write_frame(m.FRAME_PATH, box_png((0, 255, 0, 255)))
+                delay = None
+                while time.monotonic() - changed < 15:
+                    frame = reader.stdout.read(160*90*3)
+                    px = frame[(5*160+5)*3:(5*160+5)*3+3]
+                    if px[1] > 200 and px[0] < 80 and px[2] < 80:
+                        delay = time.monotonic() - changed
+                        break
+            finally:
+                reader.kill(); reader.wait()
+                write_frame(m.FRAME_PATH, BLANK)
+            assert delay is not None and delay < 3, ('overlay change too late', delay)
+            print(f'PASS: a Score67 overlay change reaches the stream in {delay:.1f} s', flush=True)
             time.sleep(9)  # blue footage in the recording
             assert m.switch_camera('cam1')[0]  # live is red again
             recorder_pid = m._recorder_proc.proc.pid
+            # Let this cut's 1-2 handover frames pass the encoder first: the window below is about
+            # the replay. (The old encoder delayed everything by ~6 s, which hid this cut.)
+            time.sleep(2)
             watcher = watch_program(30)
             time.sleep(2)
             started = time.monotonic()

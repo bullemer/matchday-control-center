@@ -10,6 +10,19 @@ from unittest.mock import MagicMock, patch
 
 from test_control import ApiTests, EngineStateCase, m
 
+
+# No real Score67 FIFO feeder in unit tests: it could write into a running app's encoder pipe.
+_overlay_feeder_patch = __import__('unittest.mock', fromlist=['patch']).patch('media_engine.OverlayFeeder')
+
+
+def setUpModule():
+    _overlay_feeder_patch.start()
+
+
+def tearDownModule():
+    _overlay_feeder_patch.stop()
+
+
 r = m.recordings
 REAL_GENERATE = m.generate_mediamtx_config
 

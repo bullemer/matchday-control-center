@@ -68,11 +68,13 @@ def run(source=None):
             wait(lambda: overlay.path.read_bytes() != first)
             print('PASS: browser renders live score changes', flush=True)
             Path('/tmp/mcc-score67-render.png').write_bytes(overlay.path.read_bytes())
-            # A single long-running encoder must pick up atomically replaced PNGs.
+            # A single long-running encoder must pick up atomically replaced PNGs, through the
+            # same FIFO + movie source the real encoder uses.
+            import media_engine as m
+            m.FRAME_PATH = overlay.path
             command = ['ffmpeg','-v','error','-nostdin','-filter_complex_threads','2',
                 '-re','-f','lavfi','-i','color=red:s=320x180:r=10',
-                '-re','-f','image2','-loop','1','-framerate','2','-i',str(overlay.path),
-                '-filter_complex','[1:v]scale=320:180,format=rgba[o];[0:v][o]overlay=0:0:format=yuv420,format=rgb24[v]',
+                '-filter_complex',f'{m._overlay_source()},scale=320:180,format=rgba[o];[0:v][o]overlay=0:0:format=yuv420:eof_action=pass,format=rgb24[v]',
                 '-map','[v]','-f','rawvideo','pipe:1']
             encoder = subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
             latest = [None]

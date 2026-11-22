@@ -1,6 +1,9 @@
 """Render Score67's existing OBS page to transparent frames for the output encoder."""
+import errno
+import fcntl
 import os
 import re
+import stat
 import struct
 import tempfile
 import threading
@@ -59,6 +62,80 @@ def write_frame(path, data):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+FIFO_PATH = FRAME_PATH.with_name(FRAME_PATH.stem + '.fifo')
+F_SETPIPE_SZ = 1031          # Linux fcntl: pipe buffer size
+
+
+class OverlayFeeder:
+    """Feeds the current overlay PNG to the encoder through a FIFO (ffmpeg -f image2pipe).
+
+    A looped image file (image2 -loop 1 -re) produces overlay frames in real time from the
+    moment ffmpeg starts; every frame made while the camera stream was still connecting
+    waited in a queue, so score updates reached the stream about 10 s late. Here ffmpeg
+    pulls: the writer blocks as soon as the (minimal) pipe is full, so at most about one
+    picture waits, whenever the main picture started. If the feeder stops, ffmpeg sees the
+    end of the overlay and keeps the main picture (overlay eof_action=pass).
+    """
+
+    def __init__(self, frame_path=FRAME_PATH, fifo_path=FIFO_PATH):
+        self.frame_path, self.fifo_path = Path(frame_path), Path(fifo_path)
+        self._thread = None
+        self._stop = threading.Event()
+        self._data, self._mtime = BLANK, None
+        self.frames_written = 0
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self.fifo_path.parent.mkdir(parents=True, exist_ok=True)
+        if self.fifo_path.exists() and not stat.S_ISFIFO(self.fifo_path.stat().st_mode):
+            self.fifo_path.unlink()
+        if not self.fifo_path.exists():
+            os.mkfifo(self.fifo_path, 0o600)
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name='overlay-feeder')
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+
+    def _current(self):
+        """The newest rendered PNG (re-read only when the file changed)."""
+        try:
+            mtime = self.frame_path.stat().st_mtime_ns
+            if mtime != self._mtime:
+                self._data, self._mtime = self.frame_path.read_bytes(), mtime
+        except OSError:
+            pass
+        return self._data
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                # Non-blocking open fails with ENXIO until ffmpeg has opened the FIFO for reading.
+                fd = os.open(self.fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as exc:
+                if exc.errno not in (errno.ENXIO, errno.ENOENT):
+                    time.sleep(1)
+                self._stop.wait(0.1)
+                continue
+            try:
+                os.set_blocking(fd, True)
+                try:
+                    fcntl.fcntl(fd, F_SETPIPE_SZ, 4096)     # the smallest pipe: no frames queue up here
+                except OSError:
+                    pass
+                while not self._stop.is_set():
+                    data = memoryview(self._current())
+                    while data:
+                        data = data[os.write(fd, data):]     # blocks until ffmpeg wants more
+                    self.frames_written += 1
+            except (BrokenPipeError, OSError):
+                pass                                        # the encoder stopped: wait for the next one
+            finally:
+                os.close(fd)
 
 
 def ensure_frame(path=FRAME_PATH):

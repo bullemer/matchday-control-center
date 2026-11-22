@@ -1,7 +1,7 @@
 """Supervised local media pipeline. All control mutations share one lock."""
 from __future__ import annotations
 
-from browser_overlay import FRAME_PATH, ensure_frame
+from browser_overlay import FRAME_PATH, OverlayFeeder, ensure_frame
 import recordings
 import settings_store
 
@@ -2340,19 +2340,51 @@ def get_encoder_status():
             "nvidia": bool(_nvenc_ok), "intel_device": _hw_device}
 
 
+OVERLAY_FPS = 5        # Score67 overlay pictures per second the encoder takes in
+_overlay_feeder = None
+
+
+def _filter_path(path):
+    """A file name as a filter option inside -filter_complex (two levels of escaping)."""
+    option = "".join("\\" + c if c in "\\:'" else c for c in str(path))
+    return "".join("\\" + c if c in "\\'[],;" else c for c in option)
+
+
+def _overlay_source():
+    """Filter source with the Score67 overlay, fed through a FIFO by OverlayFeeder.
+
+    The overlay used to be a second ffmpeg input (image2 -loop 1 -re). ffmpeg reads another
+    input whenever the main one has no packet (connecting, any hiccup) and queued those
+    overlay pictures; their timestamps (picture number / rate) then ran ahead of the camera
+    for good: score changes reached the stream ~10 s late (measured 9.7 s; camera 1.7 s).
+    A movie source inside the filter graph is read only when the overlay is due, so no
+    backlog can build up: measured 1.15 s (camera 0.80 s) at 5 pictures per second."""
+    global _overlay_feeder
+    fifo = FRAME_PATH.with_name(FRAME_PATH.stem + ".fifo")
+    if _overlay_feeder is None or _overlay_feeder.frame_path != Path(FRAME_PATH):
+        if _overlay_feeder:
+            _overlay_feeder.stop()
+        _overlay_feeder = OverlayFeeder(FRAME_PATH, fifo)
+    _overlay_feeder.start()
+    # probesize/analyzeduration: no read-ahead when opening; dec_threads=1: frame threading
+    # in the PNG decoder would hold pictures back.
+    return (f"movie=filename={_filter_path(fifo)}:f=image2pipe:format_opts="
+            f"'framerate={OVERLAY_FPS}\\:probesize=32\\:analyzeduration=0\\:fpsprobesize=0':dec_threads=1")
+
+
 def _launch_encoder():
     global _encoder_proc, _encoder_hw
     width, height, bitrate, _ = PROFILES[_profile]
     vf = f"scale={width}:{height}"  # the live relay draws the built-in scoreboard
     ensure_frame(FRAME_PATH)
-    # Force image2: auto-detected png_pipe would keep reading the old inode after a live update.
     # Keep composition in the encoder's YUV420 format and bound worker counts:
     # auto-threading added substantial CPU overhead in real-time 1080p/PiP tests.
     intel = _hw_wanted == "intel" and bool(_hw_device) and not _hw_warning
     nvidia = _hw_wanted == "nvidia" and bool(_nvenc_ok) and not _hw_warning
     hardware = intel or nvidia
     upload = ",format=nv12,hwupload" if intel else ""
-    vf = f"[0:v]{vf}[base];[1:v]scale={width}:{height},format=rgba[score67];[base][score67]overlay=0:0:format=yuv420{upload}[vout]"
+    vf = (f"[0:v]{vf}[base];{_overlay_source()},scale={width}:{height},format=rgba[score67];"
+          f"[base][score67]overlay=0:0:format=yuv420:eof_action=pass{upload}[vout]")
     if intel:  # no B-frames, like x264's zerolatency
         codec = ["-c:v", "h264_vaapi", "-bf", "0"]
     elif nvidia:
@@ -2362,7 +2394,6 @@ def _launch_encoder():
     # A deep input queue: the reader must keep draining while the graph is busy.
     cmd = _ffmpeg() + (["-vaapi_device", _hw_device] if intel else []) + [
         "-filter_complex_threads", "2", "-thread_queue_size", "1024"] + _input("program") + [
-        "-re", "-f", "image2", "-loop", "1", "-framerate", "2", "-i", str(FRAME_PATH),
         "-filter_complex", vf, "-map", "[vout]", "-map", "0:a:0", *codec,
         "-b:v", bitrate, "-maxrate", bitrate, "-bufsize", f"{int(bitrate[:-1]) * 2}k", "-g", "60",
         "-r", "30", "-c:a", "aac", "-b:a", "128k",

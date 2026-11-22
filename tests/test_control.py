@@ -17,6 +17,19 @@ import media_engine as m
 import network_manager as n
 
 
+# No real Score67 FIFO feeder in unit tests: it could write into a running app's encoder pipe.
+_overlay_feeder_patch = __import__('unittest.mock', fromlist=['patch']).patch('media_engine.OverlayFeeder')
+
+
+def setUpModule():
+    _overlay_feeder_patch.start()
+
+
+def tearDownModule():
+    _overlay_feeder_patch.stop()
+
+
+
 class ApiTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -913,11 +926,15 @@ class MediaTests(unittest.TestCase):
             self.assertIn('scale=1920:1080',' '.join(cmd))
             self.assertIn('fontsize=42',' '.join(cmd))  # the live relay draws the scoreboard
             self.assertEqual(cmd[cmd.index('-b:v')+1],'8000k')
-            with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_encoder_proc',None):
+            with patch.object(m,'Process') as proc,patch.object(m,'ensure_frame'),patch.object(m,'_encoder_proc',None),\
+                    patch.object(m,'OverlayFeeder') as feeder,patch.object(m,'_overlay_feeder',None):
                 m._launch_encoder()
+            feeder.return_value.start.assert_called_once()
             enc=proc.call_args.args[0]
-            self.assertEqual(enc[enc.index('-f')+1], 'image2')
+            self.assertEqual(enc.count('-i'), 1)            # only the program: the overlay is a filter source
             vf=enc[enc.index('-filter_complex')+1]
+            self.assertIn('movie=filename=', vf); self.assertIn('f=image2pipe', vf); self.assertIn('dec_threads=1', vf)
+            self.assertIn('eof_action=pass', vf)
             self.assertIn('scale=1920:1080',vf); self.assertNotIn('textfile=',vf)
             self.assertEqual((enc[enc.index('-b:v')+1],enc[enc.index('-bufsize')+1]),('6000k','12000k'))
             self.assertEqual(enc[-1], m.RTSP_BASE+'/final')  # YouTube and the recorder copy this
