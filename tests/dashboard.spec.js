@@ -902,3 +902,40 @@ test('camera input settings: SRT with delay and encryption, recommended quality,
   await expect(page.locator('#url-cam5')).toHaveText(/^rtmp:/);
   expect(errors).toEqual([]);
 });
+
+test('AI Director tab: switch on, scores, best camera and thumbnails', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('[data-tab-btn="director"]').click();
+  await expect(page.locator('#director-status')).toHaveText('⚪ Off');
+  const configured = page.waitForRequest(r => r.url().endsWith('/api/director') && r.method() === 'POST' && r.postDataJSON().enabled === true);
+  await page.locator('#director-enabled').check();
+  await configured;
+  await expect(page.locator('#director-status')).toContainText('🟢 Running · Test GPU · 5 frames/s per camera · GPU budget used 31 %');
+  await expect(page.locator('#director-status')).toContainText('best now: Cam 1');
+  const cam1 = page.locator('[data-director-card="cam1"]');
+  await expect(cam1.locator('[data-director-score]')).toHaveText('78');
+  await expect(cam1.locator('[data-director-badge]')).toHaveText('⭐ BEST');
+  await expect(cam1.locator('[data-director-detail]')).toContainText('⚽ ball 62 %');
+  await expect(cam1.locator('[data-director-detail]')).toContainText('9 players, 3 in the play');
+  await expect(cam1.locator('[data-director-image]')).toBeVisible();
+  expect(await cam1.locator('[data-director-image]').evaluate(img => img.complete && img.naturalWidth > 0)).toBeTruthy();
+  await expect(page.locator('[data-director-card="cam2"] [data-director-score]')).toHaveText('41');
+  await expect(page.locator('[data-director-card="cam2"] [data-director-badge]')).toHaveText('RATED');
+  // No thumbnail yet (404): placeholder instead of a broken image.
+  await expect(page.locator('[data-director-card="cam2"] [data-director-noimage]')).toBeVisible();
+  await expect(page.locator('[data-director-card="cam2"] [data-director-image]')).toBeHidden();
+  await expect(page.locator('[data-director-card="cam3"] [data-director-badge]')).toHaveText('OFFLINE');
+  // Reporting cameras are not rated.
+  await expect(page.locator('[data-director-card="cam5"]')).toHaveCount(0);
+  const rate = page.waitForRequest(r => r.url().endsWith('/api/director') && r.method() === 'POST' && r.postDataJSON().fps === 10);
+  await page.locator('#director-fps').selectOption('10');
+  await rate;
+  await expect(page.locator('#director-status')).toContainText('10 frames/s per camera');
+  // The thumbnail needs the operator login like everything else.
+  expect((await page.request.get('/api/director/image/cam1', {headers: {Authorization: ''}})).status()).toBe(200);
+  await page.screenshot({path:'/tmp/mcc-ai-director.png', fullPage:true});
+  expect(errors).toEqual([]);
+});

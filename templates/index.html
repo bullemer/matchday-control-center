@@ -359,6 +359,7 @@
       <button type="button" class="tab-btn" role="tab" data-tab-btn="cams" onclick="selectTab('cams')">🎥 Cams</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="network" onclick="selectTab('network')">🌐 Network</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="recordings" onclick="selectTab('recordings')">🎬 Recordings</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="director" onclick="selectTab('director')">🤖 AI Director</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="checklist" onclick="selectTab('checklist')">✅ Checklist</button>
     </nav>
 
@@ -1111,6 +1112,45 @@
       </div>
     </section>
 
+    <!-- AI Director: rates the match cameras (display only, no automatic cutting yet) -->
+    <section data-setup data-tab="director" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-2">
+        <h2 class="text-lg font-semibold text-white flex items-center gap-2">🤖 AI Director</h2>
+        <div class="flex items-center gap-3 text-sm">
+          <label class="flex items-center gap-2 text-slate-300" title="Frames analysed per second and camera">
+            Rate <select id="director-fps" onchange="setDirector({fps: parseInt(this.value, 10)})" class="dest-input text-xs py-1"></select>
+          </label>
+          <label class="flex items-center gap-2 text-slate-200 font-semibold">
+            <input type="checkbox" role="switch" id="director-enabled" class="overlay-switch" onchange="setDirector({enabled: this.checked})"> Enabled
+          </label>
+        </div>
+      </div>
+      <p class="text-xs text-slate-400 mb-3">Watches the match cameras (Cam 1–4) and rates each picture 0–100: ball visible and well framed,
+        players around the play, sharp and well exposed. <b>Display only</b> — it does not cut yet. Players are found with YOLO26s,
+        the ball with box2boxcam (finds fewer than half of small, far balls: the players count more).</p>
+      <p id="director-status" class="text-sm text-slate-300 mb-4" role="status">—</p>
+      <div id="director-grid" class="grid gap-3 sm:grid-cols-2">
+        {% for cam in cameras if cam.role == 'match' %}
+        <div class="bg-slate-900 rounded-lg border-2 border-slate-700 p-3" data-director-card="{{ cam.id }}">
+          <div class="flex items-center justify-between gap-2 mb-2">
+            <span class="font-semibold text-white truncate">📹 <span data-cam-label="{{ cam.id }}">{{ cam.label }}</span></span>
+            <span data-director-badge class="text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400">—</span>
+          </div>
+          <div class="relative aspect-video bg-black rounded overflow-hidden mb-2">
+            <img data-director-image alt="{{ cam.label }} as the AI Director sees it" class="w-full h-full object-contain" hidden
+                 onerror="this.hidden = true; this.nextElementSibling.hidden = false">
+            <div data-director-noimage class="absolute inset-0 grid place-content-center text-xs text-slate-500">No picture</div>
+          </div>
+          <div class="flex items-center gap-3 mb-2">
+            <span data-director-score class="text-4xl font-extrabold tabular-nums text-white w-16 text-right">—</span>
+            <div class="flex-1 h-3 rounded bg-slate-700 overflow-hidden"><div data-director-bar class="h-full bg-brand-green" style="width:0%"></div></div>
+          </div>
+          <p data-director-detail class="text-xs text-slate-400 min-h-[2rem]"></p>
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+
     <!-- ─────────────────────────────────────────────────────────────────
          8. INTERACTIVE SIDELINE CHECKLIST
          ───────────────────────────────────────────────────────────────── -->
@@ -1572,7 +1612,7 @@
       window.scrollTo(0, 0);
     }
 
-    const TABS = ['main', 'cams', 'network', 'recordings', 'checklist'];
+    const TABS = ['main', 'cams', 'network', 'recordings', 'director', 'checklist'];
 
     function selectTab(tab) {
       state.tab = TABS.includes(tab) ? tab : 'main';
@@ -1583,6 +1623,83 @@
       });
       syncPreviews();
       if (state.tab === 'recordings') loadRecordings(true);
+      if (state.tab === 'director') pollDirector();
+    }
+
+    // ──────────────────────── AI Director ────────────────────────
+    // Polled once a second, only while its tab is open (and the page is visible).
+    let directorTimer = null;
+    async function pollDirector() {
+      clearTimeout(directorTimer);
+      if (state.tab !== 'director' || state.matchMode) return;
+      try {
+        const res = await fetch('/api/director', {signal: AbortSignal.timeout(5000)});
+        const data = await res.json();
+        if (data.ok) renderDirector(data);
+      } catch (err) { /* the next poll retries */ }
+      directorTimer = setTimeout(pollDirector, document.hidden ? 5000 : 1000);
+    }
+
+    function renderDirector(d) {
+      const toggle = document.getElementById('director-enabled');
+      if (document.activeElement !== toggle) toggle.checked = d.enabled;
+      const fps = document.getElementById('director-fps');
+      if (!fps.options.length) fps.innerHTML = d.fps_choices.map(v => `<option value="${v}">${v} / s</option>`).join('');
+      if (document.activeElement !== fps) fps.value = String(d.fps);
+      const status = document.getElementById('director-status');
+      const phaseText = {running: '🟢 Running', loading: '⏳ Loading models…', starting: '⏳ Starting…', crashed: '🔴 Stopped with an error — restarting', off: '⚪ Off', stopped: '⚪ Stopped'};
+      let text = phaseText[d.phase] || d.phase;
+      if (d.phase === 'running') {
+        text += ` · ${d.gpu || ''} · ${d.fps} frames/s per camera · GPU budget used ${Math.round((d.busy || 0) * 100)} %`;
+        if (d.recommended) text += ` · ⭐ best now: ${camLabel(d.recommended)}`;
+      }
+      if (d.setup_problem) text = '⚠ ' + d.setup_problem;
+      else if (d.error && d.phase !== 'running') text += ' — ' + d.error.split('\n').pop();
+      status.textContent = text;
+      for (const cam of d.cameras) {
+        const card = document.querySelector(`[data-director-card="${cam}"]`);
+        if (!card) continue;
+        const c = d.cams[cam];
+        const badge = card.querySelector('[data-director-badge]');
+        const recommended = d.recommended === cam;
+        card.classList.toggle('border-brand-green', recommended);
+        card.classList.toggle('border-slate-700', !recommended);
+        const score = card.querySelector('[data-director-score]');
+        const bar = card.querySelector('[data-director-bar]');
+        const detail = card.querySelector('[data-director-detail]');
+        const img = card.querySelector('[data-director-image]');
+        if (!c || !c.online) {
+          badge.textContent = d.phase === 'running' ? 'OFFLINE' : '—';
+          badge.className = 'text-xs px-2 py-0.5 rounded font-bold bg-slate-700 text-slate-400';
+          score.textContent = '—'; bar.style.width = '0%';
+          detail.textContent = d.phase === 'running' ? 'Camera not publishing' : '';
+          img.hidden = true; card.querySelector('[data-director-noimage]').hidden = false;
+          continue;
+        }
+        badge.textContent = recommended ? '⭐ BEST' : 'RATED';
+        badge.className = 'text-xs px-2 py-0.5 rounded font-bold ' + (recommended ? 'bg-brand-green text-white' : 'bg-slate-700 text-slate-300');
+        score.textContent = Math.round(c.score);
+        bar.style.width = Math.max(0, Math.min(100, c.score)) + '%';
+        bar.className = 'h-full ' + (c.score >= 60 ? 'bg-brand-green' : c.score >= 35 ? 'bg-brand-amber' : 'bg-brand-red');
+        const ball = c.ball.seen ? `⚽ ball ${Math.round(c.ball.conf * 100)} %` : c.ball.remembered ? '⚽ ball just seen' : '⚽ no ball';
+        const parts = [ball, `👥 ${c.action.players} players, ${c.action.near} in the play`,
+                       c.quality.frozen ? '⏸ FROZEN picture' : `🔍 sharp ${Math.round(c.quality.sharp * 100)} % · 💡 exposure ${Math.round(c.quality.exposure * 100)} %`];
+        detail.textContent = parts.join(' · ') + `  (ball ${Math.round(c.ball.part * 100)} · play ${Math.round(c.action.part * 100)} · picture ${Math.round(c.quality.part * 100)})`;
+        if (c.image_t && img.dataset.t !== String(c.image_t)) {
+          img.dataset.t = String(c.image_t);
+          img.src = `/api/director/image/${cam}?t=${c.image_t}`;
+          img.hidden = false; card.querySelector('[data-director-noimage]').hidden = true;
+        }
+      }
+    }
+
+    async function setDirector(body) {
+      const {ok, data} = await apiRequest('/api/director', body);
+      if (!ok) {
+        showToast('❌ ' + (data.error || 'AI Director failed'), 'error');
+        document.getElementById('director-enabled').checked = false;
+      } else renderDirector(data);
+      pollDirector();
     }
 
     // Match preview: the program (instant, for cutting) or the output viewers get.

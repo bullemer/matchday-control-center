@@ -24,6 +24,7 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, send_file
 import recordings
 import camera_control
+import ai_director
 
 from browser_overlay import BrowserOverlay, normalize_url
 
@@ -305,6 +306,33 @@ def api_camera_report(cam_id):
         return jsonify(ok=False, error="Report too large"), 413
     answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id))
     return jsonify(ok=True, **answer)
+
+
+# --- AI Director ---------------------------------------------------------
+
+@app.route("/api/director")
+@api_endpoint
+def api_director_status():
+    """Scores of the match cameras (AI Director), worker state and setup problems."""
+    return jsonify(ok=True, **ai_director.status())
+
+
+@app.route("/api/director", methods=["POST"])
+@api_endpoint
+def api_director_configure():
+    """{"enabled": true/false, "fps": 2|5|10}"""
+    data = request.get_json()
+    result = ai_director.configure(enabled=data.get("enabled"), fps=data.get("fps"))
+    return jsonify(ok=True, **result)
+
+
+@app.route("/api/director/image/<cam_id>")
+def api_director_image(cam_id):
+    """Annotated thumbnail of one match camera (ball and players marked)."""
+    path = ai_director.image_path(cam_id)
+    if not path:
+        return jsonify(ok=False, error="No picture yet"), 404
+    return send_file(path, mimetype="image/jpeg", max_age=0)
 
 
 @app.route("/api/cameras/<cam_id>/zoom", methods=["POST"])
@@ -1382,6 +1410,7 @@ def initialize():
     load_camera_setting()
     load_recording_setting()
     start_monitor_worker()  # plays in the headset once MediaMTX runs, if listening was on
+    ai_director.autostart()  # rates the match cameras if it was switched on last time
     threading.Thread(target=load_encoder_setting, daemon=True).start()  # test-encodes: not on the start path
     threading.Thread(target=_recover_recordings, daemon=True).start()
     browser_overlay.start()
@@ -1399,6 +1428,7 @@ def shutdown():
         worker.join(timeout=2)
     with _init_lock:
         shutdown_all()
+    ai_director.stop()
     browser_overlay.stop()
     _save_match()
 

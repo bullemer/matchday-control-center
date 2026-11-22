@@ -71,6 +71,30 @@ def fake_zoom(cam, zoom=None, step=None, wide=False):
     phone['zoom']=0.6 if wide else round(phone['zoom']*1.25**(step or 0),2) if step else zoom
     return phone['zoom']
 a.camera_control.request_zoom=fake_zoom
+# AI Director: fake worker state (cam1 best, cam2 rated, cam3 offline) and a 1x1 JPEG thumbnail.
+import base64, time as _time
+director={'enabled':False,'fps':5}
+director_calls=[]
+_jpg=Path(tempfile.mkdtemp())/'cam1.jpg'
+_jpg.write_bytes(base64.b64decode('/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAMCAgICAgMCAgIDAwMDBAYEBAQEBAgGBgUGCQgKCgkICQkKDA8MCgsOCwkJDRENDg8QEBEQCgwSExIQEw8QEBD/yQALCAABAAEBAREA/8wABgAQEAX/2gAIAQEAAD8A0s8g/9k='))
+def fake_director_status():
+    on=director['enabled']
+    cam=lambda score, ball, near: {'online':True,'score':score,'raw':score,'image_t':1.0,
+        'ball':{'seen':ball,'remembered':False,'conf':0.62 if ball else None,'part':0.8 if ball else 0.0},
+        'action':{'part':0.75,'players':9,'near':near},'quality':{'part':0.9,'sharp':0.95,'exposure':0.9,'frozen':False}}
+    return {'enabled':on,'fps':director['fps'],'fps_choices':[2,5,10],'phase':'running' if on else 'off','setup_problem':None,
+            'gpu':'Test GPU' if on else None,'busy':0.31 if on else None,'recommended':'cam1' if on else None,
+            'cameras':['cam1','cam2','cam3','cam4'],'error':'','restarts':0,
+            'cams':{'cam1':cam(78.4,True,3),'cam2':cam(41.0,False,1),'cam3':{'online':False}} if on else {}}
+def fake_director_configure(enabled=None, fps=None):
+    director_calls.append([enabled, fps])
+    if enabled is not None: director['enabled']=enabled
+    if fps is not None: director['fps']=fps
+    return fake_director_status()
+a.ai_director.status=fake_director_status
+a.ai_director.configure=fake_director_configure
+a.ai_director.image_path=lambda cam: _jpg if cam=='cam1' else None
+a.ai_director.autostart=lambda: None
 a.set_audio_source=lambda mode: (True,'Audio updated')
 mic_delay=[]
 a.set_mic_delay=lambda ms: (mic_delay.append(ms) or True,f'Microphone delay {ms/1000:.1f} s')  # never the real data/audio.json
