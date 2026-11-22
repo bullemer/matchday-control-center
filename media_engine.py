@@ -482,9 +482,11 @@ SRT_LATENCY_MIN, SRT_LATENCY_MAX = 80, 2000   # ms; SRT resends lost packets wit
 # What to set in the camera app: resolution, frame rate, video bitrate (kbit/s). Keyframe
 # every second (our cuts start on one). Reporting cameras default lower: they move away
 # from the router, and six cameras share one Wi-Fi.
-QUALITIES = {"1080p": ("1920x1080", 30, 6000), "720p": ("1280x720", 30, 3000),
+QUALITIES = {"2160p": ("3840x2160", 30, 16000), "1440p": ("2560x1440", 30, 10000),
+             "1080p": ("1920x1080", 30, 6000), "720p": ("1280x720", 30, 3000),
              "720p-low": ("1280x720", 30, 1800), "480p": ("854x480", 30, 1000)}
-QUALITY_LABELS = {"1080p": "1080p · 6 Mbit/s", "720p": "720p · 3 Mbit/s",
+QUALITY_LABELS = {"2160p": "2160p · 16 Mbit/s (strong Wi-Fi only)", "1440p": "1440p · 10 Mbit/s",
+                  "1080p": "1080p · 6 Mbit/s", "720p": "720p · 3 Mbit/s",
                   "720p-low": "720p · 1.8 Mbit/s (weak Wi-Fi)", "480p": "480p · 1 Mbit/s (very weak link)"}
 
 
@@ -555,6 +557,16 @@ def get_cameras():
                      "recommended": {"size": size, "fps": fps, "kbps": kbps, "keyframe_s": 1,
                                      "label": QUALITY_LABELS[info["quality"]]}})
     return cams
+
+
+def quality_for(width, height, kbps):
+    """The quality preset for a resolution (and bitrate, where two share one size); None if
+    no preset has this size."""
+    size = f"{width}x{height}"
+    same = [q for q, (sz, _, _) in QUALITIES.items() if sz == size]
+    if not same:
+        return None
+    return min(same, key=lambda q: abs(QUALITIES[q][2] - kbps))
 
 
 def set_camera_info(cam, label=None, position=None, protocol=None, latency_ms=None, encrypt=None,

@@ -174,6 +174,31 @@ class CameraReportApiTests(unittest.TestCase):
             self.assertEqual(self.a.phone_config('cam3'), {'mode': 'gimbal', 'width': 1280, 'height': 720, 'kbps': 1800,
                                                            'fps': 30, 'latency_ms': 500})
 
+    def test_settings_changed_in_the_app_reach_the_dashboard(self):
+        cams = [{'id': 'cam3', 'mount': 'fixed', 'quality': '1080p', 'latency_ms': 300,
+                 'recommended': {'size': '1920x1080', 'fps': 30, 'kbps': 6000}}]
+        with patch.object(self.a, 'get_cameras', return_value=cams), \
+                patch.object(self.a, 'set_camera_info', return_value=(True, 'Camera saved')) as sci:
+            self.a.apply_phone_settings('cam3', {'mode': 'gimbal', 'width': 1280, 'height': 720, 'kbps': 1800,
+                                                 'latency_ms': 500})
+            sci.assert_called_once_with('cam3', mount='tracking', quality='720p-low', latency_ms=500)
+            sci.reset_mock()
+            # nothing new: nothing saved; unknown size: quality left alone
+            self.a.apply_phone_settings('cam3', {'mode': 'fixed', 'width': 1920, 'height': 1080, 'kbps': 6000,
+                                                 'latency_ms': 300})
+            self.a.apply_phone_settings('cam3', {'mode': 'fixed', 'width': 1000, 'height': 1000, 'kbps': 6000,
+                                                 'latency_ms': 300})
+            sci.assert_not_called()
+            self.a.apply_phone_settings('cam3', {'mode': 'reporter', 'latency_ms': 99999})
+            sci.assert_called_once_with('cam3', mount='handheld', latency_ms=2000)
+
+    def test_quality_for(self):
+        from media_engine import quality_for
+        self.assertEqual(quality_for(1280, 720, 3000), '720p')
+        self.assertEqual(quality_for(1280, 720, 2000), '720p-low')
+        self.assertEqual(quality_for(3840, 2160, 10000), '2160p')
+        self.assertIsNone(quality_for(1000, 1000, 1000))
+
     def test_camera_password_is_required_when_set(self):
         with patch.object(self.a, 'camera_password', return_value='secret'):
             self.assertEqual(self.client.post('/api/camera-report/cam3', json=dict(REPORT)).status_code, 401)

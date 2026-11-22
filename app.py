@@ -54,7 +54,8 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
                           start_monitor_worker, get_cameras, set_camera_info, load_camera_setting,
                           REPORT_CAMERAS, get_camera_inputs, QUALITY_LABELS, set_iso_match,
-                          load_recording_setting, nvenc_available, generate_mediamtx_config)
+                          load_recording_setting, nvenc_available, generate_mediamtx_config, quality_for,
+                          SRT_LATENCY_MIN, SRT_LATENCY_MAX)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -312,7 +313,10 @@ def api_camera_report(cam_id):
         return jsonify(ok=False, error="Camera password required"), 401
     if request.content_length and request.content_length > 4096:
         return jsonify(ok=False, error="Report too large"), 413
-    answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id),
+    data = request.get_json(silent=True)
+    if isinstance(data, dict) and isinstance(data.get("settings"), dict):
+        apply_phone_settings(cam_id, data["settings"])
+    answer = camera_control.record_report(cam_id, data, tally=lambda: tally_state(cam_id),
                                           config=lambda: phone_config(cam_id))
     return jsonify(ok=True, **answer)
 
@@ -531,6 +535,32 @@ def phone_config(cam_id):
     width, height = (int(v) for v in r["size"].split("x"))
     return {"mode": APP_MODES.get(cam.get("mount"), "fixed"), "width": width, "height": height,
             "kbps": r["kbps"], "fps": r["fps"], "latency_ms": cam["latency_ms"]}
+
+
+PHONE_MOUNTS = {mode: mount for mount, mode in APP_MODES.items()}
+
+
+def apply_phone_settings(cam_id, settings):
+    """The operator changed mode, resolution or latency in the phone app: the dashboard's
+    camera settings follow (last change wins), so the next answer does not change it back."""
+    changes = {}
+    cam = next(c for c in get_cameras() if c["id"] == cam_id)
+    mount = PHONE_MOUNTS.get(settings.get("mode"))
+    if mount and mount != cam.get("mount"):
+        changes["mount"] = mount
+    try:
+        quality = quality_for(int(settings["width"]), int(settings["height"]), int(settings["kbps"]))
+    except (KeyError, TypeError, ValueError):
+        quality = None
+    if quality and quality != cam.get("quality"):
+        changes["quality"] = quality
+    latency = settings.get("latency_ms")
+    if type(latency) is int and latency != cam.get("latency_ms"):
+        changes["latency_ms"] = max(SRT_LATENCY_MIN, min(SRT_LATENCY_MAX, latency))
+    if not changes:
+        return
+    ok, message = set_camera_info(cam_id, **changes)
+    log.info("%s: settings from the phone app %s: %s", cam_id, changes, message if ok else "refused - " + message)
 
 
 def tally_state(cam_id):
