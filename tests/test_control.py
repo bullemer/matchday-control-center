@@ -218,11 +218,14 @@ class ApiTests(unittest.TestCase):
                                             'source':'score67','overlay_url':'https://score67.de/s/game?k=x'})
         self.post('/api/scoreboard/clock',{'action':'set','seconds':1500})
         state=json.loads(a.MATCH_PATH.read_text())
-        state['saved_at']-=3600  # same match day: everything continues
+        state['saved_at']-=3600; state['changed_at']-=3600  # same match day: everything continues
         a.MATCH_PATH.write_text(json.dumps(state))
         a._restore_match()
         self.assertEqual((a._scoreboard['home_name'],a._scoreboard['home_score'],a._scoreboard['away_score']),('Polonia',2,1))
-        state['saved_at']-=a.MATCH_RESTORE_MAX  # last week's match
+        # app left running for hours without touching the match: the file is rewritten, the age stays
+        a._save_match(); state=json.loads(a.MATCH_PATH.read_text())
+        self.assertLess(state['changed_at'],state['saved_at']-3000)
+        state['changed_at']-=a.MATCH_RESTORE_MAX  # last week's match, saved just now
         a.MATCH_PATH.write_text(json.dumps(state))
         a._scoreboard.update(home_name='Home',away_name='Guest',home_score=0,away_score=0,source='builtin',overlay_url='')
         a._clock.update(elapsed=0.0,running=False,start_ts=None,half=1)
@@ -776,7 +779,13 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^(cam1|cam2|cam3|cam4|cam5|cam6)$'}])
             self.assertEqual(users[1]['permissions'],[{'action':'read'}])  # no password: nobody on the LAN may publish
             self.assertEqual(users[2]['ips'],['127.0.0.1','::1'])
-            self.assertIn({'action':'publish','path':'~^(program|final|monitor|cam1|cam2|cam3|cam4|cam5|cam6)$'},users[2]['permissions'])
+            self.assertIn({'action':'publish','path':'~^(program|final|monitor|cam1|cam2|cam3|cam4|cam5|cam6)(_preview)?$'},users[2]['permissions'])
+        # H.265 cameras get an on-demand H.264 preview for the browser
+        preview=config['paths']['cam5_preview']
+        self.assertIn('rtsp://127.0.0.1:8554/cam5 ',preview['runOnDemand'])
+        self.assertIn('-c:v libx264',preview['runOnDemand'])
+        self.assertTrue(preview['runOnDemand'].endswith('rtsp://127.0.0.1:8554/cam5_preview'))
+        self.assertEqual(preview['runOnDemandCloseAfter'],'10s')
 
     def reconnect_case(self, **extra):
         relay=MagicMock(); relay.poll.return_value=None; relay.healthy.return_value=True

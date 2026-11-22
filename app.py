@@ -1106,6 +1106,8 @@ CLOCK_RESUME_MAX = 600  # seconds of downtime after which a running clock is not
 # A saved match older than this is a finished one: the next start begins with Home 0:0 Guest
 # and a clock at 00:00. Within it (crash, laptop restart on match day) everything continues.
 MATCH_RESTORE_MAX = 6 * 3600
+_MATCH_FIELDS = ("home_name", "home_score", "away_name", "away_score", "half", "clock_elapsed_secs")
+_match_changed = {"at": None, "content": None}  # last change of names, score or clock
 _workers_stop = threading.Event()
 _init_lock = threading.Lock()
 _workers = []
@@ -1121,7 +1123,14 @@ def text_field(data, field, limit, default=""):
 def _save_match():
     with _scoreboard_lock:
         state = _get_scoreboard_state()
-        state["saved_at"] = time.time()  # lets a restart continue a running clock
+        now = time.time()
+        state["saved_at"] = now  # lets a restart continue a running clock
+        # changed_at = when the match itself last changed (the file is rewritten every 5 s).
+        content = tuple(state.get(k) for k in _MATCH_FIELDS)
+        if _match_changed["at"] is None or content != _match_changed["content"] or state.get("clock_running"):
+            _match_changed["at"] = now
+        _match_changed["content"] = content
+        state["changed_at"] = _match_changed["at"]
         MATCH_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(dir=MATCH_PATH.parent)
         try:
@@ -1152,8 +1161,8 @@ def _restore_match():
         state.setdefault("visible", True)  # saved matches from before the visibility control
         if type(state["visible"]) is not bool:
             raise ValueError("Invalid persisted scoreboard visibility")
-        saved_at = state.get("saved_at")
-        fresh = type(saved_at) in (int, float) and math.isfinite(saved_at) and 0 <= time.time() - saved_at <= MATCH_RESTORE_MAX
+        changed_at = state.get("changed_at", state.get("saved_at"))  # files before changed_at: saved_at
+        fresh = type(changed_at) in (int, float) and math.isfinite(changed_at) and 0 <= time.time() - changed_at <= MATCH_RESTORE_MAX
         half_length = state.get("half_length", 45)  # saved before half length existed
         if type(half_length) is not int or not 10 <= half_length <= 60:
             half_length = 45
@@ -1166,10 +1175,13 @@ def _restore_match():
                          _scoreboard["home_name"], _scoreboard["away_name"])
                 return
             _scoreboard.update({key: state[key] for key in _scoreboard})
+            # Keep the restored age: an untouched match must not look new after each restart.
+            _match_changed["at"] = changed_at
+            _match_changed["content"] = tuple(state.get(k) for k in _MATCH_FIELDS)
             # A clock that was running keeps running through a crash or restart: the match
             # went on. After a long gap (the laptop was put away) it stays paused instead.
-            gap = None
-            if state.get("clock_running") is True:
+            saved_at, gap = state.get("saved_at"), None
+            if state.get("clock_running") is True and type(saved_at) in (int, float) and math.isfinite(saved_at):
                 gap = time.time() - saved_at
             resume = gap is not None and 0 <= gap <= CLOCK_RESUME_MAX
             _clock.update(running=resume, elapsed=elapsed + (gap if resume else 0.0),
