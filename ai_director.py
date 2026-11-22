@@ -16,6 +16,7 @@ import threading
 import time
 from pathlib import Path
 
+import director_scoring
 import media_engine
 
 log = logging.getLogger(__name__)
@@ -35,13 +36,18 @@ STALE_S = 6.0            # worker state older than this = not running
 RESTART_MAX_S = 60.0
 
 _lock = threading.Lock()
-_settings = {"enabled": False, "fps": 5}
+_settings = {"enabled": False, "fps": 5, "suggest": False}
 _proc = None
 _supervisor = None
 _stop = threading.Event()
 _last_error = ""
 _restarts = 0
 _fences = {}
+# Suggest mode (operator decides): current suggestion, on-air tracking, outcome counts.
+_suggester = director_scoring.Suggester()
+_suggestion = None
+_on_air = {"cam": None, "since": 0.0}
+_stats = {"accepted": 0, "ignored": 0, "timed out": 0, "lead lost": 0}
 
 
 def match_cameras():
@@ -68,6 +74,8 @@ def load_settings():
             _settings["enabled"] = data["enabled"]
         if data.get("fps") in FPS_CHOICES:
             _settings["fps"] = data["fps"]
+        if isinstance(data.get("suggest"), bool):
+            _settings["suggest"] = data["suggest"]
     return dict(_settings)
 
 
@@ -78,10 +86,12 @@ def _save_settings():
     tmp.replace(SETTINGS)
 
 
-def configure(enabled=None, fps=None):
-    """Switch on/off and set the analysis rate (frames per second per camera)."""
+def configure(enabled=None, fps=None, suggest=None):
+    """Switch on/off, set the analysis rate (frames per second per camera) and suggest mode."""
     if enabled is not None and type(enabled) is not bool:
         raise ValueError("enabled must be true or false")
+    if suggest is not None and type(suggest) is not bool:
+        raise ValueError("suggest must be true or false")
     if fps is not None and fps not in FPS_CHOICES:
         raise ValueError(f"fps must be one of {FPS_CHOICES}")
     if enabled and setup_problem():
@@ -92,6 +102,8 @@ def configure(enabled=None, fps=None):
             _settings["enabled"] = enabled
         if fps is not None:
             _settings["fps"] = fps
+        if suggest is not None:
+            _settings["suggest"] = suggest
         _save_settings()
         want = _settings["enabled"]
     if want:
@@ -253,7 +265,73 @@ def _supervise():
             sync_fences()  # a camera switched to/from "fixed" mount
         except OSError:
             pass
+        try:
+            _update_suggestion()
+        except Exception:  # a status hiccup must never stop the supervisor
+            log.exception("AI Director suggestion failed")
         _stop.wait(1.0)
+
+
+# --- Suggest mode ----------------------------------------------------------------------
+
+SUGGEST_LOG = "suggestions.csv"
+
+
+def _update_suggestion(now=None):
+    """Once a second: what is on air, and is another match camera clearly better?"""
+    global _suggestion
+    now = time.time() if now is None else now
+    stream = media_engine.get_stream_status()
+    on_air = stream.get("active_camera") or stream.get("selected_camera")
+    with _lock:
+        if on_air != _on_air["cam"]:
+            _on_air.update(cam=on_air, since=now)
+        if not _settings["suggest"] or not _settings["enabled"] or _state_age() >= STALE_S:
+            if _suggestion:
+                _log_finished(now, [_suggester._finish(now, "lead lost")])
+            _suggestion = None
+            return None
+        state = _read_state()
+        scores = {c: v["score"] for c, v in state.get("cams", {}).items()
+                  if v.get("online") and isinstance(v.get("score"), (int, float)) and c in match_cameras()}
+        # The operator is composing: replay, a reporting camera on air, or a PiP / split layout.
+        blocked = bool((stream.get("replay") or {}).get("active") or on_air in media_engine.REPORT_CAMERAS
+                       or (stream.get("layout") or {}).get("mode", "single") != "single")
+        _suggestion, finished = _suggester.update(now, scores, on_air, _on_air["since"], blocked)
+        _log_finished(now, finished)
+        return _suggestion
+
+
+def _log_finished(now, finished):
+    for done, outcome in finished:
+        _stats[outcome] = _stats.get(outcome, 0) + 1
+        try:
+            path = OUT / SUGGEST_LOG
+            new = not path.exists()
+            with path.open("a") as f:
+                if new:
+                    f.write("time,suggested,score,on_air,on_air_score,shown_s,outcome\n")
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(done['since']))},{done['cam']},"
+                        f"{done['score']},{done['on_air'] or ''},{done['on_air_score']},{done['shown_s']},{outcome}\n")
+        except OSError:
+            pass
+
+
+def suggestion():
+    """The current suggestion for the dashboard (None when off or nothing to suggest)."""
+    with _lock:
+        return dict(_suggestion) if _suggestion and _settings["suggest"] else None
+
+
+def ignore_suggestion():
+    """The operator dismissed it: that camera rests for a while."""
+    global _suggestion
+    with _lock:
+        done = _suggester.ignore(time.time())
+        _suggestion = None
+        if done:
+            _log_finished(time.time(), [done])
+    return done is not None
 
 
 def start():
@@ -324,6 +402,7 @@ def status():
         "cameras": match_cameras(), "cams": state.get("cams", {}) if fresh else {},
         "error": _last_error if enabled else "", "restarts": _restarts,
         "fences": dict(_fences), "mounts": _mounts(),
+        "suggest": _settings["suggest"], "suggestion": suggestion(), "suggest_stats": dict(_stats),
     }
 
 

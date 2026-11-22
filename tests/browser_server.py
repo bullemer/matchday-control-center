@@ -86,7 +86,8 @@ def fake_director_status():
     cam=lambda score, ball, near: {'online':True,'score':score,'raw':score,'image_t':1.0,'fence':False,
         'ball':{'seen':ball,'remembered':False,'conf':0.62 if ball else None,'part':0.8 if ball else 0.0},
         'action':{'part':0.75,'players':9,'near':near,'off_pitch':4 if fences.get('cam1') else 0},'quality':{'part':0.9,'sharp':0.95,'exposure':0.9,'frozen':False}}
-    return {'enabled':on,'fps':director['fps'],'fps_choices':[2,5,10],'phase':'running' if on else 'off','setup_problem':None,
+    return {'enabled':on,'fps':director['fps'],'fps_choices':[2,5,10],'suggest':director.get('suggest',False),
+            'suggestion':a.ai_director.suggestion(),'suggest_stats':{'accepted':2,'ignored':1,'timed out':0,'lead lost':3},'phase':'running' if on else 'off','setup_problem':None,
             'gpu':'Test GPU' if on else None,'busy':0.31 if on else None,'recommended':'cam1' if on else None,
             'cameras':['cam1','cam2','cam3','cam4'],'error':'','restarts':0,
             'cams':{'cam1':cam(78.4,True,3),'cam2':cam(41.0,False,1),'cam3':{'online':False}} if on else {},
@@ -98,12 +99,20 @@ def fake_set_fence(cam, points):
     if points: fences[cam]=points
     else: fences.pop(cam, None)
     return points
-def fake_director_configure(enabled=None, fps=None):
-    director_calls.append([enabled, fps])
+def fake_director_configure(enabled=None, fps=None, suggest=None):
+    director_calls.append([enabled, fps, suggest])
+    if suggest is not None: director['suggest']=suggest
     if enabled is not None: director['enabled']=enabled
     if fps is not None: director['fps']=fps
     return fake_director_status()
 a.ai_director.status=fake_director_status
+# Suggest mode: cam1 is suggested (75 vs nothing on air) until ignored.
+suggestion={'current':{'cam':'cam1','since':0,'score':75.0,'on_air':None,'on_air_score':0.0}}
+ignore_calls=[]
+a.ai_director.suggestion=lambda: dict(suggestion['current']) if suggestion['current'] and director.get('suggest') else None
+def fake_ignore():
+    ignore_calls.append(1); suggestion['current']=None; return True
+a.ai_director.ignore_suggestion=fake_ignore
 a.ai_director.configure=fake_director_configure
 a.ai_director.image_path=lambda cam: _jpg if cam=='cam1' else None
 a.ai_director.set_fence=fake_set_fence

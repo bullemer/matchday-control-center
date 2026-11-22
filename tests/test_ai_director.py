@@ -130,7 +130,12 @@ class ManagerTests(unittest.TestCase):
         self.patches = [patch.object(ad, 'SETTINGS', base / 'ai-director.json'), patch.object(ad, 'OUT', base / 'out')]
         for p in self.patches:
             p.start()
-        ad._settings.update(enabled=False, fps=5)
+        ad._settings.update(enabled=False, fps=5, suggest=False)
+        ad._suggester = ds.Suggester()
+        ad._suggestion = None
+        ad._on_air.update(cam=None, since=0.0)
+        for k in ad._stats:
+            ad._stats[k] = 0
 
     def tearDown(self):
         ad.stop()
@@ -151,7 +156,7 @@ class ManagerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ad.configure(enabled='yes')
         ad.configure(fps=10)
-        self.assertEqual(json.loads(ad.SETTINGS.read_text()), {'enabled': False, 'fps': 10})
+        self.assertEqual(json.loads(ad.SETTINGS.read_text()), {'enabled': False, 'fps': 10, 'suggest': False})
         ad._settings['fps'] = 5
         self.assertEqual(ad.load_settings()['fps'], 10)
 
@@ -197,6 +202,35 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(ad.status()['fences'], {'cam2': square})
             ad._fences.clear()
 
+    def test_suggestions_from_worker_scores_and_on_air_camera(self):
+        ad.OUT.mkdir(parents=True)
+        def state(c1, c3):
+            (ad.OUT / 'state.json').write_text(json.dumps({'updated': time.time(), 'phase': 'running', 'cams': {
+                'cam1': {'online': True, 'score': c1}, 'cam3': {'online': True, 'score': c3}, 'cam5': {'online': True, 'score': 99}}}))
+        stream = {'active_camera': 'cam1', 'replay': {'active': False}, 'layout': {'mode': 'single'}}
+        ad._settings.update(enabled=True, suggest=True)
+        with patch.object(ad.media_engine, 'get_stream_status', side_effect=lambda: stream):
+            state(40, 74)
+            for t in range(0, 12):
+                ad._update_suggestion(now=1000 + t)
+            sug = ad.suggestion()
+            self.assertEqual((sug['cam'], sug['on_air']), ('cam3', 'cam1'))   # cam5 (reporter) never suggested
+            stream['replay']['active'] = True                                 # replay: no suggestions
+            ad._update_suggestion(now=1013)
+            self.assertIsNone(ad.suggestion())
+            stream['replay']['active'] = False
+            for t in range(14, 30):
+                ad._update_suggestion(now=1000 + t)
+            self.assertEqual(ad.suggestion()['cam'], 'cam3')
+            self.assertTrue(ad.ignore_suggestion())
+            self.assertIsNone(ad.suggestion())
+            ad._settings['suggest'] = False
+            self.assertIsNone(ad._update_suggestion(now=1031))
+        self.assertEqual((ad._stats['ignored'], ad._stats['lead lost']), (1, 1))
+        log = (ad.OUT / 'suggestions.csv').read_text().splitlines()
+        self.assertEqual(log[0], 'time,suggested,score,on_air,on_air_score,shown_s,outcome')
+        self.assertTrue(log[-1].endswith(',ignored'))
+
     def test_snapshot_only_for_match_cameras(self):
         with self.assertRaises(ValueError):
             ad.snapshot('cam5')
@@ -222,3 +256,58 @@ class ManagerTests(unittest.TestCase):
             ad.stop()
         self.assertGreaterEqual(len(started), 2)
         self.assertIn('CUDA error', ad._last_error)
+
+
+class SuggesterTests(unittest.TestCase):
+    def run_for(self, s, start, seconds, scores, on_air, since, step=0.5, blocked=False):
+        out = (None, [])
+        events = []
+        t = start
+        while t <= start + seconds + 1e-9:
+            out = s.update(t, scores, on_air, since, blocked)
+            events += out[1]
+            t += step
+        return out[0], events
+
+    def test_suggests_after_lead_hold_and_accepts_on_cut(self):
+        s = ds.Suggester()
+        scores = {"cam1": 40, "cam3": 74}
+        cur, _ = self.run_for(s, 10, 1.5, scores, "cam1", since=0)
+        self.assertIsNone(cur)                                   # lead not held for 2 s yet
+        cur, _ = self.run_for(s, 12, 0.5, scores, "cam1", since=0)
+        self.assertEqual((cur["cam"], cur["score"], cur["on_air_score"]), ("cam3", 74, 40))
+        cur, events = s.update(13, scores, "cam3", 13)          # operator cut to cam3
+        self.assertIsNone(cur)
+        self.assertEqual(events[0][1], "accepted")
+
+    def test_no_suggestion_right_after_a_cut_small_lead_low_score_or_blocked(self):
+        self.assertIsNone(self.run_for(ds.Suggester(), 10, 5, {"cam1": 40, "cam3": 74}, "cam1", since=8)[0])  # on air 2-7 s
+        self.assertIsNone(self.run_for(ds.Suggester(), 10, 5, {"cam1": 60, "cam3": 66}, "cam1", since=0)[0])  # lead 6
+        self.assertIsNone(self.run_for(ds.Suggester(), 10, 5, {"cam1": 10, "cam3": 30}, "cam1", since=0)[0])  # below 35
+        self.assertIsNone(self.run_for(ds.Suggester(), 10, 5, {"cam1": 40, "cam3": 74}, "cam1", since=0, blocked=True)[0])
+        # nothing on air: the best camera is suggested without waiting
+        self.assertEqual(self.run_for(ds.Suggester(), 10, 3, {"cam2": 50}, None, since=0)[0]["cam"], "cam2")
+
+    def test_lost_lead_timeout_and_snooze(self):
+        s = ds.Suggester()
+        self.run_for(s, 10, 2.5, {"cam1": 40, "cam3": 74}, "cam1", since=0)
+        cur, events = s.update(13, {"cam1": 70, "cam3": 72}, "cam1", 0)
+        self.assertIsNone(cur)
+        self.assertEqual(events[0][1], "lead lost")
+        cur, events = self.run_for(s, 20, 20, {"cam1": 40, "cam3": 74}, "cam1", since=0)
+        self.assertIn("timed out", [e[1] for e in events])
+        self.assertIsNone(cur)                                   # resting after the timeout
+        self.assertGreater(s.snoozed["cam3"], 40)
+
+    def test_ignore_snoozes_that_camera(self):
+        s = ds.Suggester()
+        self.run_for(s, 10, 2.5, {"cam1": 40, "cam3": 74, "cam4": 60}, "cam1", since=0)
+        done, outcome = s.ignore(13)
+        self.assertEqual((done["cam"], outcome), ("cam3", "ignored"))
+        cur, _ = self.run_for(s, 13, 3, {"cam1": 40, "cam3": 74, "cam4": 60}, "cam1", since=0)
+        self.assertEqual(cur["cam"], "cam4")     # cam3 rests: the next camera that is clearly better
+        s.ignore(16.5)
+        cur, _ = self.run_for(s, 17, 5, {"cam1": 40, "cam3": 74, "cam4": 60}, "cam1", since=0)
+        self.assertIsNone(cur)                   # both rest
+        cur, _ = self.run_for(s, 44, 3, {"cam1": 40, "cam3": 74, "cam4": 60}, "cam1", since=0)
+        self.assertEqual(cur["cam"], "cam3")     # cam3 rested 30 s

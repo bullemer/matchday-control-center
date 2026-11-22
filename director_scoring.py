@@ -226,3 +226,75 @@ class Recommender:
         else:
             self.challenger = None
         return self.current
+
+
+@dataclass
+class Suggester:
+    """Suggest mode: proposes a cut when another match camera is clearly better than the one
+    on air. The operator decides (cut = accept, Ignore, or let it time out).
+
+    A suggestion needs: lead of LEAD points for LEAD_HOLD_S seconds, at least MIN_SCORE, the
+    camera on air for at least MIN_ON_AIR_S. It ends when accepted (that camera goes on air),
+    ignored, when the lead is gone, or after SHOW_MAX_S; ignored / timed-out cameras rest for
+    SNOOZE_S. update() returns the finished suggestions as (suggestion, outcome) pairs.
+    """
+    LEAD: float = 10.0
+    LEAD_HOLD_S: float = 2.0
+    MIN_SCORE: float = 35.0
+    MIN_ON_AIR_S: float = 8.0
+    SHOW_MAX_S: float = 15.0
+    SNOOZE_S: float = 30.0
+    current: dict | None = None
+    candidate: str | None = None
+    candidate_since: float = 0.0
+    snoozed: dict = field(default_factory=dict)
+
+    def update(self, now, scores, on_air, on_air_since, blocked=False):
+        finished = []
+        on_air_score = scores.get(on_air, 0.0) if on_air else 0.0
+        cur = self.current
+        if cur:
+            cam = cur["cam"]
+            if on_air == cam:
+                finished.append(self._finish(now, "accepted"))
+            elif blocked or cam not in scores or scores[cam] < on_air_score + self.LEAD / 2:
+                finished.append(self._finish(now, "lead lost"))
+            elif now - cur["since"] >= self.SHOW_MAX_S:
+                finished.append(self._finish(now, "timed out"))
+                self.snoozed[cam] = now + self.SNOOZE_S
+            else:
+                cur.update(score=round(scores[cam], 1), on_air=on_air, on_air_score=round(on_air_score, 1))
+            if self.current:
+                return self.current, finished
+        if blocked or not scores:
+            self.candidate = None
+            return None, finished
+        # The best camera that is not on air and not resting.
+        options = {c: v for c, v in scores.items() if c != on_air and self.snoozed.get(c, 0) <= now}
+        best = max(options, key=options.get) if options else None
+        ok = (best is not None and scores[best] >= self.MIN_SCORE and scores[best] >= on_air_score + self.LEAD
+              and (on_air is None or now - on_air_since >= self.MIN_ON_AIR_S))
+        if not ok:
+            self.candidate = None
+            return None, finished
+        if self.candidate != best:
+            self.candidate, self.candidate_since = best, now
+        if now - self.candidate_since >= self.LEAD_HOLD_S:
+            self.current = {"cam": best, "since": now, "score": round(scores[best], 1),
+                            "on_air": on_air, "on_air_score": round(on_air_score, 1)}
+            self.candidate = None
+        return self.current, finished
+
+    def ignore(self, now):
+        """The operator dismissed the suggestion: that camera rests for SNOOZE_S."""
+        if not self.current:
+            return None
+        cam = self.current["cam"]
+        done = self._finish(now, "ignored")
+        self.snoozed[cam] = now + self.SNOOZE_S
+        return done
+
+    def _finish(self, now, outcome):
+        done = dict(self.current, shown_s=round(now - self.current["since"], 1))
+        self.current = None
+        return done, outcome

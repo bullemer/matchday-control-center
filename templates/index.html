@@ -160,6 +160,12 @@
     .webrtc-frame.f-fallback { border-color: #b91c1c !important; }
     .webrtc-frame.f-pip { border-color: #3b82f6 !important; }
     .webrtc-frame.f-ready { border-color: #22c55e !important; }
+    /* AI Director suggestion: cyan, gently pulsing (on the tile and the match-mode cut button) */
+    @keyframes ai-pulse { 0%, 100% { box-shadow: 0 0 0 2px #22d3ee; } 50% { box-shadow: 0 0 0 5px rgb(34 211 238 / .45); } }
+    .webrtc-frame.f-suggest { border-color: #22d3ee !important; animation: ai-pulse 1.4s ease-in-out infinite; }
+    .match-cut.ai-suggest { animation: ai-pulse 1.4s ease-in-out infinite; }
+    .ai-chip { position: absolute; top: .35rem; right: .35rem; z-index: 3; padding: .1rem .4rem; border-radius: .3rem;
+      background: #0e7490; color: #ecfeff; font-size: .7rem; font-weight: 700; pointer-events: none; }
     .cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; }
     @media (max-width: 640px) { .cut-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .match-cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; }
@@ -708,6 +714,13 @@
           </div>
         </div>
       </div>
+      <div id="ai-suggest-bar" class="hidden items-center gap-3 flex-wrap bg-cyan-950/60 border border-cyan-700 rounded-lg px-3 py-2 mb-3 text-sm" role="status">
+        <span class="text-cyan-100">🤖 AI suggests <b id="ai-suggest-cam"></b> <span id="ai-suggest-why" class="text-cyan-300 text-xs"></span></span>
+        <span class="flex gap-2 ml-auto">
+          <button type="button" id="ai-suggest-accept" onclick="acceptSuggestion()" class="px-3 py-1.5 rounded-lg bg-cyan-600 hover:bg-cyan-500 text-white font-semibold">▶ Cut</button>
+          <button type="button" onclick="ignoreSuggestion()" class="px-3 py-1.5 rounded-lg bg-slate-700 hover:bg-slate-600 text-slate-200">✕ Ignore</button>
+        </span>
+      </div>
       <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 mb-4">
         {% for cam in cameras %}
         <div>
@@ -721,6 +734,7 @@
             <button type="button" id="btn-cut-{{ cam.id }}" data-cut="{{ cam.id }}" data-tile onclick="switchCam('{{ cam.id }}')"
                     aria-label="Put {{ cam.label }} on air (key {{ cam.key }})" title="Click: {{ cam.label }} on air (key {{ cam.key }})"
                     data-base="tile-cut"><span data-cut-state>—</span></button>
+            <span data-ai-chip="{{ cam.id }}" class="ai-chip" hidden>⭐ AI</span>
           </div>
           <div data-phone-box="{{ cam.id }}" data-compact class="phone-status hidden items-center justify-between gap-1 text-xs mt-1">
             <span data-phone-info class="truncate text-slate-400"></span>
@@ -1194,6 +1208,9 @@
           <label class="flex items-center gap-2 text-slate-300" title="Frames analysed per second and camera">
             Rate <select id="director-fps" onchange="setDirector({fps: parseInt(this.value, 10)})" class="dest-input text-xs py-1"></select>
           </label>
+          <label class="flex items-center gap-2 text-slate-200 font-semibold" title="Propose cuts when another match camera is clearly better (you decide)">
+            <input type="checkbox" role="switch" id="director-suggest" class="overlay-switch" onchange="setDirector({suggest: this.checked})"> 💡 Suggest cuts
+          </label>
           <label class="flex items-center gap-2 text-slate-200 font-semibold">
             <input type="checkbox" role="switch" id="director-enabled" class="overlay-switch" onchange="setDirector({enabled: this.checked})"> Enabled
           </label>
@@ -1202,7 +1219,10 @@
       <p class="text-xs text-slate-400 mb-3">Watches the match cameras (Cam 1–4) and rates each picture 0–100: ball visible and well framed,
         players around the play, sharp and well exposed. <b>Display only</b> — it does not cut yet. Players are found with YOLO26s,
         the ball with box2boxcam (finds fewer than half of small, far balls: the players count more).</p>
-      <p id="director-status" class="text-sm text-slate-300 mb-4" role="status">—</p>
+      <p id="director-status" class="text-sm text-slate-300 mb-1" role="status">—</p>
+      <p id="director-suggest-info" class="text-xs text-slate-400 mb-4">💡 Suggest cuts: when a match camera is clearly better (10 points ahead for 2 s, at least 35,
+        current camera on air for 8 s) it glows cyan on the Main tab and in match mode — click it to cut, or ignore it. Never during replays,
+        with a reporting camera on air or in PiP / split layouts.</p>
       <div id="director-grid" class="grid gap-3 sm:grid-cols-2">
         {% for cam in cameras if cam.role == 'match' %}
         <div class="bg-slate-900 rounded-lg border-2 border-slate-700 p-3" data-director-card="{{ cam.id }}">
@@ -1899,6 +1919,17 @@
       lastDirector = d;
       const toggle = document.getElementById('director-enabled');
       if (document.activeElement !== toggle) toggle.checked = d.enabled;
+      const suggest = document.getElementById('director-suggest');
+      if (document.activeElement !== suggest) suggest.checked = d.suggest;
+      suggest.disabled = !d.enabled;
+      const st = d.suggest_stats || {};
+      const total = Object.values(st).reduce((a, b) => a + b, 0);
+      if (d.suggest && d.enabled) {
+        document.getElementById('director-suggest-info').textContent = (d.suggestion
+          ? `💡 Now: ${camLabel(d.suggestion.cam)} (${Math.round(d.suggestion.score)} vs ${Math.round(d.suggestion.on_air_score)}). `
+          : '💡 No suggestion right now. ') + `Since start: ${total} suggested · ${st.accepted || 0} taken · ${st.ignored || 0} ignored · `
+          + `${st['timed out'] || 0} timed out · ${st['lead lost'] || 0} no longer better (log: data/ai-director/suggestions.csv)`;
+      }
       const fps = document.getElementById('director-fps');
       if (!fps.options.length) fps.innerHTML = d.fps_choices.map(v => `<option value="${v}">${v} / s</option>`).join('');
       if (document.activeElement !== fps) fps.value = String(d.fps);
@@ -1948,6 +1979,36 @@
           img.hidden = false; card.querySelector('[data-director-noimage]').hidden = true;
         }
       }
+    }
+
+    // ──────────────── AI Director suggestion (Main tab + match mode) ────────────────
+    function renderSuggestion() {
+      const sug = state.suggestion;
+      const cam = sug ? sug.cam : null;
+      const bar = document.getElementById('ai-suggest-bar');
+      bar.classList.toggle('hidden', !cam);
+      bar.classList.toggle('flex', !!cam);
+      if (cam) {
+        document.getElementById('ai-suggest-cam').textContent = camLabel(cam);
+        document.getElementById('ai-suggest-why').textContent = sug.on_air
+          ? `(${Math.round(sug.score)} vs ${Math.round(sug.on_air_score)} for ${camLabel(sug.on_air)} on air)` : `(${Math.round(sug.score)})`;
+        document.getElementById('ai-suggest-accept').textContent = `▶ Cut to ${camLabel(cam)}`;
+      }
+      CAMERA_IDS.forEach(c => {
+        const frame = document.getElementById('frame-' + c);
+        if (frame) frame.classList.toggle('f-suggest', c === cam);
+        const chip = document.querySelector(`[data-ai-chip="${c}"]`);
+        if (chip) { chip.hidden = c !== cam; if (c === cam) chip.textContent = `⭐ AI ${Math.round(sug.score)}`; }
+        document.querySelectorAll(`#match-panel [data-cut="${c}"]`).forEach(btn => btn.classList.toggle('ai-suggest', c === cam));
+      });
+    }
+    function acceptSuggestion() {
+      if (state.suggestion) switchCam(state.suggestion.cam);
+    }
+    async function ignoreSuggestion() {
+      state.suggestion = null;
+      renderSuggestion();
+      await apiRequest('/api/director/suggestion/ignore', {});
     }
 
     async function setDirector(body) {
@@ -2041,6 +2102,7 @@
       if (event.target.closest('input, select, textarea')) return;
       const keyed = CAMERAS.find(c => c.key === event.key);
       if (keyed) switchCam(keyed.id);
+      if ((event.key === 'a' || event.key === 'A') && state.suggestion) acceptSuggestion();
       if (event.key === '0') cutToReplay();
       if ((event.key === 'h' || event.key === 'H') && state.recording && state.recording.active) markHighlight();
       if ((event.key === 'r' || event.key === 'R') && state.replay.available) playReplay(1);
@@ -2149,7 +2211,7 @@
           ['air', 'switching', 'back', 'fallback', 'pip', 'ready'].forEach(k => frame.classList.toggle('f-' + k, k === kind));
           return;
         }
-        btn.className = btn.dataset.base + ' ' + look;
+        btn.className = btn.dataset.base + ' ' + look + (state.suggestion && state.suggestion.cam === cam ? ' ai-suggest' : '');
       });
       document.querySelectorAll('[data-cut-replay]').forEach(btn => {
         const r = state.replay || {};
@@ -3670,6 +3732,8 @@
       if (data.camera_list) renderCameraNames(data.camera_list);
       renderCameraInputs(data.camera_inputs || {});
       renderCameraReports(data.camera_reports || {});
+      state.suggestion = data.director_suggestion || null;
+      renderSuggestion();
       CAMERA_IDS.forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);

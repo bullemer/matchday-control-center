@@ -1059,3 +1059,47 @@ test('Main tab: clicking a preview tile cuts; frame and label show the state; no
   await page.locator('section[data-tab="main"]').first().screenshot({path:'/tmp/mcc-main-tiles.png'});
   expect(errors).toEqual([]);
 });
+
+test('AI Director suggest mode: switch, bar and glowing tile on Main, pulsing cut button in match mode, ignore', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await expect(page.locator('#ai-suggest-bar')).toBeHidden();          // suggest mode off
+  await page.locator('[data-tab-btn="director"]').click();
+  await page.locator('#director-enabled').check();
+  await expect(page.locator('#director-suggest')).toBeEnabled();
+  const on = page.waitForRequest(r => r.url().endsWith('/api/director') && r.method() === 'POST' && r.postDataJSON().suggest === true);
+  await page.locator('#director-suggest').check();
+  await on;
+  await expect(page.locator('#director-suggest-info')).toContainText('Now: Cam 1 (75 vs 0). Since start: 6 suggested · 2 taken · 1 ignored');
+  // Main tab: bar + glowing tile with chip; the bar's button cuts.
+  await page.locator('[data-tab-btn="main"]').click();
+  await expect(page.locator('#ai-suggest-bar')).toBeVisible();
+  await expect(page.locator('#ai-suggest-cam')).toHaveText('Cam 1');
+  await expect(page.locator('#frame-cam1')).toHaveClass(/f-suggest/);
+  await expect(page.locator('[data-ai-chip="cam1"]')).toHaveText('⭐ AI 75');
+  await expect(page.locator('[data-ai-chip="cam2"]')).toBeHidden();
+  const cut = page.waitForRequest('**/api/switch/cam1');
+  await page.locator('#ai-suggest-accept').click();
+  await cut;
+  // Match mode: the suggested camera's button pulses; key A accepts.
+  await page.locator('#mode-toggle').click();
+  await expect(page.locator('#match-panel [data-cut="cam1"]')).toHaveClass(/ai-suggest/);
+  await expect(page.locator('#match-panel [data-cut="cam2"]')).not.toHaveClass(/ai-suggest/);
+  const key = page.waitForRequest('**/api/switch/cam1');
+  await page.keyboard.press('a');
+  await key;
+  await page.locator('#mode-toggle').click();
+  // Ignore: gone everywhere.
+  const ignored = page.waitForRequest('**/api/director/suggestion/ignore');
+  await page.locator('#ai-suggest-bar').getByRole('button', {name: /Ignore/}).click();
+  await ignored;
+  await expect(page.locator('#ai-suggest-bar')).toBeHidden();
+  await expect(page.locator('#frame-cam1')).not.toHaveClass(/f-suggest/);
+  await expect(page.locator('[data-ai-chip="cam1"]')).toBeHidden();
+  await page.locator('[data-tab-btn="director"]').click();
+  await page.locator('#director-suggest').uncheck();
+  await page.locator('#director-enabled').uncheck();
+  expect(errors).toEqual([]);
+});

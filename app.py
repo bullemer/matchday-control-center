@@ -435,8 +435,15 @@ def api_director_status():
 def api_director_configure():
     """{"enabled": true/false, "fps": 2|5|10}"""
     data = request.get_json()
-    result = ai_director.configure(enabled=data.get("enabled"), fps=data.get("fps"))
+    result = ai_director.configure(enabled=data.get("enabled"), fps=data.get("fps"), suggest=data.get("suggest"))
     return jsonify(ok=True, **result)
+
+
+@app.route("/api/director/suggestion/ignore", methods=["POST"])
+@api_endpoint
+def api_director_ignore():
+    """Dismiss the AI Director's current cut suggestion (that camera rests for a while)."""
+    return jsonify(ok=True, ignored=ai_director.ignore_suggestion())
 
 
 @app.route("/api/director/fence/<cam_id>", methods=["POST"])
@@ -548,6 +555,7 @@ def api_status():
         "camera_list": get_cameras(),
         "camera_inputs": get_camera_inputs(),
         "camera_reports": camera_control.get_reports(),
+        "director_suggestion": ai_director.suggestion(),
         "mediamtx": mediamtx,
         "stream": stream,
         "scoreboard": scoreboard,
