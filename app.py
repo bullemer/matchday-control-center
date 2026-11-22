@@ -303,7 +303,7 @@ def api_camera_report(cam_id):
         return jsonify(ok=False, error="Camera password required"), 401
     if request.content_length and request.content_length > 4096:
         return jsonify(ok=False, error="Report too large"), 413
-    answer = camera_control.record_report(cam_id, request.get_json(silent=True))
+    answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id))
     return jsonify(ok=True, **answer)
 
 
@@ -319,12 +319,8 @@ def api_camera_zoom(cam_id):
     return jsonify(ok=True, zoom=target)
 
 
-@app.route("/api/tally/<cam_id>")
-@api_endpoint
-def api_tally_status(cam_id):
-    """Lightweight tally status for camera operators (no basic auth required)."""
-    if cam_id not in CAMERA_IDS:
-        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+def _tally(cam_id):
+    """Tally of one camera: what its operator needs to know (tally page and phone app)."""
     cameras = get_camera_status()
     stream = get_stream_status()
     publishing = bool(cameras.get(cam_id))
@@ -342,8 +338,7 @@ def api_tally_status(cam_id):
     returning = bool(replay and publishing and going_out and stream.get("replay", {}).get("camera") == cam_id)
     selected = in_program and not going_out
     secondary = bool(publishing and secondary_cam == cam_id and going_out)
-    return jsonify({
-        "ok": True,
+    return {
         "cam_id": cam_id,
         "name": next(c["label"] for c in get_cameras() if c["id"] == cam_id),
         "role": "report" if cam_id in REPORT_CAMERAS else "match",
@@ -356,7 +351,25 @@ def api_tally_status(cam_id):
         "replay": replay,
         "returning": returning,
         "replay_hold": bool(replay and stream.get("replay", {}).get("hold")),
-    })
+    }
+
+
+def tally_state(cam_id):
+    """One word for the phone app: live | returning | secondary | selected | "" (not in the picture)."""
+    t = _tally(cam_id)
+    for key, word in (("on_air", "live"), ("returning", "returning"), ("secondary", "secondary"), ("selected", "selected")):
+        if t[key]:
+            return word
+    return ""
+
+
+@app.route("/api/tally/<cam_id>")
+@api_endpoint
+def api_tally_status(cam_id):
+    """Lightweight tally status for camera operators (no basic auth required)."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    return jsonify(ok=True, **_tally(cam_id))
 
 
 # --- Combined status (polled by UI every ~2 s) ------------------------

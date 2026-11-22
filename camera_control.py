@@ -3,8 +3,8 @@
 While it streams over SRT the app POSTs a status report to /api/camera-report/<cam>:
 battery, charging, temperature, Android thermal status and its zoom (current, min, max).
 Long poll: the request is held for up to HOLD_S seconds and answered at once when the
-operator asks for a zoom, so a phone sends about one request every 30 s, yet zoom reacts
-immediately. The answer carries the requested zoom with a sequence number (the phone
+operator asks for a zoom or the camera's tally changes (on air, PiP, ...), so a phone sends
+about one request every 30 s, yet zoom and tally react immediately. The answer carries the requested zoom with a sequence number (the phone
 applies each request once; a pinch on the phone is not undone). Nothing is pushed to the
 phone: it needs no server and works behind any router.
 """
@@ -79,12 +79,17 @@ def warnings(report):
     return notes
 
 
-def record_report(cam, data, hold=None):
+TALLY_CHECK_S = 0.5      # how often a waiting request looks at the tally
+
+
+def record_report(cam, data, hold=None, tally=None):
     """Store a phone's report; returns the answer for the phone. If the phone says which
-    zoom request it already has (zoom_seq) and wants to wait, the answer comes as soon as
-    there is a newer one, or after hold seconds."""
+    zoom request (zoom_seq) and tally it already has and wants to wait, the answer comes as
+    soon as either changes, or after hold seconds. tally: callable returning the camera's
+    tally word (checked every TALLY_CHECK_S; it reads in-memory state only)."""
     report = clean_report(data)
     known = data.get("zoom_seq")
+    known_tally = data.get("tally") if isinstance(data.get("tally"), str) else None
     wait = HOLD_S if hold is None else hold
     if data.get("wait") is not True or type(known) is not int:
         wait = 0
@@ -96,9 +101,23 @@ def record_report(cam, data, hold=None):
             request = _zoom_requests.get(cam)
             seq = request["seq"] if request else _SEQ_BASE
             left = deadline - time.monotonic()
-            if seq != known or left <= 0:
-                return {"zoom": request["zoom"] if request else None, "zoom_seq": seq}
-            _changed.wait(left)
+            now_tally = _safe_tally(tally)
+            tally_changed = known_tally is not None and now_tally is not None and now_tally != known_tally
+            if seq != known or tally_changed or left <= 0:
+                answer = {"zoom": request["zoom"] if request else None, "zoom_seq": seq}
+                if now_tally is not None:
+                    answer["tally"] = now_tally
+                return answer
+            _changed.wait(min(left, TALLY_CHECK_S) if tally else left)
+
+
+def _safe_tally(tally):
+    if tally is None:
+        return None
+    try:
+        return tally()
+    except Exception:  # a status hiccup must not break the phone's request
+        return None
 
 
 def get_reports():

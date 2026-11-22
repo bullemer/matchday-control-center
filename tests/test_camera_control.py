@@ -77,6 +77,39 @@ class CameraControlTests(unittest.TestCase):
         self.assertEqual(cc.record_report('cam3', dict(REPORT, wait=True, zoom_seq=b + 1), hold=0.1)['zoom_seq'], b + 1)
 
 
+class TallyLongPollTests(unittest.TestCase):
+    def setUp(self):
+        cc.reset()
+
+    def test_tally_is_answered_and_wakes_a_waiting_phone(self):
+        tally = {'word': ''}
+        b = cc._SEQ_BASE
+        self.assertEqual(cc.record_report('cam3', dict(REPORT), tally=lambda: tally['word'])['tally'], '')
+        result = {}
+        thread = threading.Thread(target=lambda: result.update(
+            cc.record_report('cam3', dict(REPORT, wait=True, zoom_seq=b, tally=''), hold=5, tally=lambda: tally['word'])))
+        thread.start(); time.sleep(0.2)
+        t0 = time.monotonic()
+        tally['word'] = 'live'  # operator cut to this camera
+        thread.join(3)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(result, {'zoom': None, 'zoom_seq': b, 'tally': 'live'})
+        # same tally as the phone has: waits for the timeout
+        t1 = time.monotonic()
+        cc.record_report('cam3', dict(REPORT, wait=True, zoom_seq=b, tally='live'), hold=0.6, tally=lambda: 'live')
+        self.assertGreaterEqual(time.monotonic() - t1, 0.55)
+
+    def test_phone_without_tally_and_broken_tally_do_not_wake(self):
+        b = cc._SEQ_BASE
+        t0 = time.monotonic()
+        answer = cc.record_report('cam3', dict(REPORT, wait=True, zoom_seq=b), hold=0.6, tally=lambda: 'live')
+        self.assertGreaterEqual(time.monotonic() - t0, 0.55)  # older app sends no tally: only zoom wakes it
+        self.assertEqual(answer['tally'], 'live')
+        def broken():
+            raise RuntimeError('status hiccup')
+        self.assertNotIn('tally', cc.record_report('cam3', dict(REPORT), tally=broken))
+
+
 class CameraReportApiTests(unittest.TestCase):
     def setUp(self):
         import app as a
@@ -100,6 +133,7 @@ class CameraReportApiTests(unittest.TestCase):
         self.assertEqual((r.status_code, r.get_json()['zoom']), (200, 0.75))
         status = self.client.get('/api/status', headers=auth).get_json()
         self.assertEqual(status['camera_reports']['cam3']['zoom_target'], 0.75)
+        self.assertEqual(self.client.post('/api/camera-report/cam3', json=dict(REPORT)).get_json()['tally'], '')
 
     def test_camera_password_is_required_when_set(self):
         with patch.object(self.a, 'camera_password', return_value='secret'):
