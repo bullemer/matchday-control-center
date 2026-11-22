@@ -530,9 +530,18 @@
          2. NETWORK CONTROLS PANEL
          ───────────────────────────────────────────────────────────────── -->
     <section data-setup data-tab="network" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700">
-      <h2 class="text-lg font-semibold text-white mb-4 flex items-center gap-2">
-        🌐 Network Controls
-      </h2>
+      <div class="flex flex-wrap items-center justify-between gap-3 mb-4">
+        <h2 class="text-lg font-semibold text-white flex items-center gap-2">🌐 Network Controls</h2>
+        <div class="flex items-center gap-2 text-sm" role="radiogroup" aria-label="Camera network">
+          <span class="text-slate-400">Camera network</span>
+          <button type="button" role="radio" data-net-mode="auto" onclick="setNetworkMode('auto')"
+                  class="px-3 py-1.5 rounded-lg bg-slate-700 text-slate-200 text-xs font-semibold"
+                  title="Laptop hotspot, or the Wi-Fi the laptop is on">Automatic</button>
+          <button type="button" role="radio" data-net-mode="router" onclick="setNetworkMode('router')"
+                  class="px-3 py-1.5 rounded-lg bg-slate-700 text-slate-200 text-xs font-semibold"
+                  title="Your own field router: laptop by cable, phones and Pi on its Wi-Fi">📶 Own router</button>
+        </div>
+      </div>
       <!-- Where camera phones connect: the app's hotspot, or the Wi-Fi/LAN the laptop is on -->
       <div id="camera-network" class="mb-4 rounded-lg p-3 border border-slate-700 bg-slate-900 flex flex-wrap items-center justify-between gap-3">
         <div>
@@ -543,6 +552,34 @@
                 class="px-3 py-1.5 rounded-lg text-xs font-bold bg-brand-cyan text-slate-950 hover:bg-cyan-300 transition-colors flex items-center gap-1.5 shadow">
           📱 Onboard Cameras (QR &amp; Tally)
         </button>
+      </div>
+      <!-- Own field router: laptop by cable, cameras on its Wi-Fi -->
+      <div id="router-card" class="hidden mb-4 rounded-lg p-4 border border-slate-700 bg-slate-900">
+        <div class="flex flex-wrap items-center justify-between gap-2 mb-3">
+          <span class="text-sm font-semibold text-white">📶 Field router</span>
+          <span id="router-link" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">—</span>
+        </div>
+        <dl class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
+          <div><dt class="text-slate-400">Camera address (laptop)</dt><dd id="router-ip" class="text-white font-mono text-sm">—</dd></div>
+          <div><dt class="text-slate-400">Router</dt><dd id="router-gateway" class="text-white font-mono text-sm">—</dd></div>
+          <div><dt class="text-slate-400">Laptop address from</dt><dd id="router-method" class="text-white text-sm">—</dd></div>
+          <div><dt class="text-slate-400">Internet</dt><dd id="router-internet" class="text-white text-sm">—</dd></div>
+        </dl>
+        <div class="flex flex-wrap items-center gap-2 mb-3 text-xs" role="radiogroup" aria-label="Internet for the broadcast">
+          <span class="text-slate-400">Internet for the broadcast:</span>
+          <button type="button" role="radio" data-router-internet="router" onclick="setRouterInternet('router')"
+                  class="px-3 py-1.5 rounded-lg bg-slate-700 text-slate-200 font-semibold"
+                  title="The router has its own internet (SIM / DSL)">🌐 Through the router</button>
+          <button type="button" role="radio" data-router-internet="phone" onclick="setRouterInternet('phone')"
+                  class="px-3 py-1.5 rounded-lg bg-slate-700 text-slate-200 font-semibold"
+                  title="A phone on USB carries the stream; the router only connects the cameras">📱 Through the USB phone</button>
+        </div>
+        <ul id="router-advice" class="space-y-1 text-xs"></ul>
+        <div class="flex flex-wrap items-center gap-2 mt-3">
+          <button type="button" id="router-confirm-ip" onclick="confirmRouterIp()"
+                  class="hidden px-3 py-1.5 rounded-lg bg-brand-amber text-slate-950 text-xs font-bold">✓ Phones and Pi use the new address</button>
+          <span id="router-pi" class="text-xs text-slate-400"></span>
+        </div>
       </div>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4">
         <!-- USB Connect -->
@@ -3869,6 +3906,64 @@
       banner.dataset.level = level;
     }
 
+    // ──────────────────────── Own field router ────────────────────────
+    async function setNetworkMode(mode) {
+      const {ok, data} = await apiRequest('/api/network/mode', {mode});
+      if (!ok) return showToast('❌ ' + (data.error || 'Could not change the camera network'), 'error');
+      showToast(mode === 'router' ? '📶 Own router: cameras connect through the field router' : 'Camera network: automatic', 'success');
+      if (data.network) { state.network = data.network; renderCameraNetwork(data.network); renderRouter(data.network); }
+    }
+    async function setRouterInternet(via) {
+      const net = state.network || {};
+      if (via === 'phone' && net.usb_state !== 'connected'
+          && !confirm('No phone is connected by USB. Without it the laptop has no internet. Switch anyway?')) return;
+      const {ok, data} = await apiRequest('/api/network/router-internet', {via});
+      showToast((ok ? '✅ ' : '❌ ') + (data.message || data.error || 'Failed'), ok ? 'success' : 'error');
+    }
+    async function confirmRouterIp() {
+      const {ok, data} = await apiRequest('/api/network/router-confirm-ip', {});
+      showToast((ok ? '✅ ' : '❌ ') + (data.message || data.error || 'Failed'), ok ? 'success' : 'error');
+    }
+    function renderRouter(network) {
+      const mode = network.network_mode || 'auto';
+      document.querySelectorAll('[data-net-mode]').forEach(b => {
+        const on = b.dataset.netMode === mode;
+        b.setAttribute('aria-checked', on);
+        b.className = 'px-3 py-1.5 rounded-lg text-xs font-semibold ' + (on ? 'bg-brand-cyan text-slate-950' : 'bg-slate-700 text-slate-200');
+      });
+      const card = document.getElementById('router-card');
+      card.classList.toggle('hidden', mode !== 'router');
+      if (mode !== 'router') return;
+      const r = network.router || {};
+      const link = document.getElementById('router-link');
+      link.textContent = !r.connected ? '⚠ not connected' : r.type === 'ethernet' ? `🔌 cable · ${r.iface}` : `📶 Wi-Fi “${r.name}”`;
+      link.className = 'text-xs px-2 py-0.5 rounded ' + (!r.connected ? 'bg-red-900/60 text-red-100'
+        : r.type === 'ethernet' ? 'bg-green-900/50 text-brand-green' : 'bg-brand-amber/20 text-brand-amber');
+      document.getElementById('router-ip').textContent = r.ip ? `${r.ip}${r.prefix ? '/' + r.prefix : ''}` : '—';
+      document.getElementById('router-gateway').textContent = r.gateway || '—';
+      document.getElementById('router-method').textContent = !r.method ? '—'
+        : r.method === 'manual' ? '📌 fixed address' : `router (DHCP)${r.mac ? ' · MAC ' + r.mac : ''}`;
+      const internet = r.internet === 'router' ? '🌐 through the router' : r.internet === 'phone' ? '📱 through the USB phone'
+        : r.internet ? `via ${r.internet}` : '—';
+      document.getElementById('router-internet').textContent = internet + (network.internet_ok ? ' ✓' : ' · ⚠ no internet');
+      const via = r.never_default ? 'phone' : 'router';
+      document.querySelectorAll('[data-router-internet]').forEach(b => {
+        const on = r.connected && b.dataset.routerInternet === via;
+        b.setAttribute('aria-checked', on);
+        b.disabled = !r.connected;
+        b.className = 'px-3 py-1.5 rounded-lg font-semibold ' + (on ? 'bg-brand-cyan text-slate-950' : 'bg-slate-700 text-slate-200')
+          + (b.disabled ? ' opacity-50' : '');
+      });
+      const tone = {error: 'text-red-300', warning: 'text-brand-amber', info: 'text-slate-400'};
+      const icon = {error: '⛔', warning: '⚠', info: '💡'};
+      document.getElementById('router-advice').innerHTML = (network.router_advice || []).map(a =>
+        `<li class="${tone[a.level] || 'text-slate-300'}">${icon[a.level] || "•"} ${escHtml(a.text)}</li>`).join('')
+        || '<li class="text-brand-green">✓ Router link, address and internet look good</li>';
+      const changed = r.ip && network.router_known_ip && r.ip !== network.router_known_ip;
+      document.getElementById('router-confirm-ip').classList.toggle('hidden', !changed);
+      document.getElementById('router-pi').textContent = r.ip ? `Raspberry Pi cameras: server address ${r.ip}` : '';
+    }
+
     // ──────────────────────── Camera network ────────────────────────
     function renderCameraNetwork(network) {
       const box = document.getElementById('camera-network');
@@ -3878,7 +3973,25 @@
       const hotspotNote = document.getElementById('hotspot-note');
       let tone = 'border-green-800 bg-green-950/40';
       hotspotNote.classList.add('hidden');
-      if (network.camera_mode === 'hotspot') {
+      if (network.network_mode === 'router') {
+        const r = network.router || {};
+        if (network.camera_mode === 'router') {
+          title.textContent = `📶 Cameras join the field router's Wi-Fi — server ${network.camera_ip}`;
+          hint.textContent = r.type === 'ethernet' ? `The laptop is on the router by cable (${r.iface}).`
+            : `The laptop is on the router's Wi-Fi “${r.name}” (a cable is steadier).`;
+          linksNote.textContent = 'Phones must join the router Wi-Fi';
+          if ((network.router_advice || []).some(a => a.level === 'error')) tone = 'border-amber-700 bg-amber-950/40';
+        } else {
+          tone = 'border-red-800 bg-red-950/40';
+          title.textContent = '⚠ Own router selected, but the laptop is not connected to it';
+          hint.textContent = 'Plug a cable from a LAN port of the router into the laptop.';
+          linksNote.textContent = '';
+        }
+        if (network.hotspot_active) {
+          hotspotNote.textContent = 'Router mode: the hotspot is not needed. Stop it so phones join the router.';
+          hotspotNote.classList.remove('hidden');
+        }
+      } else if (network.camera_mode === 'hotspot') {
         const name = network.hotspot_ssid || 'hotspot';
         title.textContent = `📡 Cameras join the hotspot “${name}” — server ${network.camera_ip}`;
         hint.textContent = network.usb_iface ? 'Internet comes from the USB-tethered phone.'
@@ -3941,6 +4054,7 @@
       if (network.camera_ip) cameraHost = network.camera_ip;
       for (const cam of CAMERA_IDS) document.getElementById('url-' + cam).textContent = cameraUrl(cam);
       renderCameraNetwork(network);
+      renderRouter(network);
 
       // --- USB Internet ---
       const usbDot = document.getElementById('status-usb-dot');

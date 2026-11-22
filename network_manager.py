@@ -90,17 +90,24 @@ def _internet_available():
     return False
 
 
-def get_network_status(check_internet=True):
+NETWORK_MODES = ("auto", "router")
+
+
+def get_network_status(check_internet=True, mode="auto"):
     """Report the internet uplink and the network camera phones should join.
 
-    Cameras use the app's hotspot when it is active; otherwise they join the same
-    Wi-Fi/LAN the laptop is connected to (a USB tether is never a camera network).
+    mode "auto": cameras use the app's hotspot when it is active, otherwise the Wi-Fi/LAN
+    the laptop is on (a USB tether is never a camera network).
+    mode "router": the operator's own field router. The laptop is on its LAN, ideally by
+    cable; phones (and the Pi) join the router's Wi-Fi. The camera address is the laptop's
+    address on that link even when Wi-Fi or a USB tether also carry internet.
     Pass check_internet=False to avoid blocking when inspecting local interfaces."""
     global _last_internet_status, _last_internet_check_ts
     info = dict(wifi_ip="N/A", usb_iface=None, usb_status="Disconnected", usb_state=None,
                 hotspot_active=False, hotspot_ssid=None, hotspot_iface=None, internet_ok=False,
                 lan_iface=None, lan_type=None, lan_name=None, lan_ip=None,
-                camera_mode="none", camera_ip=None, uplink=None)
+                camera_mode="none", camera_ip=None, uplink=None, uplink_iface=None,
+                network_mode=mode, router=None)
     ok, raw = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
     candidates, lans = [], []
     if ok:
@@ -137,7 +144,17 @@ def get_network_status(check_internet=True):
         if ip:
             info.update(lan_iface=dev, lan_type=kind, lan_name=connection, lan_ip=ip)
             break
-    if info["hotspot_active"] and info["wifi_ip"] != "N/A":
+    if mode == "router":
+        # The router link: a cable first (wired, not a USB tether), else the router's Wi-Fi.
+        for _, dev, kind, connection in sorted(lans, key=lambda lan: lan[2] != "ethernet"):
+            ip = _device_ip(dev) if dev != hotspot_dev else None
+            if ip:
+                info["router"] = _router_details(dev, kind, connection)
+                info.update(camera_mode="router", camera_ip=info["router"]["ip"] or ip)
+                break
+        else:
+            info["router"] = {"connected": False}
+    elif info["hotspot_active"] and info["wifi_ip"] != "N/A":
         info.update(camera_mode="hotspot", camera_ip=info["wifi_ip"])
     elif info["lan_ip"]:
         info.update(camera_mode="lan", camera_ip=info["lan_ip"])
@@ -145,6 +162,10 @@ def get_network_status(check_internet=True):
     if ok:
         match = re.search(r"\bdev (\S+)", route)
         dev = match.group(1) if match else None
+        info["uplink_iface"] = dev
+        if info["router"] and info["router"].get("connected"):
+            info["router"]["internet"] = ("router" if dev == info["router"]["iface"] else
+                                          "phone" if dev and dev == info["usb_iface"] else dev or None)
         if dev and dev == info["usb_iface"]:
             info["uplink"] = "USB tether"
         elif dev and dev == info["lan_iface"]:
@@ -156,6 +177,100 @@ def get_network_status(check_internet=True):
         _last_internet_check_ts = time.monotonic()
     info["internet_ok"] = _last_internet_status
     return info
+
+
+def _router_details(dev, kind, connection):
+    """Everything the operator needs about the link to the field router."""
+    details = {"connected": True, "iface": dev, "type": kind, "name": connection, "ip": None, "prefix": None,
+               "mac": None, "gateway": None, "uuid": None, "method": None, "never_default": False,
+               "internet": None}
+    ok, out = run_cmd(["nmcli", "-t", "-f", "GENERAL.HWADDR,IP4.ADDRESS,IP4.GATEWAY,DHCP4", "device", "show", dev])
+    if ok:
+        for line in out.splitlines():
+            key, _, value = line.partition(":")
+            value = value.replace("\\:", ":").strip()
+            if key == "GENERAL.HWADDR" and value:
+                details["mac"] = value.upper()
+            elif key.startswith("IP4.ADDRESS") and value and not details["ip"]:
+                ip, _, prefix = value.partition("/")
+                details["ip"], details["prefix"] = ip, int(prefix) if prefix.isdigit() else None
+            elif key == "IP4.GATEWAY" and value and value != "--":
+                details["gateway"] = value
+            elif key.startswith("DHCP4.OPTION") and not details["gateway"]:
+                # With "internet via phone" (never-default) NM installs no gateway; DHCP still names the router.
+                match = re.fullmatch(r"routers = (\S+)", value)
+                if match:
+                    details["gateway"] = match.group(1).split()[0]
+    ok, active = run_cmd(["nmcli", "-t", "-f", "UUID,DEVICE", "connection", "show", "--active"])
+    if ok:
+        for line in active.splitlines():
+            uuid, _, device = line.partition(":")
+            if device == dev:
+                details["uuid"] = uuid
+                break
+    if details["uuid"]:
+        ok, out = run_cmd(["nmcli", "-g", "ipv4.method,ipv4.never-default", "connection", "show", "uuid", details["uuid"]])
+        if ok:
+            values = out.splitlines()
+            details["method"] = values[0] if values else None
+            details["never_default"] = len(values) > 1 and values[1] == "yes"
+    return details
+
+
+def router_advice(network, known_ip=None):
+    """Warnings and hints for router mode, most important first: [{"level", "text"}]."""
+    router = network.get("router") or {}
+    advice = []
+    if not router.get("connected"):
+        return [{"level": "error", "text": "Not connected to the router: plug a cable from a LAN port of the router "
+                                           "into the laptop (or join the router's Wi-Fi)."}]
+    if router.get("type") != "ethernet":
+        advice.append({"level": "warning", "text": f"The laptop reaches the router over Wi-Fi (“{router.get('name')}”). "
+                                                   "A cable is steadier: Wi-Fi is then all for the cameras."})
+    if network.get("hotspot_active"):
+        advice.append({"level": "warning", "text": "The laptop hotspot is still on: phones could join it instead of "
+                                                   "the router. Stop the hotspot."})
+    if known_ip and router.get("ip") and known_ip != router["ip"]:
+        advice.append({"level": "error", "text": f"The laptop's address changed from {known_ip} to {router['ip']}: "
+                                                 "phones and the Pi still send to the old one. Scan the camera QR "
+                                                 "codes again (and set the Pi), then confirm."})
+    internet = router.get("internet")
+    if not network.get("internet_ok"):
+        if internet == "router" and network.get("usb_iface"):
+            advice.append({"level": "error", "text": "No internet through the router. A phone is on USB: switch "
+                                                     "“Internet” to the phone."})
+        else:
+            advice.append({"level": "error", "text": "No internet: the router needs a SIM / uplink, or connect a "
+                                                     "phone by USB and switch “Internet” to the phone."})
+    if router.get("method") == "auto" and router.get("mac"):
+        advice.append({"level": "info", "text": f"Tip: reserve {router.get('ip')} for this laptop in the router "
+                                                f"(DHCP reservation for MAC {router['mac']}), so the camera address "
+                                                "stays the same at every match."})
+    return advice
+
+
+def set_router_internet(network, via):
+    """via "phone": the router link never carries the default route (internet over the USB
+    tether, the router only connects the cameras); via "router": the router may carry it."""
+    if via not in ("phone", "router"):
+        return False, "Choose phone or router"
+    router = (network or {}).get("router") or {}
+    if not router.get("connected") or not router.get("uuid"):
+        return False, "No router connection found"
+    flag = "yes" if via == "phone" else "no"
+    with _network_lock:
+        ok, out = run_cmd(["nmcli", "connection", "modify", "uuid", router["uuid"],
+                           "ipv4.never-default", flag, "ipv6.never-default", flag])
+        if not ok:
+            return False, f"NetworkManager refused the change: {out[:160]}"
+        # Apply without dropping the link (cameras stay connected); reconnect only if needed.
+        ok, out = run_cmd(["nmcli", "device", "reapply", router["iface"]], timeout=15)
+        if not ok:
+            ok, out = run_cmd(["nmcli", "--wait", "20", "connection", "up", "uuid", router["uuid"]], timeout=25)
+        if not ok:
+            return False, f"Saved, but not applied yet: {out[:160]}"
+    return True, ("Internet now goes over the phone; the router only connects the cameras" if via == "phone"
+                  else "Internet may now go over the router")
 
 
 def connect_usb(iface):
@@ -312,7 +427,9 @@ def _same_subnet(a, b):
 
 def _firewall_commands(network, tool):
     hotspot = network.get("camera_mode") == "hotspot"
-    iface = network.get("hotspot_iface") if hotspot else network.get("lan_iface")
+    router = network.get("router") or {}
+    iface = (network.get("hotspot_iface") if hotspot else
+             router.get("iface") if network.get("camera_mode") == "router" else network.get("lan_iface"))
     if tool == "firewalld":
         return ["sudo firewall-cmd --permanent --add-port={5000,1935,8888,8889}/tcp --add-port={8189,8890}/udp",
                 "sudo firewall-cmd --reload"]

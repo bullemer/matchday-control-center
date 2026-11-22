@@ -23,6 +23,8 @@ DEFAULTS = {
     "profile": "720p",              # preselected stream / recording quality
     "recordings_dir": "",           # empty: <app>/recordings
     "min_free_gb": 3,               # refuse to start recording below this much free space
+    "network_mode": "auto",         # camera network: auto (hotspot / laptop's Wi-Fi) or router
+    "router_ip": "",                # laptop address on the router that phones and the Pi were set up with
 }
 
 CAMERA_PASSWORD_RE = re.compile(r"[A-Za-z0-9_-]{8,64}")   # goes into SRT stream ids and RTMP URLs
@@ -79,6 +81,14 @@ def _check(key, value):
     if key == "min_free_gb":
         if type(value) not in (int, float) or not 1 <= value <= 500:
             raise ValueError("Minimum free space: 1-500 GB")
+        return value
+    if key == "network_mode":
+        if value not in ("auto", "router"):
+            raise ValueError("Camera network: auto or router")
+        return value
+    if key == "router_ip":
+        if not isinstance(value, str) or (value and not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", value)):
+            raise ValueError("Router address: an IPv4 address")
         return value
     raise ValueError(f"Unknown setting {key}")
 

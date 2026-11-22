@@ -1109,3 +1109,54 @@ test('AI Director suggest mode: switch, bar and glowing tile on Main, pulsing cu
   await page.locator('#director-enabled').uncheck();
   expect(errors).toEqual([]);
 });
+
+test('own router: camera address on the cable, warnings, internet switch and address confirmation', async ({page}) => {
+  const errors = [];
+  page.on('pageerror', error => errors.push(error.message));
+  let routerIp = '192.168.8.57';
+  await page.route('**/api/status', async route => {
+    const response = await route.fetch();
+    const body = await response.json();
+    body.network = {internet_ok: true, hotspot_active: false, wifi_ip: 'N/A', usb_iface: 'usb0', usb_state: 'connected',
+      usb_status: 'usb0 (connected)', camera_mode: 'router', camera_ip: routerIp, network_mode: 'router', uplink: 'USB tether',
+      router: {connected: true, iface: 'eno1', type: 'ethernet', name: 'Wired connection 1', ip: routerIp, prefix: 24,
+        mac: '3C:52:82:AA:BB:CC', gateway: '192.168.8.1', uuid: '2222', method: 'auto', never_default: true, internet: 'phone'},
+      router_known_ip: '192.168.8.10',
+      router_advice: [{level: 'error', text: `The laptop's address changed from 192.168.8.10 to ${routerIp}: phones and the Pi still send to the old one.`},
+                      {level: 'info', text: 'Tip: reserve the address for MAC 3C:52:82:AA:BB:CC'}]};
+    await route.fulfill({response, json: body});
+  });
+  let internetRequest = null;
+  await page.route('**/api/network/router-internet', async route => {
+    internetRequest = route.request().postDataJSON();
+    await route.fulfill({json: {ok: true, message: 'Internet may now go over the router'}});
+  });
+  let confirmed = false;
+  await page.route('**/api/network/router-confirm-ip', async route => {
+    confirmed = true;
+    await route.fulfill({json: {ok: true, message: `Camera address ${routerIp} confirmed`}});
+  });
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Network/}).click();
+  await expect(page.locator('#router-card')).toBeVisible();
+  await expect(page.locator('[data-net-mode="router"]')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.locator('#camera-network-title')).toContainText("field router's Wi-Fi — server 192.168.8.57");
+  await expect(page.locator('#router-link')).toHaveText('🔌 cable · eno1');
+  await expect(page.locator('#router-ip')).toHaveText('192.168.8.57/24');
+  await expect(page.locator('#router-gateway')).toHaveText('192.168.8.1');
+  await expect(page.locator('#router-method')).toContainText('MAC 3C:52:82:AA:BB:CC');
+  await expect(page.locator('#router-internet')).toHaveText('📱 through the USB phone ✓');
+  await expect(page.locator('[data-router-internet="phone"]')).toHaveAttribute('aria-checked', 'true');
+  await expect(page.locator('#router-advice li').first()).toContainText('changed from 192.168.8.10 to 192.168.8.57');
+  await expect(page.locator('#router-pi')).toHaveText('Raspberry Pi cameras: server address 192.168.8.57');
+  // Camera links use the router address.
+  await page.getByRole('tab', {name: /Cams/}).click();
+  await expect(page.locator('#url-cam1')).toContainText('srt://192.168.8.57:8890');
+  await page.getByRole('tab', {name: /Network/}).click();
+  await page.locator('[data-router-internet="router"]').click();
+  await expect.poll(() => internetRequest).toEqual({via: 'router'});
+  await page.locator('#router-confirm-ip').click();
+  await expect.poll(() => confirmed).toBe(true);
+  await expect(page.locator('#toast-container')).toContainText('Camera address 192.168.8.57 confirmed');
+  expect(errors).toEqual([]);
+});

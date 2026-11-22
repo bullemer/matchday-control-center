@@ -41,7 +41,7 @@ import signal
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 from werkzeug.exceptions import HTTPException
-from network_manager import (get_network_status, connect_usb, start_hotspot, get_hotspot_config,
+from network_manager import (get_network_status, router_advice, set_router_internet, connect_usb, start_hotspot, get_hotspot_config,
                              stop_hotspot, get_usb_audio_devices, get_audio_outputs, get_firewall_status,
                              UPLINK_CONFLICT)
 from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CAMERA_USER, camera_password,
@@ -634,13 +634,62 @@ def api_status():
 
 # --- Network -----------------------------------------------------------
 
+def _network_status(check_internet=True):
+    """Network status in the operator's camera-network mode; in router mode with advice.
+    The first router address seen is remembered: it is what phones and the Pi were set up
+    with, so a later change is reported until the operator confirms it."""
+    network = get_network_status(check_internet=check_internet, mode=settings_store.get("network_mode"))
+    if network.get("camera_mode") == "router":
+        ip = (network.get("router") or {}).get("ip")
+        if ip and not settings_store.get("router_ip"):
+            settings_store.update({"router_ip": ip})
+    if settings_store.get("network_mode") == "router":
+        network["router_advice"] = router_advice(network, settings_store.get("router_ip") or None)
+        network["router_known_ip"] = settings_store.get("router_ip") or None
+    return network
+
+
+@app.route("/api/network/mode", methods=["POST"])
+@api_endpoint
+def api_network_mode():
+    """{"mode": "auto"|"router"}: where camera phones connect."""
+    mode = (request.get_json(force=True, silent=True) or {}).get("mode")
+    settings_store.update({"network_mode": mode})
+    log.info("Camera network mode: %s", mode)
+    _refresh_network()
+    return jsonify(ok=True, network=_diagnostics.get("network"))
+
+
+@app.route("/api/network/router-internet", methods=["POST"])
+@api_endpoint
+def api_router_internet():
+    """{"via": "phone"|"router"}: whether the router link may carry the internet."""
+    via = (request.get_json(force=True, silent=True) or {}).get("via")
+    ok, message = set_router_internet(_network_status(check_internet=False), via)
+    log.info("Router internet via %s: %s", via, message)
+    _refresh_network()
+    return jsonify(ok=ok, message=message), 200 if ok else 502
+
+
+@app.route("/api/network/router-confirm-ip", methods=["POST"])
+@api_endpoint
+def api_router_confirm_ip():
+    """The operator updated phones and Pi: the current router address is the new reference."""
+    ip = ((_network_status(check_internet=False).get("router") or {}).get("ip")) or ""
+    if not ip:
+        raise ValueError("Not connected to the router")
+    settings_store.update({"router_ip": ip})
+    _refresh_network()
+    return jsonify(ok=True, message=f"Camera address {ip} confirmed")
+
+
 @app.route("/api/network/usb-connect", methods=["POST"])
 @api_endpoint
 def api_usb_connect():
     """Connect the USB tethering interface."""
     log.info("USB connect requested")
     # Auto-detect USB interface from network status
-    net = get_network_status(check_internet=False)
+    net = _network_status(check_internet=False)
     iface = net.get("usb_iface")
     if not iface:
         return jsonify({"ok": False, "message": "No USB tethering interface detected"}), 404
@@ -686,7 +735,7 @@ def _refresh_network():
     """Update cached network diagnostics now, so the dashboard shows the result of a
     hotspot change on its next poll instead of after the next 5 s probe."""
     try:
-        network = get_network_status(check_internet=False)
+        network = _network_status(check_internet=False)
         _diagnostics.update(network=network, firewall=get_firewall_status(network))
     except Exception:
         log.exception("Network refresh failed")
@@ -1558,7 +1607,7 @@ def _diagnostics_worker():
     global _diagnostics
     while not _workers_stop.is_set():
         try:
-            network = get_network_status()
+            network = _network_status()
             audio_devices = get_usb_audio_devices()
             set_mic_devices(audio_devices)
             _diagnostics = {"network": network,
