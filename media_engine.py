@@ -1657,6 +1657,7 @@ def _replace_relay(cam_id, generation):
         _retire(old)
         _cut_seconds = round(0.5 * _cut_seconds + 0.5 * (time.monotonic() - began), 2)
         _log_cut()
+        _save_program(cam_id)
     if ended_replay:
         _notify_replay(False)
     if installed:
@@ -1880,6 +1881,44 @@ def _supervise_live_capture(now):
 
 _iso = {}                 # camera -> {"proc", "session", "path", "noted"}
 RECORDING_SETTING = BASE / "data/recording.json"
+
+# The camera on air survives a restart of the app: saved after every cut, put back at start
+# (the relay supervisor builds the program as soon as that camera publishes). None = off:
+# the app switches it on in initialize(), so tests never write the operator's real file.
+PROGRAM_SETTING = None
+_saved_program = None
+
+
+def _save_program(cam):
+    global _saved_program
+    if PROGRAM_SETTING is None or cam == _saved_program:
+        return
+    try:
+        PROGRAM_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = PROGRAM_SETTING.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"camera": cam, "saved_at": time.time()}))
+        os.replace(tmp, PROGRAM_SETTING)
+        _saved_program = cam
+    except OSError:
+        logger.exception("Cannot save the camera on air")
+
+
+def load_program_setting(path):
+    """Enable saving the camera on air and select the saved one again (at app start)."""
+    global PROGRAM_SETTING, _active_camera, _last_camera, _saved_program
+    PROGRAM_SETTING = Path(path)
+    try:
+        cam = json.loads(PROGRAM_SETTING.read_text()).get("camera")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if cam not in CAMERA_IDS:
+        return None
+    with _lock:
+        if _active_camera is None:
+            _active_camera, _saved_program = cam, cam
+            _last_camera = _last_camera or cam
+            logger.info("Camera on air before the restart: %s (on air again once it publishes)", cam)
+    return cam
 _iso_match = False        # also record every match camera on its own (material for the auto-director)
 _cut_logged = None        # (session, camera, mode, secondary) last written to the session's cut log
 _iso_retry = {}           # reporting camera -> monotonic time of the next start attempt

@@ -25,6 +25,7 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, send_file
 import recordings
 import camera_control
+import media_engine
 import settings_store
 import ai_director
 
@@ -1551,6 +1552,8 @@ def initialize():
         log.info("The app stopped while live; resuming the broadcast once a camera is back")
     load_audio_setting()
     load_camera_setting()
+    # Back on air with the camera selected before the restart (once it publishes).
+    media_engine.load_program_setting(RUNTIME_DIR / "program.json")
     load_recording_setting()
     start_monitor_worker()  # plays in the headset once MediaMTX runs, if listening was on
     ai_director.autostart()  # rates the match cameras if it was switched on last time
