@@ -113,19 +113,50 @@ def detections(result, keep=None):
     return out
 
 
-def thumbnail(frame, persons, balls, info):
+def thumbnail(frame, persons, balls, info, fence=None):
+    """Players violet, ball yellow; with a field fence: fence cyan, ignored people/balls grey."""
     img = frame.copy()
+    polygon = ds.fence_pixels(fence, W, H)
+    if polygon:
+        cv2.polylines(img, [np.array(polygon, np.int32)], True, (255, 255, 0), 2)
     for p in ds.players(persons, H):
-        cv2.rectangle(img, (int(p.x - p.w / 2), int(p.y - p.h / 2)), (int(p.x + p.w / 2), int(p.y + p.h / 2)), (238, 104, 167), 2)
+        colour, width = ((238, 104, 167), 2) if ds.on_pitch(polygon, p) else ((120, 120, 120), 1)
+        cv2.rectangle(img, (int(p.x - p.w / 2), int(p.y - p.h / 2)), (int(p.x + p.w / 2), int(p.y + p.h / 2)), colour, width)
     for b in balls:
         if b.conf >= ds.BALL_CONF:
             r = int(max(b.w, b.h) / 2) + 10
-            cv2.circle(img, (int(b.x), int(b.y)), r, (0, 255, 255), 3)
+            colour = (0, 255, 255) if ds.ball_on_pitch(polygon, b, H) else (120, 120, 120)
+            cv2.circle(img, (int(b.x), int(b.y)), r, colour, 3)
     cv2.putText(img, f"{info['score']:.0f}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 2.2, (0, 0, 0), 9)
     cv2.putText(img, f"{info['score']:.0f}", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 2.2, (255, 255, 255), 3)
     thumb = cv2.resize(img, (THUMB_W, int(THUMB_W * H / W)), interpolation=cv2.INTER_AREA)
     ok, jpg = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
     return jpg.tobytes() if ok else None
+
+
+class Fences:
+    """Field fences per camera from a JSON file {cam: [[x, y], ...]} (relative), reloaded when
+    it changes. broadcast-control writes only fixed cameras into it."""
+
+    def __init__(self, path):
+        self.path = Path(path) if path else None
+        self.mtime = None
+        self.data = {}
+
+    def get(self, cam):
+        if self.path is not None:
+            try:
+                mtime = self.path.stat().st_mtime
+            except OSError:
+                mtime = None
+            if mtime != self.mtime:
+                self.mtime = mtime
+                try:
+                    raw = json.loads(self.path.read_text()) if mtime is not None else {}
+                    self.data = {c: [(float(x), float(y)) for x, y in pts] for c, pts in raw.items() if len(pts) >= 3}
+                except (OSError, ValueError, TypeError):
+                    self.data = {}
+        return self.data.get(cam)
 
 
 def write_atomic(path, data):
@@ -142,6 +173,7 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--models", required=True)
     ap.add_argument("--no-hwaccel", action="store_true")
+    ap.add_argument("--fences", default="", help="JSON file with field fences per camera")
     args = ap.parse_args()
 
     out = Path(args.out)
@@ -172,6 +204,7 @@ def main():
     results = {}
     thumbs_t = {c: 0.0 for c in cams}
     recommender = ds.Recommender()
+    fences = Fences(args.fences)
     period = 1.0 / args.fps
     loop_times = []
 
@@ -196,10 +229,11 @@ def main():
             for (c, frame), pr, br in zip(batch, people, balls):
                 persons, ball_dets = detections(pr, keep={0}), detections(br)
                 pic, greys[c] = picture_metrics(frame, greys[c])
-                info = ds.rate(states[c], now, W, H, persons, ball_dets, pic)
+                fence = fences.get(c)
+                info = ds.rate(states[c], now, W, H, persons, ball_dets, pic, fence)
                 results[c] = {"online": True, **info}
                 if now - thumbs_t[c] >= THUMB_EVERY_S:
-                    jpg = thumbnail(frame, persons, ball_dets, info)
+                    jpg = thumbnail(frame, persons, ball_dets, info, fence)
                     if jpg:
                         write_atomic(out / f"{c}.jpg", jpg)
                         thumbs_t[c] = now

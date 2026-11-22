@@ -32,6 +32,7 @@ PLAYER_MIN_H = 0.015      # people smaller than 1.5 % of the frame height are ig
 ACTION_RADIUS = 0.22      # "near the ball" = within 22 % of the frame width
 ACTION_FULL = 4           # this many players near the ball = full action
 SMOOTH_TAU_S = 1.5        # exponential smoothing of the score
+BALL_AIR = 0.15           # a ball up to 15 % of the frame height above the fence still counts (in the air)
 FROZEN_DIFF = 0.6         # mean pixel change below this ...
 FROZEN_S = 2.0            # ... for this long = frozen picture
 
@@ -66,6 +67,41 @@ class CameraState:
 
 def clamp(v, lo=0.0, hi=1.0):
     return max(lo, min(hi, v))
+
+
+# --- Field fence: a polygon around the pitch (fixed cameras only) -------------------------
+# Like the XbotGo Falcon's field fence: people outside it (spectators, substitutes, coaches)
+# are not players. Points are relative (0..1) to the analysis frame.
+
+def inside(polygon, x, y):
+    """Point in polygon (ray casting). polygon: [(x, y), ...] in the same units as x, y."""
+    hit = False
+    n = len(polygon)
+    for i in range(n):
+        x1, y1 = polygon[i]
+        x2, y2 = polygon[(i + 1) % n]
+        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
+            hit = not hit
+    return hit
+
+
+def fence_pixels(fence, width, height):
+    """Relative fence -> pixels; None (no fence) for fewer than 3 points."""
+    if not fence or len(fence) < 3:
+        return None
+    return [(x * width, y * height) for x, y in fence]
+
+
+def on_pitch(polygon, person):
+    """A person counts when the feet (bottom centre of the box) are on the pitch."""
+    return polygon is None or inside(polygon, person.x, person.y + person.h / 2)
+
+
+def ball_on_pitch(polygon, ball, height):
+    """Inside the fence, or above it (a high ball): checked as the point lowered by BALL_AIR."""
+    if polygon is None:
+        return True
+    return inside(polygon, ball.x, ball.y) or inside(polygon, ball.x, ball.y + BALL_AIR * height)
 
 
 def ball_part(ball, age_s, width, height):
@@ -121,8 +157,11 @@ def quality_part(pic, frozen):
     return clamp(0.6 * sharp + 0.4 * exposure), {"sharp": round(sharp, 2), "exposure": round(exposure, 2), "frozen": False}
 
 
-def rate(state, now, width, height, persons, balls, pic):
-    """One analysed frame -> score details. Updates state (ball memory, freeze, smoothing)."""
+def rate(state, now, width, height, persons, balls, pic, fence=None):
+    """One analysed frame -> score details. Updates state (ball memory, freeze, smoothing).
+    fence: relative polygon around the pitch (or None): people and balls outside are ignored."""
+    polygon = fence_pixels(fence, width, height)
+    balls = [b for b in balls if ball_on_pitch(polygon, b, height)]
     ball = max((b for b in balls if b.conf >= BALL_CONF), key=lambda b: b.conf, default=None)
     if ball is not None:
         state.last_ball, state.last_ball_t = ball, now
@@ -135,7 +174,8 @@ def rate(state, now, width, height, persons, balls, pic):
         state.frozen_since = None
     frozen = state.frozen_since is not None and now - state.frozen_since >= FROZEN_S
 
-    people = players(persons, height)
+    sized = players(persons, height)
+    people = [p for p in sized if on_pitch(polygon, p)]
     b, b_info = ball_part(remembered, age, width, height)
     a, a_info = action_part(people, remembered, width, height)
     q, q_info = quality_part(pic, frozen)
@@ -153,7 +193,8 @@ def rate(state, now, width, height, persons, balls, pic):
         "score": round(state.smooth, 1), "raw": round(raw, 1),
         "ball": {"seen": ball is not None, "remembered": remembered is not None and ball is None,
                  "conf": round(ball.conf, 2) if ball else None, "part": round(b, 2), **b_info},
-        "action": {"part": round(a, 2), "players": len(people), **a_info},
+        "action": {"part": round(a, 2), "players": len(people), "off_pitch": len(sized) - len(people), **a_info},
+        "fence": polygon is not None,
         "quality": {"part": round(q, 2), **q_info},
     }
 

@@ -10,6 +10,8 @@ Setup once: scripts/setup-ai-director.sh (creates ai-venv, downloads the two mod
 """
 import json
 import logging
+import math
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -25,6 +27,9 @@ MODELS = BASE / "models"
 MODEL_FILES = ("yolo26s.pt", "box2boxcam-ball-v1.0.pt")
 OUT = BASE / "data" / "ai-director"
 SETTINGS = BASE / "data" / "ai-director.json"
+FENCES = BASE / "data" / "ai-director-fences.json"   # all fences the operator drew
+FENCE_MAX_POINTS = 16
+SNAPSHOT_W, SNAPSHOT_H = 1280, 720                  # same framing as the worker's analysis frames
 FPS_CHOICES = (2, 5, 10)
 STALE_S = 6.0            # worker state older than this = not running
 RESTART_MAX_S = 60.0
@@ -36,6 +41,7 @@ _supervisor = None
 _stop = threading.Event()
 _last_error = ""
 _restarts = 0
+_fences = {}
 
 
 def match_cameras():
@@ -99,7 +105,107 @@ def configure(enabled=None, fps=None):
 
 def _command():
     return [str(VENV_PYTHON), str(WORKER), "--cams", ",".join(match_cameras()),
-            "--fps", str(_settings["fps"]), "--out", str(OUT), "--models", str(MODELS)]
+            "--fps", str(_settings["fps"]), "--out", str(OUT), "--models", str(MODELS),
+            "--fences", str(OUT / "fences.json")]
+
+
+# --- Field fences ----------------------------------------------------------------------
+# A polygon around the pitch per match camera (relative 0..1 coordinates of the analysis
+# frame). Only fixed cameras use it: on a gimbal or in the hand the picture moves.
+
+def load_fences():
+    try:
+        data = json.loads(FENCES.read_text())
+    except (OSError, ValueError):
+        data = {}
+    clean = {}
+    for cam, pts in (data.items() if isinstance(data, dict) else []):
+        try:
+            clean[cam] = _clean_points(pts)
+        except ValueError:
+            pass
+    with _lock:
+        _fences.clear()
+        _fences.update({c: p for c, p in clean.items() if c in match_cameras() and p})
+    return dict(_fences)
+
+
+def _clean_points(points):
+    if not isinstance(points, list) or (points and not 3 <= len(points) <= FENCE_MAX_POINTS):
+        raise ValueError(f"A field fence needs 3 to {FENCE_MAX_POINTS} points (or none to remove it)")
+    clean = []
+    for pt in points:
+        if not (isinstance(pt, (list, tuple)) and len(pt) == 2 and all(
+                type(v) in (int, float) and math.isfinite(v) and -0.05 <= v <= 1.05 for v in pt)):
+            raise ValueError("Points must be [x, y] between 0 and 1")
+        clean.append([round(min(max(float(pt[0]), 0.0), 1.0), 4), round(min(max(float(pt[1]), 0.0), 1.0), 4)])
+    return clean
+
+
+def set_fence(cam, points):
+    """Store (or with [] remove) the field fence of one match camera."""
+    if cam not in match_cameras():
+        raise ValueError("Field fences are for match cameras (Cam 1-4)")
+    clean = _clean_points(points)
+    with _lock:
+        if clean:
+            _fences[cam] = clean
+        else:
+            _fences.pop(cam, None)
+        FENCES.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        tmp = FENCES.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_fences))
+        tmp.replace(FENCES)
+    sync_fences()
+    return clean
+
+
+def _mounts():
+    try:
+        return {c["id"]: c.get("mount", "fixed") for c in media_engine.get_cameras()}
+    except Exception:  # camera settings unreadable: assume fixed
+        return {}
+
+
+def effective_fences():
+    """The fences the worker uses: fixed cameras only."""
+    mounts = _mounts()
+    with _lock:
+        return {c: p for c, p in _fences.items() if mounts.get(c, "fixed") == "fixed"}
+
+
+def sync_fences():
+    """Write the worker's fence file when it differs (fence edited or camera mount changed)."""
+    path = OUT / "fences.json"
+    text = json.dumps(effective_fences(), sort_keys=True)
+    try:
+        if path.read_text() == text:
+            return
+    except OSError:
+        pass
+    OUT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text)
+    tmp.replace(path)
+
+
+def snapshot(cam):
+    """A fresh still of one match camera in the worker's framing (for drawing the fence)."""
+    if cam not in match_cameras():
+        raise ValueError("Unknown match camera")
+    OUT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = OUT / f"{cam}-still.jpg"
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-rtsp_transport", "tcp",
+           "-timeout", "5000000", "-i", f"rtsp://127.0.0.1:8554/{cam}", "-an", "-frames:v", "1",
+           "-vf", f"scale={SNAPSHOT_W}:{SNAPSHOT_H}:force_original_aspect_ratio=decrease,"
+                  f"pad={SNAPSHOT_W}:{SNAPSHOT_H}:(ow-iw)/2:(oh-ih)/2", "-q:v", "4", "-y", str(path)]
+    try:
+        result = subprocess.run(cmd, capture_output=True, timeout=12)
+    except subprocess.TimeoutExpired:
+        raise ValueError("The camera did not deliver a picture in time")
+    if result.returncode != 0 or not path.is_file():
+        raise ValueError("Camera is not publishing")
+    return path
 
 
 def _start_worker():
@@ -143,6 +249,10 @@ def _supervise():
                     _last_error = str(exc)
         elif _state_age() < STALE_S:
             delay = 2.0  # running fine: next crash restarts quickly again
+        try:
+            sync_fences()  # a camera switched to/from "fixed" mount
+        except OSError:
+            pass
         _stop.wait(1.0)
 
 
@@ -172,6 +282,11 @@ def stop():
 def autostart():
     """At app start: run if it was enabled last time (and the environment is ready)."""
     load_settings()
+    load_fences()
+    try:
+        sync_fences()
+    except OSError:
+        pass
     if _settings["enabled"] and not setup_problem():
         try:
             start()
@@ -208,6 +323,7 @@ def status():
         "busy": state.get("busy") if fresh else None, "recommended": state.get("recommended") if fresh else None,
         "cameras": match_cameras(), "cams": state.get("cams", {}) if fresh else {},
         "error": _last_error if enabled else "", "restarts": _restarts,
+        "fences": dict(_fences), "mounts": _mounts(),
     }
 
 

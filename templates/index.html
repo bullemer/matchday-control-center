@@ -19,6 +19,10 @@
       margin: auto; padding: 1.25rem; border: 1px solid #475569; border-radius: 1rem;
       background: #1e293b; color: #fff; }
     #clock-editor::backdrop, #layout-editor::backdrop, #qr-dialog::backdrop { background: rgb(0 0 0 / .65); }
+    #fence-editor { width: min(64rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); margin: auto; padding: 1rem;
+      border: 1px solid #475569; border-radius: 1rem; background: #1e293b; color: #fff; }
+    #fence-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #fence-box { cursor: crosshair; }
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
     body.match-mode main { padding-top: .5rem; }
@@ -1146,6 +1150,11 @@
             <div class="flex-1 h-3 rounded bg-slate-700 overflow-hidden"><div data-director-bar class="h-full bg-brand-green" style="width:0%"></div></div>
           </div>
           <p data-director-detail class="text-xs text-slate-400 min-h-[2rem]"></p>
+          <div class="flex items-center justify-between gap-2 text-xs mt-2 pt-2 border-t border-slate-700">
+            <span data-director-fence class="text-slate-400">🥅 —</span>
+            <button type="button" data-director-fence-btn onclick="openFenceEditor('{{ cam.id }}')"
+                    class="shrink-0 px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200">✏️ Draw fence</button>
+          </div>
         </div>
         {% endfor %}
       </div>
@@ -1196,6 +1205,30 @@
         <button id="layout-apply" class="flex-1 bg-brand-blue rounded-lg py-3 font-semibold">Apply layout</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="fence-editor" aria-labelledby="fence-editor-title">
+    <div class="flex items-center justify-between gap-2 mb-2">
+      <h3 id="fence-editor-title" class="text-base font-semibold">🥅 Field fence</h3>
+      <span id="fence-count" class="text-xs text-slate-400"></span>
+    </div>
+    <p id="fence-hint" class="text-xs text-slate-300 mb-2">Click the corners of the pitch in order (add points along curved or hidden edges).
+      Players count only with their feet inside; spectators, substitutes and coaches outside are ignored. A high ball above the fence still counts.</p>
+    <div id="fence-box" class="relative aspect-video bg-black rounded overflow-hidden mb-3" onclick="addFencePoint(event)">
+      <img id="fence-img" alt="Still of the camera for drawing the field fence" class="w-full h-full object-contain">
+      <svg id="fence-svg" viewBox="0 0 1280 720" preserveAspectRatio="none" class="absolute inset-0 w-full h-full pointer-events-none"></svg>
+      <div id="fence-loading" class="absolute inset-0 grid place-content-center text-sm text-slate-400">Loading picture…</div>
+    </div>
+    <div class="flex flex-wrap justify-between gap-2">
+      <div class="flex gap-2">
+        <button type="button" onclick="undoFencePoint()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">↶ Undo point</button>
+        <button type="button" onclick="clearFence()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Remove all</button>
+      </div>
+      <div class="flex gap-2">
+        <button type="button" onclick="document.getElementById('fence-editor').close()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+        <button type="button" id="fence-save" onclick="saveFence()" class="px-4 py-2 rounded-lg bg-brand-green hover:bg-green-600 text-white font-semibold text-sm">Save</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="clock-editor" aria-labelledby="clock-editor-title">
@@ -1640,7 +1673,84 @@
       directorTimer = setTimeout(pollDirector, document.hidden ? 5000 : 1000);
     }
 
+    let lastDirector = null;
+    function renderFenceLine(d, cam, c) {
+      const card = document.querySelector(`[data-director-card="${cam}"]`);
+      const line = card.querySelector('[data-director-fence]');
+      const button = card.querySelector('[data-director-fence-btn]');
+      const mount = (d.mounts || {})[cam] || 'fixed';
+      const pts = (d.fences || {})[cam];
+      button.textContent = pts ? '✏️ Edit fence' : '✏️ Draw fence';
+      if (mount !== 'fixed') {
+        line.textContent = `🥅 Fence only for fixed cameras (this one: ${mount})`;
+        line.className = 'text-slate-500';
+        button.disabled = true; button.classList.add('opacity-50');
+        return;
+      }
+      button.disabled = false; button.classList.remove('opacity-50');
+      if (pts) {
+        const off = c && c.online && c.action ? c.action.off_pitch : null;
+        line.textContent = `🥅 Field fence: ${pts.length} points` + (off ? ` · ${off} outside ignored` : '');
+        line.className = 'text-slate-300';
+      } else {
+        line.textContent = '🥅 No field fence — people beside the pitch count as players';
+        line.className = 'text-brand-amber';
+      }
+    }
+
+    // Field fence editor: click the pitch corners on a fresh still of the camera.
+    const fenceEdit = {cam: null, points: []};
+    function openFenceEditor(cam) {
+      fenceEdit.cam = cam;
+      fenceEdit.points = (((lastDirector || {}).fences || {})[cam] || []).map(p => [...p]);
+      document.getElementById('fence-editor-title').textContent = `🥅 Field fence · ${camLabel(cam)}`;
+      const img = document.getElementById('fence-img');
+      const loading = document.getElementById('fence-loading');
+      loading.hidden = false; loading.textContent = 'Loading picture…';
+      img.onload = () => { loading.hidden = true; };
+      img.onerror = async () => {
+        loading.hidden = false;
+        try {
+          const res = await fetch(img.src);
+          loading.textContent = '⚠ ' + ((await res.json()).error || 'No picture');
+        } catch (err) { loading.textContent = '⚠ No picture'; }
+      };
+      img.src = `/api/director/snapshot/${cam}?t=${Date.now()}`;
+      renderFence();
+      document.getElementById('fence-editor').showModal();
+    }
+    function addFencePoint(event) {
+      if (fenceEdit.points.length >= 16) return showToast('At most 16 points', 'info');
+      const r = document.getElementById('fence-box').getBoundingClientRect();
+      const x = (event.clientX - r.left) / r.width, y = (event.clientY - r.top) / r.height;
+      fenceEdit.points.push([Math.round(x * 10000) / 10000, Math.round(y * 10000) / 10000]);
+      renderFence();
+    }
+    function undoFencePoint() { fenceEdit.points.pop(); renderFence(); }
+    function clearFence() { fenceEdit.points = []; renderFence(); }
+    function renderFence() {
+      const pts = fenceEdit.points.map(([x, y]) => `${(x * 1280).toFixed(1)},${(y * 720).toFixed(1)}`);
+      const shape = pts.length >= 3 ? `<polygon points="${pts.join(' ')}" fill="rgb(34 211 238 / .18)" stroke="#22d3ee" stroke-width="4"/>`
+        : pts.length === 2 ? `<polyline points="${pts.join(' ')}" fill="none" stroke="#22d3ee" stroke-width="4"/>` : '';
+      document.getElementById('fence-svg').innerHTML = shape + fenceEdit.points.map(([x, y], i) =>
+        `<circle cx="${x * 1280}" cy="${y * 720}" r="11" fill="${i === 0 ? '#facc15' : '#22d3ee'}" stroke="#0f172a" stroke-width="3"/>`).join('');
+      const n = fenceEdit.points.length;
+      document.getElementById('fence-count').textContent = n ? `${n} point${n === 1 ? '' : 's'}` : 'no fence';
+      const save = document.getElementById('fence-save');
+      save.disabled = n > 0 && n < 3;
+      save.textContent = n === 0 ? 'Save (no fence)' : 'Save';
+      save.classList.toggle('opacity-50', save.disabled);
+    }
+    async function saveFence() {
+      const {ok, data} = await apiRequest(`/api/director/fence/${fenceEdit.cam}`, {points: fenceEdit.points});
+      if (!ok) return showToast('❌ ' + (data.error || 'Saving the fence failed'), 'error');
+      showToast(fenceEdit.points.length ? `🥅 Field fence saved for ${camLabel(fenceEdit.cam)}` : `Field fence removed for ${camLabel(fenceEdit.cam)}`, 'success');
+      document.getElementById('fence-editor').close();
+      pollDirector();
+    }
+
     function renderDirector(d) {
+      lastDirector = d;
       const toggle = document.getElementById('director-enabled');
       if (document.activeElement !== toggle) toggle.checked = d.enabled;
       const fps = document.getElementById('director-fps');
@@ -1660,6 +1770,7 @@
         const card = document.querySelector(`[data-director-card="${cam}"]`);
         if (!card) continue;
         const c = d.cams[cam];
+        renderFenceLine(d, cam, c);
         const badge = card.querySelector('[data-director-badge]');
         const recommended = d.recommended === cam;
         card.classList.toggle('border-brand-green', recommended);

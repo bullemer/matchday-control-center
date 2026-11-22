@@ -83,6 +83,34 @@ class ScoringTests(unittest.TestCase):
         self.assertAlmostEqual(r["score"], r["raw"], delta=3)
 
 
+class FenceScoringTests(unittest.TestCase):
+    PITCH = [(0.1, 0.4), (0.9, 0.4), (1.0, 0.95), (0.0, 0.95)]   # trapezoid, lower part of the picture
+
+    def test_point_in_polygon(self):
+        square = [(0, 0), (10, 0), (10, 10), (0, 10)]
+        self.assertTrue(ds.inside(square, 5, 5))
+        self.assertFalse(ds.inside(square, 15, 5))
+        self.assertFalse(ds.inside(square, 5, -1))
+        self.assertIsNone(ds.fence_pixels([(0, 0), (1, 1)], W, H))     # fewer than 3 points: no fence
+
+    def test_spectators_outside_the_fence_do_not_count(self):
+        players = [person(640, 450 - 40) for _ in range(3)]            # feet at y=450 (on the pitch)
+        stands = [person(200 + i * 80, 200 - 40) for i in range(6)]    # feet at y=200 (above the fence)
+        no_fence = ds.rate(ds.CameraState(), 0, W, H, players + stands, [], GOOD)
+        fenced = ds.rate(ds.CameraState(), 0, W, H, players + stands, [], GOOD, fence=self.PITCH)
+        self.assertEqual(no_fence["action"]["players"], 9)
+        self.assertEqual(fenced["action"]["players"], 3)
+        self.assertEqual(fenced["action"]["off_pitch"], 6)
+        self.assertTrue(fenced["fence"])
+        self.assertFalse(no_fence["fence"])
+
+    def test_ball_in_the_air_above_the_fence_counts_but_not_far_outside(self):
+        high = ball(640, 0.4 * H - 0.1 * H)      # 10 % of the height above the far line: in the air
+        stand = ball(640, 0.1 * H)               # in the stands
+        self.assertTrue(ds.rate(ds.CameraState(), 0, W, H, [], [high], GOOD, fence=self.PITCH)["ball"]["seen"])
+        self.assertFalse(ds.rate(ds.CameraState(), 0, W, H, [], [stand], GOOD, fence=self.PITCH)["ball"]["seen"])
+
+
 class RecommenderTests(unittest.TestCase):
     def test_hysteresis(self):
         r = ds.Recommender()
@@ -149,6 +177,32 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNotNone(ad.image_path('cam1'))
         self.assertIsNone(ad.image_path('cam5'))
         self.assertIsNone(ad.image_path('../secret'))
+
+    def test_fences_validated_saved_and_only_for_fixed_cameras(self):
+        square = [[0.1, 0.4], [0.9, 0.4], [1.0, 0.95], [0.0, 0.95]]
+        with patch.object(ad, 'FENCES', ad.SETTINGS.parent / 'fences.json'), \
+                patch.object(ad, '_mounts', return_value={'cam1': 'fixed', 'cam2': 'tracking'}):
+            for bad in ([[0.1, 0.1], [0.2, 0.2]], [[0.1, 0.1]] * 17, [[0.1, 'x'], [0.2, 0.2], [0.3, 0.3]], [[2, 0], [0, 0], [0, 1]], 'abc'):
+                with self.assertRaises(ValueError):
+                    ad.set_fence('cam1', bad)
+            with self.assertRaises(ValueError):
+                ad.set_fence('cam5', square)                 # reporting cameras: no fence
+            self.assertEqual(ad.set_fence('cam1', square), square)
+            ad.set_fence('cam2', square)
+            self.assertEqual(json.loads((ad.OUT / 'fences.json').read_text()), {'cam1': square})  # cam2 moves: not used
+            ad._fences.clear()
+            self.assertEqual(set(ad.load_fences()), {'cam1', 'cam2'})
+            self.assertEqual(ad.set_fence('cam1', []), [])     # remove
+            self.assertEqual(json.loads((ad.OUT / 'fences.json').read_text()), {})
+            self.assertEqual(ad.status()['fences'], {'cam2': square})
+            ad._fences.clear()
+
+    def test_snapshot_only_for_match_cameras(self):
+        with self.assertRaises(ValueError):
+            ad.snapshot('cam5')
+        with patch.object(ad.subprocess, 'run', return_value=type('R', (), {'returncode': 1})()):
+            with self.assertRaises(ValueError):
+                ad.snapshot('cam1')
 
     def test_supervisor_restarts_a_crashed_worker(self):
         started = []

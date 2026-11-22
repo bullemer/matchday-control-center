@@ -936,6 +936,38 @@ test('AI Director tab: switch on, scores, best camera and thumbnails', async ({p
   await expect(page.locator('#director-status')).toContainText('10 frames/s per camera');
   // The thumbnail needs the operator login like everything else.
   expect((await page.request.get('/api/director/image/cam1', {headers: {Authorization: ''}})).status()).toBe(200);
+  // Field fence: amber hint without one; tracking cameras cannot have one.
+  await expect(cam1.locator('[data-director-fence]')).toContainText('No field fence');
+  await expect(page.locator('[data-director-card="cam2"] [data-director-fence]')).toContainText('only for fixed cameras (this one: tracking)');
+  await expect(page.locator('[data-director-card="cam2"] [data-director-fence-btn]')).toBeDisabled();
+  await cam1.locator('[data-director-fence-btn]').click();
+  const editor = page.locator('#fence-editor');
+  await expect(editor).toBeVisible();
+  await expect(page.locator('#fence-loading')).toBeHidden();
+  await expect(page.locator('#fence-save')).toHaveText('Save (no fence)');
+  const box = await page.locator('#fence-box').boundingBox();
+  for (const [x, y] of [[0.1, 0.4], [0.9, 0.4], [1.0, 0.95], [0.0, 0.95]])
+    await page.mouse.click(box.x + Math.min(x, 0.999) * box.width, box.y + y * box.height);
+  await expect(page.locator('#fence-count')).toHaveText('4 points');
+  await expect(page.locator('#fence-svg polygon')).toHaveCount(1);
+  await page.locator('#fence-editor').getByRole('button', {name: 'Undo point'}).click();
+  await expect(page.locator('#fence-count')).toHaveText('3 points');
+  await page.mouse.click(box.x + 0.999 * box.width, box.y + 0.95 * box.height);
+  const saved = page.waitForRequest(r => r.url().endsWith('/api/director/fence/cam1') && r.postDataJSON().points.length === 4);
+  await page.locator('#fence-save').click();
+  const points = (await saved).postDataJSON().points;
+  expect(points[0][0]).toBeCloseTo(0.1, 2); expect(points[1][1]).toBeCloseTo(0.4, 2);
+  await expect(editor).toBeHidden();
+  await expect(cam1.locator('[data-director-fence]')).toHaveText('🥅 Field fence: 4 points · 4 outside ignored');
+  await expect(cam1.locator('[data-director-fence-btn]')).toHaveText('✏️ Edit fence');
+  // Reopen: the saved fence is shown and can be removed.
+  await cam1.locator('[data-director-fence-btn]').click();
+  await expect(page.locator('#fence-count')).toHaveText('4 points');
+  await page.locator('#fence-editor').getByRole('button', {name: 'Remove all'}).click();
+  const removed = page.waitForRequest(r => r.url().endsWith('/api/director/fence/cam1') && r.postDataJSON().points.length === 0);
+  await page.locator('#fence-save').click();
+  await removed;
+  await expect(cam1.locator('[data-director-fence]')).toContainText('No field fence');
   await page.screenshot({path:'/tmp/mcc-ai-director.png', fullPage:true});
   expect(errors).toEqual([]);
 });

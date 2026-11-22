@@ -326,6 +326,21 @@ def api_director_configure():
     return jsonify(ok=True, **result)
 
 
+@app.route("/api/director/fence/<cam_id>", methods=["POST"])
+@api_endpoint
+def api_director_fence(cam_id):
+    """Field fence of a match camera: {"points": [[x, y], ...]} relative 0..1; [] removes it."""
+    points = ai_director.set_fence(cam_id, request.get_json().get("points"))
+    return jsonify(ok=True, points=points)
+
+
+@app.route("/api/director/snapshot/<cam_id>")
+@api_endpoint
+def api_director_snapshot(cam_id):
+    """A fresh still of a match camera for drawing its field fence (works while the AI is off)."""
+    return send_file(ai_director.snapshot(cam_id), mimetype="image/jpeg", max_age=0)
+
+
 @app.route("/api/director/image/<cam_id>")
 def api_director_image(cam_id):
     """Annotated thumbnail of one match camera (ball and players marked)."""
