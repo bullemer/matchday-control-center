@@ -28,7 +28,7 @@ test('dashboard uses real API contracts and preserves edits', async ({page}) => 
   await expect(page.locator('#btn-cut-cam1')).toBeEnabled();
   await page.locator('#btn-cut-cam1').click();
   await expect(page.locator('#toast-container')).toContainText('Camera unavailable');
-  await expect(page.locator('#btn-cut-cam1')).not.toHaveClass(/bg-brand-red/);
+  await expect(page.locator('#frame-cam1')).not.toHaveClass(/f-air/);
   await page.locator('#audio-follow').click();
   await expect(page.locator('#audio-follow')).toHaveClass(/bg-brand-blue/);
   expect(errors).toEqual([]);
@@ -1031,5 +1031,31 @@ test('Settings tab: match defaults, new match, camera password, storage and logi
   await page.locator('#settings-login').getByRole('button', {name: 'Change login'}).click();
   await expect(page.locator('#toast-container')).toContainText('current password is wrong');
   await page.screenshot({path:'/tmp/mcc-settings.png', fullPage:true});
+  expect(errors).toEqual([]);
+});
+
+test('Main tab: clicking a preview tile cuts; frame and label show the state; no separate cut row', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  // The old cut row is gone from the Main tab; REPLAY lives in its panel.
+  await expect(page.locator('section[data-tab="main"] .cut-grid')).toHaveCount(0);
+  await expect(page.locator('#replay-panel #btn-cut-replay')).toBeVisible();
+  // Live camera: green frame, "Ready", clickable over the video; offline camera: not clickable.
+  const tile = page.locator('#frame-cam1 [data-tile]');
+  await expect(tile.locator('[data-cut-state]')).toHaveText('Ready');
+  await expect(page.locator('#frame-cam1')).toHaveClass(/f-ready/);
+  await expect(page.locator('#btn-cut-cam2')).toBeDisabled();
+  await expect(page.locator('#btn-cut-cam2 [data-cut-state]')).toHaveText('Offline');
+  const cut = page.waitForRequest('**/api/switch/cam1');
+  await page.locator('#frame-cam1').click();       // a click anywhere on the picture
+  await cut;
+  // On air (as the status reports it): red frame and label.
+  await page.evaluate(() => { state.activeCam = 'cam1'; updateTallyButtons(); });
+  await expect(page.locator('#frame-cam1')).toHaveClass(/f-air/);
+  await expect(page.locator('#frame-cam1')).not.toHaveClass(/f-ready/);
+  await expect(tile.locator('[data-cut-state]')).toHaveText('On air');
+  await page.locator('section[data-tab="main"]').first().screenshot({path:'/tmp/mcc-main-tiles.png'});
   expect(errors).toEqual([]);
 });

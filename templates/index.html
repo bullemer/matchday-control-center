@@ -141,6 +141,25 @@
     .outdoor-mode .dest-row { background: #fff; border: 2px solid #0f172a; }
     .outdoor-mode .dest-input { background: #f1f5f9; color: #020617; border: 2px solid #0f172a; }
     .replay-badge { background: #7c3aed; }
+    /* Main tab: the preview tile itself is the cut button (a layer over the video, which
+       would swallow the click); its frame and a small label show the state. */
+    .tile-cut { position: absolute; inset: 0; z-index: 2; background: transparent; cursor: pointer;
+      border: 0; padding: 0; display: flex; align-items: flex-end; justify-content: flex-start; }
+    .tile-cut:disabled { cursor: not-allowed; }
+    .tile-cut:not(:disabled):hover { background: rgb(255 255 255 / .06); }
+    .tile-cut:focus-visible { outline: 3px solid #22d3ee; outline-offset: -3px; }
+    .tile-cut [data-cut-state] { margin: .35rem; padding: .1rem .45rem; border-radius: .3rem; font-size: .7rem;
+      font-weight: 700; letter-spacing: .03em; text-transform: uppercase; background: rgb(15 23 42 / .8); color: #cbd5e1; }
+    .tile-cut.t-air [data-cut-state] { background: #dc2626; color: #fff; }
+    .tile-cut.t-switching [data-cut-state], .tile-cut.t-back [data-cut-state] { background: #d97706; color: #fff; }
+    .tile-cut.t-fallback [data-cut-state] { background: #7f1d1d; color: #fecaca; }
+    .tile-cut.t-pip [data-cut-state] { background: #2563eb; color: #fff; }
+    .tile-cut.t-ready [data-cut-state] { background: #16a34a; color: #fff; }
+    .webrtc-frame.f-air { border-color: #ef4444 !important; box-shadow: 0 0 0 2px #ef4444; }
+    .webrtc-frame.f-switching, .webrtc-frame.f-back { border-color: #f59e0b !important; }
+    .webrtc-frame.f-fallback { border-color: #b91c1c !important; }
+    .webrtc-frame.f-pip { border-color: #3b82f6 !important; }
+    .webrtc-frame.f-ready { border-color: #22c55e !important; }
     .cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .75rem; }
     @media (max-width: 640px) { .cut-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
     .match-cut-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: .5rem; }
@@ -699,6 +718,9 @@
           <div class="webrtc-frame border-2 border-slate-700" id="frame-{{ cam.id }}">
             <div class="preview-offline" data-offline="{{ cam.id }}">Camera offline</div>
             <iframe data-camera="{{ cam.id }}" data-preview="setup" data-src="http://{{ media_host }}:8889/{{ cam.id }}" allow="autoplay" loading="lazy"></iframe>
+            <button type="button" id="btn-cut-{{ cam.id }}" data-cut="{{ cam.id }}" data-tile onclick="switchCam('{{ cam.id }}')"
+                    aria-label="Put {{ cam.label }} on air (key {{ cam.key }})" title="Click: {{ cam.label }} on air (key {{ cam.key }})"
+                    data-base="tile-cut"><span data-cut-state>—</span></button>
           </div>
           <div data-phone-box="{{ cam.id }}" data-compact class="phone-status hidden items-center justify-between gap-1 text-xs mt-1">
             <span data-phone-info class="truncate text-slate-400"></span>
@@ -713,26 +735,14 @@
         {% endfor %}
       </div>
 
-      <!-- Tally / Cut Buttons -->
-      <div class="cut-grid mb-4">
-        {% for cam in cameras %}
-        <button id="btn-cut-{{ cam.id }}" data-cut="{{ cam.id }}" onclick="switchCam('{{ cam.id }}')" title="{{ cam.label }} (key {{ cam.key }})"
-                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center {{ 'report-cut' if cam.role == 'report' else '' }}">
-          <span class="truncate max-w-full px-1">{{ '🎤' if cam.role == 'report' else '🎥' }} <span data-cam-label="{{ cam.id }}">{{ cam.label }}</span></span>
-          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
-        </button>
-        {% endfor %}
-        <button id="btn-cut-replay" data-cut-replay onclick="cutToReplay()"
-                data-base="cut-btn btn-tally rounded-xl transition-all flex flex-col items-center justify-center">
-          <span>🎬 CAM REPLAY</span>
-          <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
-        </button>
-      </div>
-
       <!-- CAM REPLAY: pick any moment of the running recording -->
       <div id="replay-panel" class="bg-slate-900 rounded-lg p-3 border border-slate-700 mb-4 space-y-3">
         <div class="flex flex-wrap items-center gap-2">
-          <span class="text-sm font-semibold text-white">🎬 CAM REPLAY</span>
+          <button id="btn-cut-replay" data-cut-replay onclick="cutToReplay()" title="Put CAM REPLAY on air (key 0)"
+                  data-base="cut-btn rounded-lg px-3 py-2 font-bold transition-all flex items-center gap-2">
+            <span>🎬 CAM REPLAY</span>
+            <span data-cut-state class="text-xs font-semibold normal-case tracking-normal">—</span>
+          </button>
           <span data-bind="replay_status" class="text-sm text-slate-300"></span>
           <button data-when-replay-on onclick="backToLive()" class="live-btn hidden ml-auto">⏹ Back to live</button>
         </div>
@@ -2127,9 +2137,19 @@
         } else {
           look = 'bg-slate-700 text-slate-400'; label = 'Offline';
         }
-        btn.className = btn.dataset.base + ' ' + look;
         btn.disabled = secondary || (!publishing && cam !== state.selectedCam);
         btn.querySelector('[data-cut-state]').textContent = label;
+        if ('tile' in btn.dataset) {
+          // Preview tile: the frame colour and the label show the state, the video stays visible.
+          const kind = look.includes('pulse-live') ? 'switching' : look.includes('bg-brand-red') ? 'air'
+            : look.includes('bg-brand-amber') ? 'back' : look.includes('bg-red-950') ? 'fallback'
+            : look.includes('bg-brand-blue') ? 'pip' : look.includes('bg-brand-green') ? 'ready' : 'off';
+          btn.className = btn.dataset.base + ' t-' + kind;
+          const frame = document.getElementById('frame-' + cam);
+          ['air', 'switching', 'back', 'fallback', 'pip', 'ready'].forEach(k => frame.classList.toggle('f-' + k, k === kind));
+          return;
+        }
+        btn.className = btn.dataset.base + ' ' + look;
       });
       document.querySelectorAll('[data-cut-replay]').forEach(btn => {
         const r = state.replay || {};
@@ -2141,12 +2161,6 @@
         btn.className = btn.dataset.base + ' ' + look;
         btn.disabled = !r.available;
         btn.querySelector('[data-cut-state]').textContent = label;
-      });
-      CAMERA_IDS.forEach(c => {
-        const frame = document.getElementById('frame-' + c);
-        if (!frame) return;
-        frame.classList.toggle('border-red-500', c === state.activeCam);
-        frame.classList.toggle('border-slate-700', c !== state.activeCam);
       });
     }
 
