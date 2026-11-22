@@ -852,7 +852,7 @@
         <!-- Home Team -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Home Team</label>
-          <input id="home-name" type="text" maxlength="40" value="HOME" placeholder="Home team name"
+          <input id="home-name" type="text" maxlength="40" value="Home" placeholder="Home team name"
                  onchange="updateScoreboard()"
                  class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
           <div class="flex items-center justify-center gap-3">
@@ -866,7 +866,7 @@
         <!-- Away Team -->
         <div class="bg-slate-900 rounded-lg p-4 border border-slate-700">
           <label class="block text-xs text-slate-400 uppercase tracking-wider mb-2">Away Team</label>
-          <input id="away-name" type="text" maxlength="40" value="AWAY" placeholder="Away team name"
+          <input id="away-name" type="text" maxlength="40" value="Guest" placeholder="Guest team name"
                  onchange="updateScoreboard()"
                  class="w-full bg-slate-800 border border-slate-600 rounded px-3 py-2 text-sm text-white mb-3 focus:border-brand-cyan focus:outline-none font-semibold text-center">
           <div class="flex items-center justify-center gap-3">
@@ -885,7 +885,7 @@
         <div id="scoreboard-preview"
              class="bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900 rounded-lg px-6 py-3 text-center border border-slate-600">
           <span class="text-lg sm:text-2xl font-bold text-white tracking-wide font-mono">
-            HOME &nbsp; 0 - 0 &nbsp; AWAY &nbsp; | &nbsp; 00:00
+            Home &nbsp; 0 - 0 &nbsp; Guest &nbsp; | &nbsp; 00:00
           </span>
         </div>
       </div>
@@ -2579,7 +2579,7 @@
 
     async function renameTeam(team) {
       const input = document.getElementById(team + '-name');
-      const name = prompt(team === 'home' ? 'Home team name' : 'Away team name', input.value);
+      const name = prompt(team === 'home' ? 'Home team name' : 'Guest team name', input.value);
       if (name === null) return;
       input.value = name.trim().slice(0, 40);
       dirtyNames.add(input.id);
@@ -2794,8 +2794,8 @@
       bind('clock', clockStr);
 
       // Also update the scoreboard preview in real time
-      const homeName = document.getElementById('home-name').value.trim() || 'HOME';
-      const awayName = document.getElementById('away-name').value.trim() || 'AWAY';
+      const homeName = document.getElementById('home-name').value.trim() || 'Home';
+      const awayName = document.getElementById('away-name').value.trim() || 'Guest';
       renderScoreboardPreview(homeName, state.homeScore, awayName, state.awayScore, clockStr);
     }
 

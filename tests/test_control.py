@@ -146,7 +146,7 @@ class ApiTests(unittest.TestCase):
         page=self.client.get('/tally/cam1').get_data(as_text=True)
         self.assertIn('data.returning',page); self.assertIn('REPLAY ON AIR',page)
         a._write_scoreboard_file()
-        self.assertIn('HOME',Path(a.SCOREBOARD_PATH).read_text())
+        self.assertIn('Home',Path(a.SCOREBOARD_PATH).read_text())
         with patch.object(a,'play_replay',return_value=(True,'Replay on air (10 s)')) as replay:
             self.assertEqual(self.post('/api/replay',{'seconds':10,'speed':0.5}).status_code,200)
             replay.assert_called_once_with(10.0,0.5,marker=None,start=None,hold=False)
@@ -163,7 +163,7 @@ class ApiTests(unittest.TestCase):
         self.assertEqual(a._scoreboard['source'], 'score67')
         self.assertEqual(a._scoreboard['overlay_url'], 'https://score67.de/s/game/overlay?k=private')
         self.post('/api/scoreboard/update', {'source':'builtin', 'visible':True})
-        self.assertIn('HOME', Path(a.SCOREBOARD_PATH).read_text())
+        self.assertIn('Home', Path(a.SCOREBOARD_PATH).read_text())
 
     def test_scoreboard_visibility_preserves_match_and_persists(self):
         self.post('/api/scoreboard/update',{'home_score':3})
@@ -209,6 +209,28 @@ class ApiTests(unittest.TestCase):
         a._restore_match()
         self.assertFalse(a._clock['running'])
         self.assertAlmostEqual(a._clock_elapsed(),600,delta=2)
+
+    def test_defaults_and_old_match_starts_fresh(self):
+        self.assertEqual((a.DEFAULT_TEAM_NAMES['home_name'],a.DEFAULT_TEAM_NAMES['away_name']),('Home','Guest'))
+        self.post('/api/scoreboard/update',{'home_name':'','away_name':''})  # empty = default names
+        self.assertEqual((a._scoreboard['home_name'],a._scoreboard['away_name']),('Home','Guest'))
+        self.post('/api/scoreboard/update',{'home_name':'Polonia','away_name':'Hanseat','home_score':2,'away_score':1,
+                                            'source':'score67','overlay_url':'https://score67.de/s/game?k=x'})
+        self.post('/api/scoreboard/clock',{'action':'set','seconds':1500})
+        state=json.loads(a.MATCH_PATH.read_text())
+        state['saved_at']-=3600  # same match day: everything continues
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._restore_match()
+        self.assertEqual((a._scoreboard['home_name'],a._scoreboard['home_score'],a._scoreboard['away_score']),('Polonia',2,1))
+        state['saved_at']-=a.MATCH_RESTORE_MAX  # last week's match
+        a.MATCH_PATH.write_text(json.dumps(state))
+        a._scoreboard.update(home_name='Home',away_name='Guest',home_score=0,away_score=0,source='builtin',overlay_url='')
+        a._clock.update(elapsed=0.0,running=False,start_ts=None,half=1)
+        a._restore_match()
+        sb=a._scoreboard
+        self.assertEqual((sb['home_name'],sb['home_score'],sb['away_score'],sb['away_name']),('Home',0,0,'Guest'))
+        self.assertEqual(a._clock_elapsed(),0)
+        self.assertEqual((sb['source'],sb['overlay_url']),('score67','https://score67.de/s/game/overlay?k=x'))  # setup kept
 
     def test_paused_clock_stays_paused_after_restart(self):
         self.post('/api/scoreboard/clock',{'action':'set','seconds':600})

@@ -121,10 +121,11 @@ SCOREBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stati
 SCOREBOARD_PATH = os.path.join(SCOREBOARD_DIR, "scoreboard.txt")
 
 _scoreboard_lock = threading.RLock()
+DEFAULT_TEAM_NAMES = {"home_name": "Home", "away_name": "Guest"}
 _scoreboard = {
-    "home_name": "HOME",
+    "home_name": DEFAULT_TEAM_NAMES["home_name"],
     "home_score": 0,
-    "away_name": "AWAY",
+    "away_name": DEFAULT_TEAM_NAMES["away_name"],
     "away_score": 0,
     "visible": True,
     "source": "builtin",
@@ -532,7 +533,7 @@ def _match_title():
 
 
 def _match_moment():
-    """Match clock and score for a highlight, e.g. ("23:41", "HOME 1-0 AWAY")."""
+    """Match clock and score for a highlight, e.g. ("23:41", "Home 1-0 Guest")."""
     with _scoreboard_lock:
         sb = dict(_scoreboard)
         clock = _format_clock(_clock_elapsed())
@@ -943,8 +944,8 @@ def api_scoreboard_update():
         updates["visible"] = data["visible"]
     for field in ("home_name", "away_name"):
         if field in data:
-            # Team names are shown exactly as typed; empty falls back to HOME / AWAY.
-            updates[field] = text_field(data, field, 40) or field.split("_")[0].upper()
+            # Team names are shown exactly as typed; empty falls back to Home / Guest.
+            updates[field] = text_field(data, field, 40) or DEFAULT_TEAM_NAMES[field]
     for field in ("home_score", "away_score"):
         if field in data:
             value = data[field]
@@ -1102,6 +1103,9 @@ def api_encoder():
 RUNTIME_DIR = Path(__file__).resolve().parent / "data"
 MATCH_PATH = RUNTIME_DIR / "match.json"
 CLOCK_RESUME_MAX = 600  # seconds of downtime after which a running clock is not resumed
+# A saved match older than this is a finished one: the next start begins with Home 0:0 Guest
+# and a clock at 00:00. Within it (crash, laptop restart on match day) everything continues.
+MATCH_RESTORE_MAX = 6 * 3600
 _workers_stop = threading.Event()
 _init_lock = threading.Lock()
 _workers = []
@@ -1148,15 +1152,24 @@ def _restore_match():
         state.setdefault("visible", True)  # saved matches from before the visibility control
         if type(state["visible"]) is not bool:
             raise ValueError("Invalid persisted scoreboard visibility")
+        saved_at = state.get("saved_at")
+        fresh = type(saved_at) in (int, float) and math.isfinite(saved_at) and 0 <= time.time() - saved_at <= MATCH_RESTORE_MAX
+        half_length = state.get("half_length", 45)  # saved before half length existed
+        if type(half_length) is not int or not 10 <= half_length <= 60:
+            half_length = 45
         with _scoreboard_lock:
+            if not fresh:
+                # Old match: keep only the setup (scoreboard source, overlay, visibility, half length).
+                _scoreboard.update({key: state[key] for key in ("source", "overlay_url", "visible")})
+                _clock["half_length"] = half_length
+                log.info("Saved match is older than %d h: starting with %s 0:0 %s", MATCH_RESTORE_MAX // 3600,
+                         _scoreboard["home_name"], _scoreboard["away_name"])
+                return
             _scoreboard.update({key: state[key] for key in _scoreboard})
-            half_length = state.get("half_length", 45)  # saved before half length existed
-            if type(half_length) is not int or not 10 <= half_length <= 60:
-                half_length = 45
             # A clock that was running keeps running through a crash or restart: the match
             # went on. After a long gap (the laptop was put away) it stays paused instead.
-            saved_at, gap = state.get("saved_at"), None
-            if state.get("clock_running") is True and type(saved_at) in (int, float) and math.isfinite(saved_at):
+            gap = None
+            if state.get("clock_running") is True:
                 gap = time.time() - saved_at
             resume = gap is not None and 0 <= gap <= CLOCK_RESUME_MAX
             _clock.update(running=resume, elapsed=elapsed + (gap if resume else 0.0),
