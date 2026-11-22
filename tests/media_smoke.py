@@ -37,12 +37,14 @@ def run():
         m.ZMQ_ADDRESS = 'tcp://127.0.0.1:28799'
         m.recordings.RECORDINGS_DIR = Path(tmp) / 'recordings'
         m.AUDIO_SETTING = Path(tmp) / 'audio.json'  # never the real data/audio.json
+        m.CAMERA_SETTING = Path(tmp) / 'cameras.json'
+        m._camera_info.clear()
         def config():
             original_config()
             p = Path(m.MEDIAMTX_CONFIG)
             data = json.loads(p.read_text())
             data.update(apiAddress='127.0.0.1:29997', rtspAddress='127.0.0.1:28554',
-                        rtmpAddress='127.0.0.1:21935', hls=False, webrtc=False)
+                        rtmpAddress='127.0.0.1:21935', srtAddress='127.0.0.1:28890', hls=False, webrtc=False)
             p.write_text(json.dumps(data))
             return str(p)
         m.generate_mediamtx_config = config
@@ -369,6 +371,44 @@ def run():
             assert iso[0]['duration'] > 5 and abs(m.recordings._probe_duration(iso_file) - iso[0]['duration']) < 2, iso
             assert iso[0]['offset'] is not None and iso[0]['offset'] < 5, iso
             print(f"PASS: reporting camera recorded on its own: {iso[0]['duration']:.0f}s from {iso[0]['time']}", flush=True)
+            # SRT camera: H.265, encrypted; the other cameras keep running while its setting changes.
+            assert m.set_camera_info('cam6', protocol='srt', latency_ms=200, encrypt=True)[0]
+            time.sleep(1.5)  # MediaMTX reloads the changed configuration by itself
+            assert m.get_camera_status()['cam5'] and m.get_camera_status()['cam1']
+            passphrase = m._camera_info['cam6']['passphrase']
+            def srt_source(color, key, codec='libx265'):
+                url = (f"srt://127.0.0.1:28890?streamid=publish:cam6&latency=200000" + (f"&passphrase={key}" if key else ''))
+                return subprocess.Popen(['ffmpeg', '-hide_banner', '-loglevel', 'error', '-nostdin',
+                    '-re', '-f', 'lavfi', '-i', f'color=c={color}:s=1280x720:r=30',
+                    '-f', 'lavfi', '-i', 'sine=frequency=330:sample_rate=48000',
+                    '-c:v', codec, '-preset', 'ultrafast', '-g', '30', '-pix_fmt', 'yuv420p',
+                    '-c:a', 'aac', '-ac', '2', '-f', 'mpegts', url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            intruder = srt_source('white', 'wrong-passphrase-1')
+            time.sleep(3)
+            assert not m.get_camera_status().get('cam6'), 'a wrong passphrase must be refused'
+            intruder.kill(); intruder.wait()
+            sources.append(srt_source('yellow', passphrase))
+            wait(lambda: m.get_camera_status().get('cam6'))
+            wait(lambda: m.get_camera_inputs().get('cam6', {}).get('kbps') is not None, seconds=15)
+            info = m.get_camera_inputs()['cam6']
+            assert (info['protocol'], info['codec'], info['width'], info['height']) == ('srt', 'H265', 1280, 720), info
+            assert 'rtt_ms' in info and info.get('loss_pct', 0) < 1, info
+            print(f"PASS: encrypted SRT camera (H.265) arrives: {info}", flush=True)
+            assert m.start_recording('720p', 'SRT')[0]
+            wait(lambda: m.get_recording_status()['writing'])
+            assert m.switch_camera('cam6')[0], m.get_stream_status()
+            time.sleep(1.5)
+            centre = program_pixels()(80, 40)
+            assert centre[0] > 150 and centre[1] > 150 and centre[2] < 90, ('SRT camera on air (yellow)', centre)
+            assert 'cam6' in m.get_stream_status()['audio_on_air']
+            wait(lambda: m.get_recording_status()['iso'].get('cam6'), seconds=10)
+            assert m.switch_camera('cam1')[0]
+            print('PASS: cut to the SRT camera shows its picture and sound; it is recorded on its own', flush=True)
+            time.sleep(2)
+            srt_session = m.get_recording_status()['session']
+            assert m.stop_recording()[0]
+            wait(lambda: m.recordings.get(srt_session)['state'] == 'done', seconds=60)
+            assert {p['camera'] for p in m.recordings.get(srt_session)['iso']} >= {'cam6'}, m.recordings.get(srt_session)['iso']
             assert m.start_youtube_stream('cam3', '1080p')[0], m.get_stream_status()
             wait(lambda: m.get_stream_status()['state'] == 'live')
             probe = subprocess.run(['ffprobe', '-v', 'error', '-rtsp_transport', 'tcp', '-select_streams', 'v:0',

@@ -526,7 +526,7 @@
             <span id="net-firewall-status" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">Unknown</span>
           </div>
           <div id="net-firewall-details" class="text-xs text-slate-400 space-y-2">
-            <p>Ports required: 5000, 1935, 8888, 8889, 8189/UDP</p>
+            <p>Ports required: 5000, 1935, 8888, 8889, 8189/UDP, 8890/UDP (SRT cameras)</p>
           </div>
         </div>
       </div>
@@ -563,11 +563,35 @@
             🔊 Sound while in picture
           </label>
           {% endif %}
-          <code id="url-{{ cam.id }}" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-3 break-all select-all">rtmp://{{ media_host }}:1935/{{ cam.id }}{{ camera_query }}</code>
+          <div class="grid grid-cols-2 gap-2 mb-2 text-xs">
+            <div class="grid grid-cols-2 rounded-lg overflow-hidden border border-slate-600" role="group" aria-label="{{ cam.label }} protocol">
+              {% for proto in ['rtmp', 'srt'] %}
+              <button type="button" data-cam-protocol="{{ proto }}" data-cam="{{ cam.id }}" onclick="saveCameraInfo('{{ cam.id }}', 'protocol', '{{ proto }}')"
+                      class="py-1.5 font-semibold" title="{{ 'Simple, works with every camera app' if proto == 'rtmp' else 'Steadier on weak Wi-Fi, optional encryption, H.265 possible (Larix, Moblin, OBS)' }}">{{ proto|upper }}</button>
+              {% endfor %}
+            </div>
+            <select data-cam-edit="quality" data-cam="{{ cam.id }}" aria-label="{{ cam.label }} quality"
+                    onchange="saveCameraInfo('{{ cam.id }}', 'quality', this.value)" class="dest-input text-xs py-1">
+              {% for value, label in qualities %}<option value="{{ value }}" {{ 'selected' if value == cam.quality else '' }}>{{ label }}</option>{% endfor %}
+            </select>
+          </div>
+          <div data-srt-settings="{{ cam.id }}" class="hidden grid grid-cols-2 gap-2 mb-2 text-xs items-center">
+            <label class="flex items-center gap-1 text-slate-300" title="SRT resends lost packets within this delay. More delay = steadier on bad Wi-Fi, but later picture.">
+              Delay <input type="number" min="80" max="2000" step="20" data-cam-edit="latency_ms" data-cam="{{ cam.id }}" value="{{ cam.latency_ms }}"
+                     onchange="saveCameraInfo('{{ cam.id }}', 'latency_ms', parseInt(this.value, 10))" class="dest-input text-xs py-1 w-20"> ms
+            </label>
+            <label class="flex items-center gap-1 text-slate-300" title="The camera must know the passphrase; nobody else on the Wi-Fi can watch or send.">
+              <input type="checkbox" data-cam-edit="encrypt" data-cam="{{ cam.id }}" {{ 'checked' if cam.encrypt else '' }}
+                     onchange="saveCameraInfo('{{ cam.id }}', 'encrypt', this.checked)"> 🔒 Encrypt
+            </label>
+          </div>
+          <p class="text-xs text-slate-400 mb-1">Set in the app: <span data-cam-recommended="{{ cam.id }}"></span></p>
+          <code id="url-{{ cam.id }}" class="block text-xs text-brand-cyan bg-slate-800 rounded p-2 mb-2 break-all select-all">rtmp://{{ media_host }}:1935/{{ cam.id }}{{ camera_query }}</code>
+          <p data-cam-input="{{ cam.id }}" class="text-xs text-slate-400 mb-3 min-h-[1rem]"></p>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('{{ cam.id }}'))"
                     class="w-full bg-slate-700 hover:bg-slate-600 text-white font-medium py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1">
-              📋 Copy RTMP
+              📋 Copy link
             </button>
             <button onclick="showCameraQR('{{ cam.id }}')"
                     class="w-full bg-brand-blue hover:bg-blue-600 text-white font-semibold py-2 rounded-lg transition-colors text-xs flex items-center justify-center gap-1 shadow">
@@ -1137,13 +1161,16 @@
           </div>
         </div>
         <div>
-          <span class="text-slate-400 block mb-1">RTMP Stream URL (for Larix Broadcaster):</span>
+          <span id="qr-url-label" class="text-slate-400 block mb-1">RTMP Stream URL (for Larix Broadcaster):</span>
           <div class="flex items-center gap-1.5">
             <code id="qr-rtmp-url" class="flex-1 bg-slate-900 border border-slate-700 rounded px-2 py-1 font-mono text-brand-cyan truncate select-all"></code>
-            <button type="button" onclick="copyToClipboard(document.getElementById('qr-rtmp-url').textContent); showToast('📋 RTMP URL copied', 'info')"
+            <button type="button" onclick="copyToClipboard(document.getElementById('qr-rtmp-url').textContent); showToast('📋 Stream URL copied', 'info')"
                     class="bg-slate-700 hover:bg-slate-600 px-2.5 py-1 rounded text-white font-medium">Copy</button>
           </div>
         </div>
+        <!-- Apps with separate SRT fields (Larix: Connections → SRT) -->
+        <dl id="qr-srt-fields" class="hidden grid grid-cols-[auto_1fr] gap-x-2 gap-y-1 bg-slate-900 border border-slate-700 rounded p-2"></dl>
+        <p class="text-slate-300">📐 Set in the camera app: <strong id="qr-recommended"></strong></p>
       </div>
 
       <div class="pt-2 border-t border-slate-700">
@@ -1242,7 +1269,34 @@
 
     let cameraHost = location.hostname.includes(':') ? '[' + location.hostname + ']' : location.hostname;
     const cameraQuery = {{ camera_query | tojson }};
-    function cameraUrl(cam) { return 'rtmp://' + cameraHost + ':1935/' + cam + cameraQuery; }
+    function srtFields(cam) {
+      const c = camInfo(cam);
+      const fields = [['Server', `srt://${cameraHost}:${c.srt_port}`], ['Mode', 'Caller'], ['Stream ID', c.srt_stream_id],
+                      ['Latency', c.latency_ms + ' ms']];
+      if (c.encrypt) fields.push(['Passphrase', c.passphrase], ['Key length', 'any (AES-128 default)']);
+      return fields;
+    }
+    function cameraUrl(cam) {
+      const c = camInfo(cam);
+      if (c.protocol !== 'srt') return 'rtmp://' + cameraHost + ':1935/' + cam + cameraQuery;
+      // ffmpeg/OBS/Moblin style: latency in microseconds, the stream id URL-encoded.
+      return `srt://${cameraHost}:${c.srt_port}?streamid=${encodeURIComponent(c.srt_stream_id)}&latency=${c.latency_ms * 1000}`
+        + (c.encrypt ? '&passphrase=' + encodeURIComponent(c.passphrase) : '');
+    }
+    function recommendedText(cam) {
+      const r = camInfo(cam).recommended || {};
+      const codec = camInfo(cam).protocol === 'srt' ? 'H.264 or H.265' : 'H.264';
+      return `${r.size} · ${r.fps} fps · ${(r.kbps / 1000).toLocaleString()} Mbit/s · keyframe ${r.keyframe_s} s · ${codec}`;
+    }
+    function inputText(input) {
+      if (!input) return '';
+      const parts = [input.protocol.toUpperCase(), [input.codec, input.width ? input.width + '×' + input.height : ''].filter(Boolean).join(' ')];
+      if (input.kbps != null) parts.push((input.kbps / 1000).toFixed(1) + ' Mbit/s');
+      if (input.protocol === 'srt' && input.loss_pct != null) parts.push('loss ' + input.loss_pct + ' %');
+      if (input.protocol === 'srt' && input.rtt_ms != null) parts.push('RTT ' + input.rtt_ms + ' ms');
+      if (!input.audio) parts.push('no sound');
+      return '📥 ' + parts.filter(Boolean).join(' · ');
+    }
     function tallyUrl(cam) {
       const port = location.port ? ':' + location.port : '';
       return location.protocol + '//' + cameraHost + port + '/tally/' + cam;
@@ -1272,6 +1326,13 @@
       document.getElementById('qr-tally-url').textContent = qrUrl;
       document.getElementById('qr-tally-link').href = qrUrl;
       document.getElementById('qr-rtmp-url').textContent = rtmp;
+      const srt = camInfo(cam).protocol === 'srt';
+      document.getElementById('qr-url-label').textContent = srt
+        ? 'SRT Stream URL (OBS, Moblin, ffmpeg — or use the fields below):' : 'RTMP Stream URL (for Larix Broadcaster):';
+      const srtBox = document.getElementById('qr-srt-fields');
+      srtBox.classList.toggle('hidden', !srt);
+      srtBox.innerHTML = srt ? srtFields(cam).map(([k, v]) => `<dt class="text-slate-400">${esc(k)}</dt><dd class="font-mono text-brand-cyan break-all select-all">${esc(v)}</dd>`).join('') : '';
+      document.getElementById('qr-recommended').textContent = recommendedText(cam);
 
       const guide = document.getElementById('qr-network-guide');
       if (hotspot.active) {
@@ -1903,8 +1964,32 @@
       for (const cam of list) {
         document.querySelectorAll(`[data-cam-label="${cam.id}"]`).forEach(el => { el.textContent = cam.label; });
         document.querySelectorAll(`[data-cam-edit][data-cam="${cam.id}"]`).forEach(el => {
-          if (document.activeElement !== el) el.value = cam[el.dataset.camEdit];
+          if (document.activeElement === el) return;
+          if (el.type === 'checkbox') el.checked = !!cam[el.dataset.camEdit];
+          else el.value = cam[el.dataset.camEdit];
         });
+        document.querySelectorAll(`[data-cam-protocol][data-cam="${cam.id}"]`).forEach(el => {
+          const on = el.dataset.camProtocol === cam.protocol;
+          el.className = 'py-1.5 font-semibold ' + (on ? 'bg-brand-blue text-white' : 'bg-slate-700 text-slate-300');
+          el.setAttribute('aria-pressed', on);
+        });
+        document.querySelector(`[data-srt-settings="${cam.id}"]`)?.classList.toggle('hidden', cam.protocol !== 'srt');
+        const rec = document.querySelector(`[data-cam-recommended="${cam.id}"]`);
+        if (rec) rec.textContent = recommendedText(cam.id);
+        const url = document.getElementById('url-' + cam.id);
+        if (url) url.textContent = cameraUrl(cam.id);
+      }
+    }
+
+    function renderCameraInputs(inputs) {
+      for (const cam of CAMERA_IDS) {
+        const el = document.querySelector(`[data-cam-input="${cam}"]`);
+        if (!el) continue;
+        const input = inputs[cam];
+        el.textContent = input ? inputText(input) + (input.warning ? ' — ⚠ ' + input.warning : '') : '';
+        el.className = 'text-xs mb-3 min-h-[1rem] ' + (input && input.warning ? 'text-brand-amber font-semibold' : 'text-slate-400');
+        const badge = document.getElementById('mv-badge-' + cam);
+        if (badge && input) badge.title = inputText(input) + (input.warning ? ' — ' + input.warning : '');
       }
     }
 
@@ -2720,6 +2805,7 @@
     }
 
     renderChecklist();
+    renderCameraNames(CAMERAS);
 
     // ──────────────────────── Audio level meters ────────────────────────
     const meterDisplay = {};  // key -> {level, peak, peakAt}: smoothed fall-off and 1.5 s peak hold
@@ -3030,6 +3116,7 @@
       state.connectionLost = false;
       syncPreviews();
       if (data.camera_list) renderCameraNames(data.camera_list);
+      renderCameraInputs(data.camera_inputs || {});
       CAMERA_IDS.forEach(c => {
         const badge = document.getElementById('cam-badge-' + c);
         const mvBadge = document.getElementById('mv-badge-' + c);

@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import secrets
 import shutil
 import signal
 import subprocess
@@ -469,45 +470,192 @@ def _default_label(cam):
     return f"Cam {cam[3:]}"
 
 
+SRT_PORT = 8890
+PROTOCOLS = ("rtmp", "srt")
+SRT_LATENCY_MIN, SRT_LATENCY_MAX = 80, 2000   # ms; SRT resends lost packets within this delay
+# What to set in the camera app: resolution, frame rate, video bitrate (kbit/s). Keyframe
+# every second (our cuts start on one). Reporting cameras default lower: they move away
+# from the router, and six cameras share one Wi-Fi.
+QUALITIES = {"1080p": ("1920x1080", 30, 6000), "720p": ("1280x720", 30, 3000),
+             "720p-low": ("1280x720", 30, 1800), "480p": ("854x480", 30, 1000)}
+QUALITY_LABELS = {"1080p": "1080p · 6 Mbit/s", "720p": "720p · 3 Mbit/s",
+                  "720p-low": "720p · 1.8 Mbit/s (weak Wi-Fi)", "480p": "480p · 1 Mbit/s (very weak link)"}
+
+
+def _default_camera(cam):
+    return {"label": _default_label(cam), "position": "", "protocol": "rtmp", "latency_ms": 300,
+            "encrypt": False, "passphrase": "", "quality": "720p" if cam in REPORT_CAMERAS else "1080p"}
+
+
+def _clean_camera(cam, entry):
+    """A camera's settings with every field valid (bad or missing fields get the default)."""
+    clean = _default_camera(cam)
+    entry = entry if isinstance(entry, dict) else {}
+    label = str(entry.get("label") or "").strip()[:24]
+    clean["label"] = label or clean["label"]
+    clean["position"] = str(entry.get("position") or "").strip()[:40]
+    if entry.get("protocol") in PROTOCOLS:
+        clean["protocol"] = entry["protocol"]
+    if type(entry.get("latency_ms")) is int and SRT_LATENCY_MIN <= entry["latency_ms"] <= SRT_LATENCY_MAX:
+        clean["latency_ms"] = entry["latency_ms"]
+    passphrase = entry.get("passphrase")
+    if isinstance(passphrase, str) and re.fullmatch(r"[A-Za-z0-9_-]{10,79}", passphrase):
+        clean["passphrase"] = passphrase
+    clean["encrypt"] = entry.get("encrypt") is True and bool(clean["passphrase"])
+    if entry.get("quality") in QUALITIES:
+        clean["quality"] = entry["quality"]
+    return clean
+
+
 def load_camera_setting():
-    """The operator's camera names and field positions (e.g. "Left goal")."""
+    """The operator's camera settings: name, field position (e.g. "Left goal"), how the
+    camera sends (RTMP or SRT, SRT delay and encryption) and the quality to set in its app."""
     try:
         saved = json.loads(CAMERA_SETTING.read_text())
     except (OSError, ValueError):
         saved = {}
+    saved = saved if isinstance(saved, dict) else {}
     for cam in CAMERA_IDS:
-        entry = saved.get(cam) if isinstance(saved.get(cam), dict) else {}
-        label = str(entry.get("label") or "").strip()[:24]
-        position = str(entry.get("position") or "").strip()[:40]
-        _camera_info[cam] = {"label": label or _default_label(cam), "position": position}
+        _camera_info[cam] = _clean_camera(cam, saved.get(cam))
+
+
+def _srt_stream_id(cam):
+    password = camera_password()
+    return f"publish:{cam}:{CAMERA_USER}:{password}" if password else f"publish:{cam}"
 
 
 def get_cameras():
-    """Every camera with its role, name and field position, in display order."""
+    """Every camera with its role and settings, in display order. Holds SRT passphrases
+    and the camera password: for the logged-in dashboard only."""
     if not _camera_info:
         load_camera_setting()
-    return [{"id": c, "role": camera_role(c), "key": str(i + 1), **_camera_info[c],
-             "short": f"REP {REPORT_CAMERAS.index(c) + 1}" if c in REPORT_CAMERAS else f"CAM {c[3:]}"}
-            for i, c in enumerate(CAMERA_IDS)]
+    cams = []
+    for i, c in enumerate(CAMERA_IDS):
+        info = _camera_info[c]
+        size, fps, kbps = QUALITIES[info["quality"]]
+        cams.append({"id": c, "role": camera_role(c), "key": str(i + 1), **info,
+                     "short": f"REP {REPORT_CAMERAS.index(c) + 1}" if c in REPORT_CAMERAS else f"CAM {c[3:]}",
+                     "srt_port": SRT_PORT, "srt_stream_id": _srt_stream_id(c),
+                     "recommended": {"size": size, "fps": fps, "kbps": kbps, "keyframe_s": 1,
+                                     "label": QUALITY_LABELS[info["quality"]]}})
+    return cams
 
 
-def set_camera_info(cam, label=None, position=None):
+def set_camera_info(cam, label=None, position=None, protocol=None, latency_ms=None, encrypt=None,
+                    quality=None, new_passphrase=False):
+    """Change one camera's settings. Switching encryption (or a new passphrase) changes what
+    MediaMTX accepts for that camera: the running server reloads it, only that camera reconnects."""
     if cam not in CAMERA_IDS:
         return False, "Invalid camera"
+    if protocol is not None and protocol not in PROTOCOLS:
+        return False, "Protocol must be rtmp or srt"
+    if latency_ms is not None and (type(latency_ms) is not int or not SRT_LATENCY_MIN <= latency_ms <= SRT_LATENCY_MAX):
+        return False, f"SRT delay must be {SRT_LATENCY_MIN}-{SRT_LATENCY_MAX} ms"
+    if quality is not None and quality not in QUALITIES:
+        return False, "Unknown quality"
     if not _camera_info:
         load_camera_setting()
     with _lock:
         info = _camera_info[cam]
+        before = (info["encrypt"], info["passphrase"])
         if label is not None:
             info["label"] = str(label).strip()[:24] or _default_label(cam)
         if position is not None:
             info["position"] = str(position).strip()[:40]
+        if protocol is not None:
+            info["protocol"] = protocol
+        if latency_ms is not None:
+            info["latency_ms"] = latency_ms
+        if quality is not None:
+            info["quality"] = quality
+        if new_passphrase or (encrypt and not info["passphrase"]):
+            info["passphrase"] = secrets.token_urlsafe(12)  # 16 characters, SRT allows 10-79
+        if encrypt is not None:
+            info["encrypt"] = bool(encrypt)
+        reload = (info["encrypt"], info["passphrase"]) != before and (info["encrypt"] or before[0])
         data = {c: dict(v) for c, v in _camera_info.items()}
     CAMERA_SETTING.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = CAMERA_SETTING.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=1))
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds passphrases
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=1)
     os.replace(tmp, CAMERA_SETTING)
+    if reload and get_mediamtx_running():
+        generate_mediamtx_config()  # MediaMTX reloads a changed file by itself
+        return True, "Camera saved; an SRT camera reconnects with the new setting"
     return True, "Camera saved"
+
+
+_inputs = {}        # camera -> what arrives: protocol, codec, size, kbps, SRT loss/RTT
+_input_bytes = {}   # camera -> (monotonic, bytes received) for the bitrate
+_srt_stats = {}     # camera -> (packets received, packets lost) at the last look
+SOURCE_PROTOCOLS = {"rtmpConn": "rtmp", "rtmpSource": "rtmp", "srtConn": "srt", "srtSource": "srt",
+                    "rtspSession": "rtsp", "rtspsSession": "rtsp", "webRTCSession": "webrtc"}
+
+
+def _note_input(p, now):
+    """Record what a ready camera path receives (from the MediaMTX path list)."""
+    name = p["name"]
+    video = next((t for t in p.get("tracks2") or [] if t.get("codec") in VIDEO_CODECS), None)
+    props = (video or {}).get("codecProps") or {}
+    received = p.get("inboundBytes") or p.get("bytesReceived") or 0
+    entry = _inputs.setdefault(name, {})
+    entry.update(protocol=SOURCE_PROTOCOLS.get((p.get("source") or {}).get("type"), "other"),
+                 codec=(video or {}).get("codec") or "", width=props.get("width"), height=props.get("height"),
+                 audio=_camera_audio.get(name, False))
+    last = _input_bytes.get(name)
+    if last and now > last[0] and received >= last[1]:
+        kbps = (received - last[1]) * 8 / 1000 / (now - last[0])
+        entry["kbps"] = round(kbps if entry.get("kbps") is None else 0.5 * entry["kbps"] + 0.5 * kbps)
+    _input_bytes[name] = (now, received)
+
+
+def _update_srt_stats():
+    """Packet loss (before SRT's resends repaired it), round trip and buffer of SRT cameras."""
+    if not any(i.get("protocol") == "srt" for i in _inputs.values()):
+        return
+    try:
+        response = requests.get(f"{MEDIAMTX_API}/v3/srtconns/list", timeout=2)
+        response.raise_for_status()
+        items = response.json().get("items", [])
+    except (requests.RequestException, ValueError):
+        return
+    for conn in items:
+        cam = conn.get("path")
+        if conn.get("state") != "publish" or cam not in _inputs:
+            continue
+        received, lost = conn.get("packetsReceived") or 0, conn.get("packetsReceivedLoss") or 0
+        before = _srt_stats.get(cam)
+        if before and received > before[0] and lost >= before[1]:
+            fresh, missing = received - before[0], lost - before[1]
+            _inputs[cam]["loss_pct"] = round(100 * missing / (fresh + missing), 1)
+        _srt_stats[cam] = (received, lost)
+        _inputs[cam]["rtt_ms"] = round(conn.get("msRTT") or 0)
+        _inputs[cam]["drops"] = conn.get("packetsReceivedDrop") or 0  # arrived too late: lost for good
+
+
+def get_camera_inputs():
+    """Per publishing camera: protocol, codec, picture size, bitrate, SRT loss and round trip,
+    and a hint when it differs from what its settings recommend."""
+    if not _camera_info:
+        load_camera_setting()
+    result = {}
+    for cam, entry in list(_inputs.items()):
+        if not _camera_status.get(cam):
+            continue
+        info = dict(entry)
+        size, _, kbps = QUALITIES[_camera_info[cam]["quality"]]
+        notes = []
+        if info.get("kbps") is not None and info["kbps"] < kbps * 0.5:
+            notes.append(f"only {info['kbps'] / 1000:.1f} of {kbps / 1000:g} Mbit/s arrive")
+        if (info.get("loss_pct") or 0) >= 2:
+            notes.append(f"{info['loss_pct']:g} % packets lost on the way (weak Wi-Fi)")
+        if info.get("width") and f"{info['width']}x{info['height']}" != size \
+                and info["width"] < int(size.split("x")[0]):
+            notes.append(f"sends {info['width']}x{info['height']}, set {size} in the app")
+        info["warning"] = "; ".join(notes)
+        result[cam] = info
+    return result
 
 
 def generate_mediamtx_config():
@@ -520,7 +668,7 @@ def generate_mediamtx_config():
         "logLevel": "warn", "api": True, "apiAddress": "127.0.0.1:9997",
         "rtsp": True, "rtspAddress": "127.0.0.1:8554", "rtspTransports": ["tcp"],
         "rtmp": True, "rtmpAddress": ":1935", "hls": True, "hlsAddress": ":8888",
-        "webrtc": True, "webrtcAddress": ":8889", "srt": False, "moq": False,
+        "webrtc": True, "webrtcAddress": ":8889", "srt": True, "srtAddress": f":{SRT_PORT}", "moq": False,
         "authInternalUsers": [
             {"user": CAMERA_USER, "pass": password, "ips": [], "permissions": camera_publish}
             if password else {"user": "any", "ips": [], "permissions": camera_publish},
@@ -532,6 +680,12 @@ def generate_mediamtx_config():
         # (otherwise it is refused until MediaMTX times the dead one out).
         "paths": {c: {"overridePublisher": True} for c in CAMERA_IDS},
     }
+    # Encrypted SRT: the camera must know its passphrase (RTMP is not affected).
+    if not _camera_info:
+        load_camera_setting()
+    for cam in CAMERA_IDS:
+        if _camera_info[cam]["encrypt"]:
+            config["paths"][cam]["srtPublishPassphrase"] = _camera_info[cam]["passphrase"]
     program = {"alwaysAvailable": True}
     if _ensure_offline_card():
         program["alwaysAvailableFile"] = OFFLINE_CARD
@@ -553,17 +707,24 @@ def _paths():
     response = requests.get(f"{MEDIAMTX_API}/v3/paths/list", timeout=2)
     response.raise_for_status()
     items = response.json().get("items", [])
+    now = time.monotonic()
     for p in items:
         if p.get("name") in CAMERA_IDS:
             if p.get("ready"):
                 _camera_audio[p["name"]] = any(t in AUDIO_CODECS for t in p.get("tracks") or [])
-                _camera_source[p["name"]] = (p.get("source") or {}).get("id")
+                source = (p.get("source") or {}).get("id")
+                if _camera_source.get(p["name"]) != source:  # a new connection: fresh counters
+                    _inputs.pop(p["name"], None); _input_bytes.pop(p["name"], None); _srt_stats.pop(p["name"], None)
+                _camera_source[p["name"]] = source
+                _note_input(p, now)
             else:
                 _camera_audio.pop(p["name"], None)
                 _camera_source.pop(p["name"], None)
+                _inputs.pop(p["name"], None); _input_bytes.pop(p["name"], None); _srt_stats.pop(p["name"], None)
     for name in set(_camera_audio) - {p.get("name") for p in items}:
         _camera_audio.pop(name, None)
         _camera_source.pop(name, None)
+        _inputs.pop(name, None); _input_bytes.pop(name, None); _srt_stats.pop(name, None)
     return {p["name"]: bool(p.get("ready")) for p in items}
 
 
@@ -2362,6 +2523,7 @@ def _supervise_once():
         _camera_status = {c: paths.get(c, False) for c in CAMERA_IDS}
         _camera_status["program"] = paths.get(program_path(), False)
         _status_failures = 0
+        _update_srt_stats()
     except (requests.RequestException, ValueError, KeyError):
         # One missed answer from a running MediaMTX is not a camera outage: keep the last
         # status (marking everything offline stopped the meters and rebuilt the relay on air).

@@ -11,6 +11,7 @@ from unittest.mock import MagicMock, patch
 from test_control import ApiTests, EngineStateCase, m
 
 r = m.recordings
+REAL_GENERATE = m.generate_mediamtx_config
 
 
 class CameraListTests(unittest.TestCase):
@@ -244,6 +245,166 @@ class CameraApiTests(unittest.TestCase):
             self.post('/api/switch/cam4', {'source': 'auto'})
             cut.assert_called_with('cam4', source='auto')
         self.assertEqual(self.post('/api/switch/cam7', {}).status_code, 400)
+
+
+class CameraInputSettingTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / 'cameras.json'
+        self.enterContext(patch.object(m, 'CAMERA_SETTING', self.path))
+        self.enterContext(patch.object(m, '_camera_info', {}))
+        self.running = self.enterContext(patch.object(m, 'get_mediamtx_running', return_value=False))
+        self.config = self.enterContext(patch.object(m, 'generate_mediamtx_config'))
+
+    def cam(self, cam):
+        return next(c for c in m.get_cameras() if c['id'] == cam)
+
+    def test_defaults_rtmp_and_quality_by_role(self):
+        self.assertEqual((self.cam('cam1')['protocol'], self.cam('cam1')['quality']), ('rtmp', '1080p'))
+        self.assertEqual(self.cam('cam5')['quality'], '720p')
+        self.assertEqual(self.cam('cam5')['recommended'], {'size': '1280x720', 'fps': 30, 'kbps': 3000,
+                                                          'keyframe_s': 1, 'label': '720p · 3 Mbit/s'})
+
+    def test_srt_settings_are_validated_and_saved_privately(self):
+        self.assertTrue(m.set_camera_info('cam5', protocol='srt', latency_ms=500, quality='720p-low')[0])
+        self.assertFalse(m.set_camera_info('cam5', protocol='udp')[0])
+        self.assertFalse(m.set_camera_info('cam5', latency_ms=20)[0])
+        self.assertFalse(m.set_camera_info('cam5', latency_ms=500.5)[0])
+        self.assertFalse(m.set_camera_info('cam5', quality='4k')[0])
+        self.assertTrue(m.set_camera_info('cam5', encrypt=True)[0])
+        cam = self.cam('cam5')
+        self.assertEqual((cam['protocol'], cam['latency_ms'], cam['quality'], cam['encrypt']), ('srt', 500, '720p-low', True))
+        self.assertRegex(cam['passphrase'], r'^[A-Za-z0-9_-]{16}$')
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)  # holds the passphrase
+        m._camera_info.clear(); m.load_camera_setting()
+        self.assertEqual(self.cam('cam5')['passphrase'], cam['passphrase'])
+        # Switching encryption off keeps the passphrase for later; a new one on request.
+        m.set_camera_info('cam5', encrypt=False)
+        self.assertEqual(self.cam('cam5')['passphrase'], cam['passphrase'])
+        m.set_camera_info('cam5', new_passphrase=True)
+        self.assertNotEqual(self.cam('cam5')['passphrase'], cam['passphrase'])
+
+    def test_broken_saved_settings_fall_back_to_defaults(self):
+        self.path.write_text(json.dumps({'cam2': {'protocol': 'udp', 'latency_ms': 'x', 'encrypt': True,
+                                                  'passphrase': 'short', 'quality': '8k'}}))
+        m.load_camera_setting()
+        cam = self.cam('cam2')
+        self.assertEqual((cam['protocol'], cam['latency_ms'], cam['encrypt'], cam['quality']), ('rtmp', 300, False, '1080p'))
+
+    def test_encryption_change_reloads_the_running_server(self):
+        self.running.return_value = True
+        m.set_camera_info('cam5', label='Interview')
+        self.config.assert_not_called()  # a name change never touches MediaMTX
+        ok, message = m.set_camera_info('cam5', encrypt=True)
+        self.assertIn('reconnects', message)
+        self.config.assert_called_once()
+        m.set_camera_info('cam5', latency_ms=400)
+        self.assertEqual(self.config.call_count, 1)
+
+    def test_mediamtx_accepts_srt_and_checks_passphrases(self):
+        m.set_camera_info('cam6', encrypt=True)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(m, 'MEDIAMTX_CONFIG', tmp + '/mtx.yml'), \
+                patch.object(m, '_ensure_offline_card', return_value=False):
+            config = json.loads(Path(REAL_GENERATE()).read_text())
+        self.assertTrue(config['srt'])
+        self.assertEqual(config['srtAddress'], ':8890')
+        self.assertEqual(config['paths']['cam6']['srtPublishPassphrase'], self.cam('cam6')['passphrase'])
+        self.assertNotIn('srtPublishPassphrase', config['paths']['cam5'])
+
+    def test_stream_id_carries_the_camera_password(self):
+        with patch.object(m, 'camera_password', return_value=''):
+            self.assertEqual(self.cam('cam3')['srt_stream_id'], 'publish:cam3')
+        with patch.object(m, 'camera_password', return_value='pw'):
+            self.assertEqual(self.cam('cam3')['srt_stream_id'], 'publish:cam3:camera:pw')
+
+
+class CameraInputStatsTests(unittest.TestCase):
+    def setUp(self):
+        for name in ('_inputs', '_input_bytes', '_srt_stats', '_camera_audio', '_camera_source'):
+            self.enterContext(patch.object(m, name, {}))
+        self.enterContext(patch.object(m, '_camera_status', {'cam5': True}))
+        self.enterContext(patch.object(m, '_camera_info', {}))
+        self.enterContext(patch.object(m, 'CAMERA_SETTING', Path('/nonexistent/cameras.json')))
+
+    def path(self, received, source='s1'):
+        return {'name': 'cam5', 'ready': True, 'source': {'type': 'srtConn', 'id': source},
+                'tracks': ['H265', 'MPEG-4 Audio'], 'inboundBytes': received,
+                'tracks2': [{'codec': 'H265', 'codecProps': {'width': 1280, 'height': 720}},
+                            {'codec': 'MPEG-4 Audio', 'codecProps': {}}]}
+
+    def paths(self, *items):
+        response = MagicMock(); response.json.return_value = {'items': list(items)}
+        return patch.object(m.requests, 'get', return_value=response)
+
+    def srt(self, received, lost, rtt=12.4):
+        response = MagicMock()
+        response.json.return_value = {'items': [{'path': 'cam5', 'state': 'publish', 'packetsReceived': received,
+                                                 'packetsReceivedLoss': lost, 'msRTT': rtt, 'packetsReceivedDrop': 0}]}
+        return patch.object(m.requests, 'get', return_value=response)
+
+    def test_protocol_codec_size_bitrate_and_srt_loss(self):
+        with patch.object(m.time, 'monotonic', return_value=100.0), self.paths(self.path(0)):
+            m._paths()
+        with patch.object(m.time, 'monotonic', return_value=102.0), self.paths(self.path(750_000)):
+            m._paths()  # 750 kB in 2 s = 3000 kbit/s
+        with self.srt(1000, 0):
+            m._update_srt_stats()
+        with self.srt(1900, 100):
+            m._update_srt_stats()  # 100 lost of 1000 sent since the last look
+        cam = m.get_camera_inputs()['cam5']
+        self.assertEqual((cam['protocol'], cam['codec'], cam['width'], cam['height']), ('srt', 'H265', 1280, 720))
+        self.assertEqual((cam['kbps'], cam['loss_pct'], cam['rtt_ms'], cam['audio']), (3000, 10.0, 12, True))
+        self.assertIn('packets lost', cam['warning'])
+
+    def test_low_bitrate_and_small_picture_are_flagged(self):
+        m.load_camera_setting()
+        m._inputs['cam5'] = {'protocol': 'rtmp', 'codec': 'H264', 'width': 640, 'height': 360, 'kbps': 900, 'audio': True}
+        warning = m.get_camera_inputs()['cam5']['warning']
+        self.assertIn('only 0.9 of 3 Mbit/s', warning)
+        self.assertIn('set 1280x720 in the app', warning)
+
+    def test_reconnect_starts_fresh_counters(self):
+        with patch.object(m.time, 'monotonic', return_value=100.0), self.paths(self.path(5_000_000)):
+            m._paths()
+        with patch.object(m.time, 'monotonic', return_value=102.0), self.paths(self.path(1000, source='s2')):
+            m._paths()
+        self.assertIsNone(m._inputs['cam5'].get('kbps'))  # no negative or huge jump
+
+    def test_offline_camera_has_no_input(self):
+        m._inputs['cam5'] = {'protocol': 'srt'}
+        m._camera_status['cam5'] = False
+        self.assertEqual(m.get_camera_inputs(), {})
+
+
+class CameraLinkApiTests(unittest.TestCase):
+    setUp, post = ApiTests.setUp, ApiTests.post
+
+    def cams(self, **cam5):
+        cams = [dict(c) for c in m.get_cameras()]
+        cams[4].update(cam5)
+        import app as a
+        return patch.object(a, 'get_cameras', return_value=cams)
+
+    def test_tally_shows_the_srt_link_only_without_secrets(self):
+        import app as a
+        with self.cams(protocol='srt', latency_ms=400), patch.object(a, 'camera_password', return_value=''):
+            page = self.client.get('/tally/cam5').data.decode()
+        self.assertIn('srt://localhost:8890?streamid=publish%3Acam5&amp;latency=400000', page)
+        self.assertIn('REP 1', page)
+        self.assertIn('1280x720 · 30 fps · 3 Mbit/s', page)
+        with self.cams(protocol='srt', encrypt=True, passphrase='secretpassphrase'), patch.object(a, 'camera_password', return_value=''):
+            page = self.client.get('/tally/cam5').data.decode()
+        self.assertNotIn('secretpassphrase', page)
+        self.assertNotIn('srt://', page)
+
+    def test_settings_api_validates_types(self):
+        import app as a
+        with patch.object(a, 'set_camera_info', return_value=(True, 'Camera saved')) as save:
+            self.assertEqual(self.post('/api/cameras/cam5', {'protocol': 'srt', 'latency_ms': 400, 'encrypt': True}).status_code, 200)
+            save.assert_called_with('cam5', protocol='srt', latency_ms=400, encrypt=True)
+            self.assertEqual(self.post('/api/cameras/cam5', {'latency_ms': '400'}).status_code, 400)
+            self.assertEqual(self.post('/api/cameras/cam5', {'encrypt': 'yes'}).status_code, 400)
+        self.assertEqual(self.client.post('/api/cameras/cam5', json={'protocol': 'srt'}).status_code, 401)
 
 
 del ApiTests, EngineStateCase  # run the imported base tests once, in their own module

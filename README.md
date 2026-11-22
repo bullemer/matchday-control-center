@@ -125,7 +125,7 @@ so try a real stream before relying on a slower laptop.
 
 ## Media pipeline and recovery
 
-Camera phones publish RTMP to `cam1`…`cam6`. A relay normalizes the
+Camera phones publish RTMP (port 1935) or SRT (UDP 8890) to `cam1`…`cam6`. A relay normalizes the
 selected camera to H.264 at the stream resolution and stereo 48 kHz AAC on `program`. MediaMTX 1.21.2's
 always-available program path supplies fallback video and silence when that publisher
 is absent. A separate encoder reads the continuous program over loopback RTSP,
@@ -150,6 +150,31 @@ destination and the recorder copy it from there.
   "🎤 Reporting cameras" with their start time in the match recording.
 - **Names and positions** of all cameras are edited on their cards in 🎥 Cams.
 - GO LIVE starts on a match camera; a reporting camera only if no match camera publishes.
+
+### Camera input settings (RTMP or SRT)
+
+Each camera card in 🎥 Cams has:
+
+- **RTMP / SRT** — which link the card, QR dialog and tally page show. Both are always
+  accepted. RTMP works with every camera app. SRT (Larix Broadcaster, Moblin, OBS,
+  ffmpeg) is steadier on weak Wi-Fi: it resends lost packets within a fixed **delay**
+  (80–2000 ms, default 300; more = steadier but later picture) and allows H.265.
+  SRT link: `srt://<laptop>:8890?streamid=publish:camN[:camera:<password>]&latency=<µs>`;
+  the QR dialog also lists the separate fields (server, stream ID, latency, passphrase).
+- **🔒 Encrypt** (SRT) — the camera must send with the generated passphrase (AES); others
+  are refused. Changing it reloads MediaMTX: only that camera reconnects.
+- **Quality** — what to set in the camera app (resolution, 30 fps, bitrate, keyframe 1 s),
+  shown on the card, in the QR dialog and on the tally page. Defaults: match cameras
+  1080p · 6 Mbit/s, reporting cameras 720p · 3 Mbit/s.
+- **📥 Input line** — what actually arrives: protocol, codec, picture size, bitrate, and
+  for SRT the packet loss (before resends) and round trip. Amber with a hint when the
+  bitrate is under half the recommended one, more than 2 % packets are lost, or the
+  picture is smaller than recommended.
+
+Settings are saved in `data/cameras.json` (mode 0600: it holds passphrases). The tally
+page (no login) never shows a link that contains a password or passphrase. H.265
+cameras may not show in the browser preview on every device; cuts, recording and the
+stream are not affected.
 
 ## Streaming destinations
 

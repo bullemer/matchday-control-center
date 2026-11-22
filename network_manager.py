@@ -14,7 +14,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 REQUIRED_TCP_PORTS = [5000, 1935, 8888, 8889]
-REQUIRED_UDP_PORTS = [8189]
+REQUIRED_UDP_PORTS = [8189, 8890]  # WebRTC previews, SRT cameras
 DEFAULT_HOTSPOT_IP = "10.42.0.1"
 PROFILE = "Matchday-Control-Hotspot"
 PROFILE_FILE = Path(__file__).resolve().parent / "data/hotspot-uuid"
@@ -314,7 +314,7 @@ def _firewall_commands(network, tool):
     hotspot = network.get("camera_mode") == "hotspot"
     iface = network.get("hotspot_iface") if hotspot else network.get("lan_iface")
     if tool == "firewalld":
-        return ["sudo firewall-cmd --permanent --add-port={5000,1935,8888,8889}/tcp --add-port=8189/udp",
+        return ["sudo firewall-cmd --permanent --add-port={5000,1935,8888,8889}/tcp --add-port={8189,8890}/udp",
                 "sudo firewall-cmd --reload"]
     if not iface:
         return []
@@ -322,7 +322,7 @@ def _firewall_commands(network, tool):
         # Hotspot phones also need DHCP/DNS from the laptop, and forwarding for internet.
         return [f"sudo ufw allow in on {iface}", f"sudo ufw route allow in on {iface}"]
     return [f"sudo ufw allow in on {iface} to any port 5000,1935,8888,8889 proto tcp",
-            f"sudo ufw allow in on {iface} to any port 8189 proto udp"]
+            f"sudo ufw allow in on {iface} to any port 8189,8890 proto udp"]
 
 
 def get_firewall_status(network=None):

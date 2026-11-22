@@ -48,7 +48,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           add_replay_listener, REPLAY_MARGIN, set_hardware_encoding, load_encoder_setting,
                           resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
                           start_monitor_worker, get_cameras, set_camera_info, load_camera_setting,
-                          REPORT_CAMERAS)
+                          REPORT_CAMERAS, get_camera_inputs, QUALITY_LABELS)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -259,7 +259,8 @@ def index():
     destinations = [(name, label, default()) for name, (label, default, _) in DESTINATIONS.items()]
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
     return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
-                           camera_query=_camera_query(), cameras=get_cameras())
+                           camera_query=_camera_query(), cameras=get_cameras(),
+                           qualities=list(QUALITY_LABELS.items()))
 
 
 @app.route("/tally/<cam_id>")
@@ -270,8 +271,20 @@ def tally_page(cam_id):
     host = urlsplit(request.host_url).hostname or "localhost"
     if ":" in host:
         host = f"[{host}]"
-    title = next(c["short"] for c in get_cameras() if c["id"] == cam_id)  # "CAM 1", "REP 1"
-    return render_template("tally.html", cam_id=cam_id, title=title, media_host=host, show_url=not camera_password())
+    cam = next(c for c in get_cameras() if c["id"] == cam_id)
+    r = cam["recommended"]
+    recommended = (f"{r['size']} · {r['fps']} fps · {r['kbps'] / 1000:g} Mbit/s · keyframe {r['keyframe_s']} s · "
+                   + ("H.264 or H.265" if cam["protocol"] == "srt" else "H.264"))
+    if cam["protocol"] == "srt":
+        # Never the stream id with the camera password: this page needs no login.
+        stream_url = (f"srt://{host}:{cam['srt_port']}?streamid={quote('publish:' + cam_id, safe='')}"
+                      f"&latency={cam['latency_ms'] * 1000}")
+    else:
+        stream_url = f"rtmp://{host}:1935/{cam_id}"
+    # The tally page needs no login: never show a link holding a password or passphrase.
+    show_url = not camera_password() and not cam["encrypt"]
+    return render_template("tally.html", cam_id=cam_id, title=cam["short"], media_host=host, show_url=show_url,
+                           protocol=cam["protocol"], stream_url=stream_url, recommended=recommended)
 
 
 @app.route("/api/tally/<cam_id>")
@@ -332,6 +345,7 @@ def api_status():
         "network": network,
         "cameras": cameras,
         "camera_list": get_cameras(),
+        "camera_inputs": get_camera_inputs(),
         "mediamtx": mediamtx,
         "stream": stream,
         "scoreboard": scoreboard,
@@ -747,13 +761,29 @@ def api_layout():
 @app.route("/api/cameras/<cam_id>", methods=["POST"])
 @api_endpoint
 def api_camera_info(cam_id):
-    """Rename a camera or set its field position (e.g. "Left goal")."""
+    """Camera settings: label (name), position (e.g. "Left goal"), protocol (rtmp/srt),
+    latency_ms (SRT delay), encrypt (SRT passphrase on/off), new_passphrase, quality."""
     if cam_id not in CAMERA_IDS:
         return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
     data = request.get_json(force=True, silent=True) or {}
-    label = text_field(data, "label", 24, None) if "label" in data else None
-    position = text_field(data, "position", 40, None) if "position" in data else None
-    ok, message = set_camera_info(cam_id, label, position)
+    fields = {}
+    if "label" in data:
+        fields["label"] = text_field(data, "label", 24)
+    if "position" in data:
+        fields["position"] = text_field(data, "position", 40)
+    for name in ("protocol", "quality"):
+        if name in data:
+            fields[name] = text_field(data, name, 10)
+    if "latency_ms" in data:
+        if type(data["latency_ms"]) is not int:
+            raise ValueError("latency_ms must be a whole number of milliseconds")
+        fields["latency_ms"] = data["latency_ms"]
+    for name in ("encrypt", "new_passphrase"):
+        if name in data:
+            if type(data[name]) is not bool:
+                raise ValueError(f"{name} must be true or false")
+            fields[name] = data[name]
+    ok, message = set_camera_info(cam_id, **fields)
     return jsonify(ok=ok, message=message, cameras=get_cameras()), 200 if ok else 400
 
 

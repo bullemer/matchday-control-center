@@ -819,3 +819,45 @@ test('four match and two reporting cameras: cut row, keys, layout rule and camer
   await saved;
   expect(errors).toEqual([]);
 });
+
+test('camera input settings: SRT with delay and encryption, recommended quality, live input line', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('[data-tab-btn="cams"]').click();
+  const card = page.locator('[data-camera-card="cam5"]');
+  await expect(card.locator('[data-cam-recommended]')).toHaveText('1280x720 · 30 fps · 3 Mbit/s · keyframe 1 s · H.264');
+  await expect(page.locator('#url-cam5')).toHaveText(/^rtmp:\/\/.*:1935\/cam5\?user=camera&pass=browser-camera$/);
+  await expect(card.locator('[data-srt-settings]')).toBeHidden();
+  await card.getByRole('button', {name: 'SRT'}).click();
+  await expect(card.locator('[data-srt-settings]')).toBeVisible();
+  await expect(page.locator('#url-cam5')).toHaveText(/^srt:\/\/.*:8890\?streamid=publish%3Acam5%3Acamera%3Abrowser-camera&latency=300000$/);
+  await card.locator('[data-cam-edit="latency_ms"]').fill('500');
+  await card.locator('[data-cam-edit="latency_ms"]').press('Tab');
+  await expect(page.locator('#url-cam5')).toHaveText(/latency=500000$/);
+  await card.locator('[data-cam-edit="encrypt"]').check();
+  await expect(page.locator('#url-cam5')).toHaveText(/&passphrase=[A-Za-z0-9_-]{16}$/);
+  await card.locator('[data-cam-edit="quality"]').selectOption('720p-low');
+  await expect(card.locator('[data-cam-recommended]')).toHaveText('1280x720 · 30 fps · 1.8 Mbit/s · keyframe 1 s · H.264 or H.265');
+  // The QR dialog lists the separate SRT fields for apps like Larix.
+  await card.getByRole('button', {name: /Tally/}).click();
+  const fields = page.locator('#qr-srt-fields');
+  await expect(fields).toBeVisible();
+  await expect(fields).toContainText('Stream ID');
+  await expect(fields).toContainText('publish:cam5:camera:browser-camera');
+  await expect(fields).toContainText('500 ms');
+  await expect(fields).toContainText('Passphrase');
+  await expect(page.locator('#qr-recommended')).toContainText('1.8 Mbit/s');
+  await page.locator('#qr-dialog').getByRole('button', {name: 'Done'}).click();
+  // What actually arrives from a publishing camera.
+  await expect(page.locator('[data-cam-input="cam1"]')).toHaveText('📥 SRT · H265 1920×1080 · 5.8 Mbit/s · loss 0.4 % · RTT 9 ms');
+  // Back to RTMP: the SRT fields hide again; settings survive a reload.
+  await page.reload();
+  await page.locator('[data-tab-btn="cams"]').click();
+  await expect(page.locator('#url-cam5')).toHaveText(/^srt:/);
+  await card.getByRole('button', {name: 'RTMP'}).click();
+  await expect(card.locator('[data-srt-settings]')).toBeHidden();
+  await expect(page.locator('#url-cam5')).toHaveText(/^rtmp:/);
+  expect(errors).toEqual([]);
+});

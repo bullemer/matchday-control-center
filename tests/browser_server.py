@@ -55,7 +55,12 @@ def replay_calls():
 a.start_recording=lambda profile,title='': (recording.update(active=True) or True,'Recording starting')
 a.stop_recording=lambda: (recording.update(active=False) or True,'Recording stopped; saving the file')
 a.switch_camera=lambda camera, source='manual': (False,'Camera unavailable')
-a.set_camera_info=lambda cam, label=None, position=None: (True,'Camera saved')
+# Real camera settings, saved in a throwaway folder; MediaMTX is never touched.
+import media_engine as m
+m.CAMERA_SETTING=Path(tempfile.mkdtemp())/'cameras.json'
+m.get_mediamtx_running=lambda: False
+a.get_camera_inputs=lambda: {'cam1':{'protocol':'srt','codec':'H265','width':1920,'height':1080,'kbps':5800,
+                                     'loss_pct':0.4,'rtt_ms':9,'audio':True,'warning':''}}
 a.set_audio_source=lambda mode: (True,'Audio updated')
 mic_delay=[]
 a.set_mic_delay=lambda ms: (mic_delay.append(ms) or True,f'Microphone delay {ms/1000:.1f} s')  # never the real data/audio.json
