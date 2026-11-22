@@ -1,3 +1,4 @@
+import subprocess
 import base64
 import copy
 import io
@@ -774,6 +775,10 @@ class MediaTests(unittest.TestCase):
             self.assertTrue(config['paths']['program']['alwaysAvailable'])
             self.assertEqual(config['paths']['program']['alwaysAvailableFile'],tmp+'/offline.mp4')  # our card, not "STREAM IS OFFLINE"
             self.assertTrue(Path(tmp,'offline.mp4').stat().st_size>0)
+            # no B-frames: browsers cannot play them over WebRTC (program preview would spin)
+            probe=subprocess.run(['ffprobe','-v','error','-select_streams','v','-show_entries','stream=has_b_frames',
+                                  '-of','csv=p=0',tmp+'/offline.mp4'],capture_output=True,text=True)
+            self.assertEqual(probe.stdout.strip(),'0')
             users=config['authInternalUsers']
             self.assertEqual((users[0]['user'],users[0]['pass']),('camera','cam-secret'))
             self.assertEqual(users[0]['permissions'],[{'action':'publish','path':'~^(cam1|cam2|cam3|cam4|cam5|cam6)$'}])

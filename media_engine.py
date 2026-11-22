@@ -98,7 +98,9 @@ _relay_zmq = None        # live-volume control address of the running relay
 _relay_slot = 0
 # Shown by MediaMTX while program has no publisher (and for a frame or two at a handover)
 # instead of its "STREAM IS OFFLINE" segment.
-OFFLINE_CARD = str(BASE / "data/offline.mp4")
+# v2: without B-frames. WebRTC cannot play B-frames, so the browser preview of the program
+# spun forever until the first cut. A new name makes existing installs create the new card.
+OFFLINE_CARD = str(BASE / "data/offline-v2.mp4")
 CAMERA_USER = "camera"
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
@@ -431,7 +433,7 @@ def _ensure_offline_card():
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x101418:s=1280x720:r=30:d=0.5",
                         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-vf",
                         "drawtext=text='Back in a moment':fontcolor=white:fontsize=48:x=(w-tw)/2:y=(h-th)/2",
-                        "-t", "0.5", "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p", "-g", "15",
+                        "-t", "0.5", "-c:v", "libx264", "-preset", "veryfast", "-bf", "0", "-pix_fmt", "yuv420p", "-g", "15",
                         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", OFFLINE_CARD + ".tmp.mp4"],
                        check=True, capture_output=True, timeout=30)
         os.replace(OFFLINE_CARD + ".tmp.mp4", OFFLINE_CARD)
