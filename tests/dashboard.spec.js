@@ -327,7 +327,8 @@ test('offline cameras show a neutral placeholder and load previews only when onl
   }
   await page.locator('#frame-cam1').screenshot({path:'/tmp/mcc-offline-camera.png'});
   online=true;
-  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /cam1$/);
+  // The fake server reports cam1 as an H.265 SRT camera: browsers get the H.264 preview copy.
+  await expect(page.locator('iframe[data-camera="cam1"]')).toHaveAttribute('src', /cam1_preview$/);
   await expect(page.locator('[data-offline="cam1"]')).toBeHidden();
   online=false;
   await expect(page.locator('[data-offline="cam1"]')).toBeVisible();
