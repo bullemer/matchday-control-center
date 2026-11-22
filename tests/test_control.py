@@ -301,7 +301,8 @@ class ApiTests(unittest.TestCase):
             page=self.client.get('/',headers=self.headers).get_data(as_text=True)
             tally=self.client.get('/tally/cam1').get_data(as_text=True)
         self.assertNotIn('pass=',page.split('cameraQuery =')[1][:40])
-        self.assertIn('RTMP Publishing URL',tally)
+        self.assertIn('SRT Publishing URL',tally)   # SRT is the default protocol
+        self.assertIn('streamid=publish%3Acam1&amp;latency',tally)  # no password in the stream id
 
     def test_camera_links_carry_the_password_only_behind_login(self):
         page=self.client.get('/',headers=self.headers).get_data(as_text=True)

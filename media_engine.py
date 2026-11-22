@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from browser_overlay import FRAME_PATH, ensure_frame
 import recordings
+import settings_store
 
 import hashlib
 import collections
@@ -458,8 +459,11 @@ def program_path():
 
 
 def camera_password():
-    """Password for publishing a camera; empty (the default) means no password."""
-    return os.environ.get("MCC_CAMERA_PASSWORD", "")
+    """Password for publishing a camera; empty (the default) means no password.
+    MCC_CAMERA_PASSWORD wins over the Settings tab."""
+    if "MCC_CAMERA_PASSWORD" in os.environ:
+        return os.environ["MCC_CAMERA_PASSWORD"]
+    return settings_store.get("camera_password")
 
 
 def camera_role(cam):

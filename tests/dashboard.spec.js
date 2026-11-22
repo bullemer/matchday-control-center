@@ -976,3 +976,60 @@ test('AI Director tab: switch on, scores, best camera and thumbnails', async ({p
   await page.screenshot({path:'/tmp/mcc-ai-director.png', fullPage:true});
   expect(errors).toEqual([]);
 });
+
+test('Settings tab: match defaults, new match, camera password, storage and login checks', async ({page}) => {
+  const errors=[];
+  page.on('pageerror', error => errors.push(error.message));
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  await page.locator('[data-tab-btn="settings"]').click();
+  await expect(page.locator('#set-home')).toHaveValue('Home');
+  await expect(page.locator('#set-away')).toHaveValue('Guest');
+  await expect(page.locator('#set-half')).toHaveValue('45');
+  await expect(page.locator('#set-profile')).toHaveValue('720p');
+  await expect(page.locator('#set-user')).toHaveValue('operator');
+  await expect(page.locator('#set-recinfo')).toContainText('GB free');
+  // Match defaults, then a new match with them.
+  await page.locator('#set-home').fill('Polonia');
+  await page.locator('#set-half').fill('40');
+  const saved = page.waitForRequest(r => r.url().endsWith('/api/settings') && r.method() === 'POST' && r.postDataJSON().home_name === 'Polonia');
+  await page.locator('#settings-match').getByRole('button', {name: 'Save defaults'}).click();
+  expect((await saved).postDataJSON().half_length).toBe(40);
+  await expect(page.locator('#toast-container')).toContainText('Settings saved');
+  page.once('dialog', dialog => dialog.accept());
+  await page.locator('#settings-match').getByRole('button', {name: /Start a new match now/}).click();
+  await expect(page.locator('#toast-container')).toContainText('New match: Polonia 0:0 Guest');
+  // Out-of-range numbers are stopped by the browser; the server refuses what slips through, with the reason.
+  await page.locator('#set-half').fill('90');
+  expect(await page.locator('#set-half').evaluate(el => el.checkValidity())).toBe(false);
+  await page.locator('#set-half').fill('40');
+  await page.locator('#set-recdir').fill('relative/folder');
+  await page.locator('#settings-storage').getByRole('button', {name: 'Save storage'}).click();
+  await expect(page.locator('#toast-container')).toContainText('Recording folder: an absolute path');
+  // Camera password: this test server sets it by environment variable, so the field is locked
+  // with the reason (saving it is covered by the unit tests).
+  await expect(page.locator('[data-settings-locked="camera"]')).toBeVisible();
+  await expect(page.locator('#set-campw')).toBeDisabled();
+  await expect(page.locator('#settings-camera').getByRole('button', {name: /Generate/})).toBeDisabled();
+  expect(await page.evaluate(() => generatePassword())).toMatch(/^[A-Za-z0-9]{16}$/);
+  // Storage: a new folder is created.
+  const folder = `/tmp/mcc-browser-settings-${Date.now()}`;
+  await page.locator('#set-recdir').fill(folder);
+  await page.locator('#settings-storage').getByRole('button', {name: 'Save storage'}).click();
+  await expect(page.locator('#set-recinfo')).toContainText(`Recording into ${folder}`);
+  await page.locator('#set-recdir').fill('');
+  await page.locator('#settings-storage').getByRole('button', {name: 'Save storage'}).click();
+  await expect(page.locator('#set-recinfo')).not.toContainText(folder);
+  // Login: mismatched or wrong passwords are refused (a successful change would lock out this test run).
+  await page.locator('#set-current').fill('browser-test');
+  await page.locator('#set-new').fill('NewPassword1');
+  await page.locator('#set-new2').fill('NewPassword2');
+  await page.locator('#settings-login').getByRole('button', {name: 'Change login'}).click();
+  await expect(page.locator('#toast-container')).toContainText('do not match');
+  await page.locator('#set-current').fill('wrong');
+  await page.locator('#set-new2').fill('NewPassword1');
+  await page.locator('#settings-login').getByRole('button', {name: 'Change login'}).click();
+  await expect(page.locator('#toast-container')).toContainText('current password is wrong');
+  await page.screenshot({path:'/tmp/mcc-settings.png', fullPage:true});
+  expect(errors).toEqual([]);
+});

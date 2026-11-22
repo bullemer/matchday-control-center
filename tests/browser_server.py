@@ -59,6 +59,10 @@ a.switch_camera=lambda camera, source='manual': (False,'Camera unavailable')
 import media_engine as m
 m.CAMERA_SETTING=Path(tempfile.mkdtemp())/'cameras.json'
 m.get_mediamtx_running=lambda: False
+# The app module imported these by name: patch its copies too, or a test could rewrite the
+# configuration of a real MediaMTX running on this laptop.
+a.get_mediamtx_running=lambda: False
+a.generate_mediamtx_config=lambda: None
 a.get_camera_inputs=lambda: {'cam1':{'protocol':'srt','codec':'H265','width':1920,'height':1080,'kbps':5800,
                                      'loss_pct':0.4,'rtt_ms':9,'audio':True,'warning':''}}
 # cam1 is a Chameleon Stream phone that reports battery / temperature and allows remote zoom.
@@ -163,4 +167,6 @@ if True:
     a.SCOREBOARD_PATH=tmp+'/scoreboard.txt'
     a.MATCH_PATH=Path(tmp)/'match.json'
     a._keys_path=lambda: Path(tmp)/'stream-keys.json'  # never the real saved keys
+    a.settings_store.PATH=Path(tmp)/'settings.json'   # never the real settings
+    a.RUNTIME_DIR=Path(tmp)                            # login changes never touch the real login files
     a.app.run(host='127.0.0.1',port=25000,threaded=True)

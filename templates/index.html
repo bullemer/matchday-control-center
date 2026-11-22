@@ -23,6 +23,7 @@
       border: 1px solid #475569; border-radius: 1rem; background: #1e293b; color: #fff; }
     #fence-editor::backdrop { background: rgb(0 0 0 / .65); }
     #fence-box { cursor: crosshair; }
+    section[data-tab="settings"] :disabled { opacity: .45; cursor: not-allowed; }
     #clock-editor input { min-width: 0; }
     #clock-editor label { min-width: 0; }
     body.match-mode main { padding-top: .5rem; }
@@ -365,6 +366,7 @@
       <button type="button" class="tab-btn" role="tab" data-tab-btn="recordings" onclick="selectTab('recordings')">🎬 Recordings</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="director" onclick="selectTab('director')">🤖 AI Director</button>
       <button type="button" class="tab-btn" role="tab" data-tab-btn="checklist" onclick="selectTab('checklist')">✅ Checklist</button>
+      <button type="button" class="tab-btn" role="tab" data-tab-btn="settings" onclick="selectTab('settings')">⚙️ Settings</button>
     </nav>
 
     <!-- ─────────────────────────────────────────────────────────────────
@@ -1004,7 +1006,7 @@
       <div class="space-y-4">
         <div class="flex flex-wrap items-center gap-2">
           <label for="quality-profile" class="text-sm text-slate-400">Quality</label>
-          <select id="quality-profile" aria-label="Stream quality" onchange="renderDestinations()" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600"><option value="1080p">1080p Full HD · 6 Mbps</option><option value="720p" selected>720p · 4 Mbps</option><option value="480p">480p · 1.8 Mbps</option></select>
+          <select id="quality-profile" aria-label="Stream quality" onchange="renderDestinations()" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600">{% for value, text in [('1080p', '1080p Full HD · 6 Mbps'), ('720p', '720p · 4 Mbps'), ('480p', '480p · 1.8 Mbps')] %}<option value="{{ value }}" {{ 'selected' if value == default_profile else '' }}>{{ text }}</option>{% endfor %}</select>
           <label for="hw-encode" class="text-sm text-slate-400" title="Where the picture is encoded. NVIDIA GPU: the camera relays and the final picture, least CPU. Intel graphics: the final picture only. Falls back to software if it fails.">Encoder</label>
           <select id="hw-encode" aria-label="Encoder" onchange="setHardwareEncoding(this)" class="bg-slate-800 text-white rounded-lg p-2 border border-slate-600">
             <option value="software">Software (CPU)</option>
@@ -1114,6 +1116,64 @@
       <div id="recordings-list" class="space-y-4">
         <p data-recordings-empty class="text-sm text-slate-400">No recordings yet. Start one in the Main tab (⏺ Record only, or GO LIVE with recording on).</p>
       </div>
+    </section>
+
+    <!-- Settings: login, camera password, match defaults, recording storage -->
+    <section data-setup data-tab="settings" class="bg-slate-800 rounded-xl p-4 sm:p-6 border border-slate-700 space-y-5">
+      <h2 class="text-lg font-semibold text-white">⚙️ Settings</h2>
+
+      <form id="settings-login" class="bg-slate-900 rounded-lg p-4 border border-slate-700" onsubmit="event.preventDefault(); saveLogin();">
+        <h3 class="font-semibold text-white mb-1">🔐 Login</h3>
+        <p class="text-xs text-slate-400 mb-3">User and password for this dashboard. After a change the browser asks for the new login.</p>
+        <p data-settings-locked="login" class="hidden text-xs text-brand-amber mb-2">Set by environment variables (MCC_OPERATOR_USER / MCC_OPERATOR_PASSWORD): change them there.</p>
+        <div class="grid sm:grid-cols-2 gap-3">
+          <label class="text-xs text-slate-300">User <input id="set-user" autocomplete="username" maxlength="32" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">Current password <input id="set-current" type="password" autocomplete="current-password" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">New password (min. 8) <input id="set-new" type="password" autocomplete="new-password" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">Repeat new password <input id="set-new2" type="password" autocomplete="new-password" class="dest-input text-sm w-full"></label>
+        </div>
+        <button type="submit" class="mt-3 px-4 py-2 rounded-lg bg-brand-blue hover:bg-blue-600 text-white font-semibold text-sm">Change login</button>
+      </form>
+
+      <form id="settings-camera" class="bg-slate-900 rounded-lg p-4 border border-slate-700" onsubmit="event.preventDefault(); saveSettings({camera_password: document.getElementById('set-campw').value.trim()}, true);">
+        <h3 class="font-semibold text-white mb-1">📹 Camera password</h3>
+        <p class="text-xs text-slate-400 mb-3">Optional: cameras must send it to publish (it is part of the links and QR codes in the Cams tab).
+          Empty = no password. <b>After a change every camera needs the new link</b> — running cameras are disconnected.</p>
+        <p data-settings-locked="camera" class="hidden text-xs text-brand-amber mb-2">Set by the environment variable MCC_CAMERA_PASSWORD.</p>
+        <div class="flex flex-wrap gap-2 items-center">
+          <input id="set-campw" autocomplete="off" spellcheck="false" maxlength="64" placeholder="no password" class="dest-input text-sm font-mono flex-1 min-w-[12rem]">
+          <button type="button" onclick="document.getElementById('set-campw').value = generatePassword()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">🎲 Generate</button>
+          <button type="submit" class="px-4 py-2 rounded-lg bg-brand-blue hover:bg-blue-600 text-white font-semibold text-sm">Save</button>
+        </div>
+      </form>
+
+      <form id="settings-match" class="bg-slate-900 rounded-lg p-4 border border-slate-700" onsubmit="event.preventDefault(); saveMatchDefaults();">
+        <h3 class="font-semibold text-white mb-1">⚽ Match defaults</h3>
+        <p class="text-xs text-slate-400 mb-3">What a new match starts with (also used when a team name is cleared).</p>
+        <div class="grid sm:grid-cols-4 gap-3">
+          <label class="text-xs text-slate-300">Home team <input id="set-home" maxlength="40" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">Guest team <input id="set-away" maxlength="40" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">Half length (min) <input id="set-half" type="number" min="10" max="60" class="dest-input text-sm w-full"></label>
+          <label class="text-xs text-slate-300">Stream / recording quality <select id="set-profile" class="dest-input text-sm w-full"></select></label>
+        </div>
+        <div class="flex flex-wrap gap-2 mt-3">
+          <button type="submit" class="px-4 py-2 rounded-lg bg-brand-blue hover:bg-blue-600 text-white font-semibold text-sm">Save defaults</button>
+          <button type="button" onclick="startNewMatch()" class="px-4 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">🆕 Start a new match now</button>
+        </div>
+      </form>
+
+      <form id="settings-storage" class="bg-slate-900 rounded-lg p-4 border border-slate-700" onsubmit="event.preventDefault(); saveStorage();">
+        <h3 class="font-semibold text-white mb-1">💾 Recording storage</h3>
+        <p class="text-xs text-slate-400 mb-3">Folder for recordings (e.g. an external disk) and the free space a recording needs to start.
+          Recordings already made stay in the old folder. Not while recording.</p>
+        <p data-settings-locked="storage" class="hidden text-xs text-brand-amber mb-2">The folder is set by the environment variable MCC_RECORDINGS_DIR.</p>
+        <div class="grid sm:grid-cols-[1fr_10rem] gap-3">
+          <label class="text-xs text-slate-300">Folder <input id="set-recdir" spellcheck="false" class="dest-input text-sm font-mono w-full"></label>
+          <label class="text-xs text-slate-300">Min. free space (GB) <input id="set-minfree" type="number" min="1" max="500" step="1" class="dest-input text-sm w-full"></label>
+        </div>
+        <p id="set-recinfo" class="text-xs text-slate-400 mt-2"></p>
+        <button type="submit" class="mt-3 px-4 py-2 rounded-lg bg-brand-blue hover:bg-blue-600 text-white font-semibold text-sm">Save storage</button>
+      </form>
     </section>
 
     <!-- AI Director: rates the match cameras (display only, no automatic cutting yet) -->
@@ -1645,7 +1705,7 @@
       window.scrollTo(0, 0);
     }
 
-    const TABS = ['main', 'cams', 'network', 'recordings', 'director', 'checklist'];
+    const TABS = ['main', 'cams', 'network', 'recordings', 'director', 'checklist', 'settings'];
 
     function selectTab(tab) {
       state.tab = TABS.includes(tab) ? tab : 'main';
@@ -1657,6 +1717,82 @@
       syncPreviews();
       if (state.tab === 'recordings') loadRecordings(true);
       if (state.tab === 'director') pollDirector();
+      if (state.tab === 'settings') loadSettings();
+    }
+
+    // ──────────────────────── Settings ────────────────────────
+    async function loadSettings() {
+      try {
+        const res = await fetch('/api/settings', {signal: AbortSignal.timeout(5000)});
+        const data = await res.json();
+        if (data.ok) renderSettings(data);
+      } catch (err) { showToast('Settings could not be loaded', 'error'); }
+    }
+
+    function renderSettings(d) {
+      const s = d.settings;
+      document.getElementById('set-user').value = d.login.user;
+      document.getElementById('set-campw').value = s.camera_password;
+      document.getElementById('set-home').value = s.home_name;
+      document.getElementById('set-away').value = s.away_name;
+      document.getElementById('set-half').value = s.half_length;
+      const profile = document.getElementById('set-profile');
+      if (!profile.options.length) profile.innerHTML = d.profiles.map(p => `<option value="${p}">${p}</option>`).join('');
+      profile.value = s.profile;
+      const recdir = document.getElementById('set-recdir');
+      recdir.value = s.recordings_dir;
+      recdir.placeholder = d.recordings.default_dir + ' (default)';
+      document.getElementById('set-minfree').value = s.min_free_gb;
+      document.getElementById('set-recinfo').textContent = `Recording into ${d.recordings.dir}` +
+        (d.recordings.free_gb != null ? ` · ${d.recordings.free_gb} GB free` : '');
+      for (const [key, locked] of [['login', d.login.locked], ['camera', d.camera_password_locked], ['storage', d.recordings.locked]]) {
+        document.querySelector(`[data-settings-locked="${key}"]`).classList.toggle('hidden', !locked);
+        const form = {login: 'settings-login', camera: 'settings-camera', storage: 'settings-storage'}[key];
+        document.querySelectorAll(`#${form} input, #${form} button`).forEach(el => el.disabled = locked);
+      }
+    }
+
+    function generatePassword() {
+      const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789';
+      const bytes = crypto.getRandomValues(new Uint8Array(16));
+      return Array.from(bytes, b => chars[b % chars.length]).join('');
+    }
+
+    async function saveSettings(changes, reloadAfter = false) {
+      const {ok, data} = await apiRequest('/api/settings', changes);
+      if (!ok) { showToast('❌ ' + (data.error || 'Saving failed'), 'error'); return false; }
+      renderSettings(data);
+      showToast('✅ Settings saved', 'success');
+      // Camera links and QR codes are part of the page: reload so they carry the new password.
+      if (reloadAfter) setTimeout(() => location.reload(), 800);
+      return true;
+    }
+
+    function saveMatchDefaults() {
+      return saveSettings({home_name: document.getElementById('set-home').value, away_name: document.getElementById('set-away').value,
+                           half_length: parseInt(document.getElementById('set-half').value, 10), profile: document.getElementById('set-profile').value});
+    }
+
+    function saveStorage() {
+      return saveSettings({recordings_dir: document.getElementById('set-recdir').value.trim(),
+                           min_free_gb: parseFloat(document.getElementById('set-minfree').value)});
+    }
+
+    async function startNewMatch() {
+      if (!confirm('Start a new match now? Score 0:0, clock 00:00 (1st half), default team names.')) return;
+      const {ok, data} = await apiRequest('/api/settings/new-match', {});
+      showToast(ok ? '🆕 ' + data.message : '❌ ' + (data.error || 'Failed'), ok ? 'success' : 'error');
+    }
+
+    async function saveLogin() {
+      const user = document.getElementById('set-user').value.trim();
+      const current = document.getElementById('set-current').value;
+      const fresh = document.getElementById('set-new').value;
+      if (fresh !== document.getElementById('set-new2').value) return showToast('❌ The new passwords do not match', 'error');
+      const {ok, data} = await apiRequest('/api/settings/login', {current_password: current, user, new_password: fresh});
+      if (!ok) return showToast('❌ ' + (data.error || 'Changing the login failed'), 'error');
+      alert('Login changed. The browser now asks for the new user and password.');
+      location.reload();
     }
 
     // ──────────────────────── AI Director ────────────────────────

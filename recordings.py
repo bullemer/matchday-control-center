@@ -31,10 +31,31 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 BASE = Path(__file__).resolve().parent
-RECORDINGS_DIR = Path(os.environ.get("MCC_RECORDINGS_DIR", BASE / "recordings"))
+DEFAULT_DIR = BASE / "recordings"
+RECORDINGS_DIR = Path(os.environ.get("MCC_RECORDINGS_DIR", DEFAULT_DIR))
 GB = 1024 ** 3
 MIN_FREE_START = 3 * GB   # refuse to start recording below this
 MIN_FREE_KEEP = 1 * GB    # stop recording automatically below this
+
+
+def configure_storage(folder, min_free_gb):
+    """Recording folder and minimum free space from the Settings tab (MCC_RECORDINGS_DIR wins).
+    Creates the folder and checks it is writable. Not while recording: the caller checks."""
+    global RECORDINGS_DIR, MIN_FREE_START
+    if "MCC_RECORDINGS_DIR" in os.environ:
+        target = Path(os.environ["MCC_RECORDINGS_DIR"])
+    else:
+        target = Path(folder) if folder else DEFAULT_DIR
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe = target / ".write-test"
+            probe.write_text("ok")
+            probe.unlink()
+        except OSError as exc:
+            raise ValueError(f"Cannot record into {target}: {exc.strerror or exc}")
+    RECORDINGS_DIR = target
+    MIN_FREE_START = int(min_free_gb * GB)
+    return RECORDINGS_DIR
 JOIN_MARGIN = 200 * 1024 ** 2   # headroom when joining parts into the final file
 BYTES_PER_HOUR = {"720p": 2.1e9, "1080p": 2.8e9}   # what an hour of recording takes
 LABELS = ("Highlight", "Goal", "Chance", "Save", "Card", "Foul", "Other")

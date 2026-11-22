@@ -16,6 +16,7 @@ Run: python app.py
 import logging
 import math
 import os
+import re
 import tempfile
 import threading
 import time
@@ -24,6 +25,7 @@ from functools import wraps
 from flask import Flask, jsonify, render_template, request, send_file
 import recordings
 import camera_control
+import settings_store
 import ai_director
 
 from browser_overlay import BrowserOverlay, normalize_url
@@ -51,7 +53,7 @@ from media_engine import (ensure_mediamtx, start_mediamtx, get_camera_status, CA
                           resume_state, resume, set_mic_delay, load_audio_setting, set_gate, set_monitor,
                           start_monitor_worker, get_cameras, set_camera_info, load_camera_setting,
                           REPORT_CAMERAS, get_camera_inputs, QUALITY_LABELS, set_iso_match,
-                          load_recording_setting, nvenc_available)
+                          load_recording_setting, nvenc_available, generate_mediamtx_config)
 
 def init_mediamtx():
     if not ensure_mediamtx():
@@ -124,7 +126,12 @@ SCOREBOARD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stati
 SCOREBOARD_PATH = os.path.join(SCOREBOARD_DIR, "scoreboard.txt")
 
 _scoreboard_lock = threading.RLock()
-DEFAULT_TEAM_NAMES = {"home_name": "Home", "away_name": "Guest"}
+DEFAULT_TEAM_NAMES = {"home_name": "Home", "away_name": "Guest"}  # until the Settings tab says otherwise
+
+
+def default_team_name(field):
+    """Default team names from the Settings tab (Home / Guest unless changed)."""
+    return settings_store.get(field) or DEFAULT_TEAM_NAMES[field]
 _scoreboard = {
     "home_name": DEFAULT_TEAM_NAMES["home_name"],
     "home_score": 0,
@@ -265,7 +272,7 @@ def index():
     bitrates = {name: int(video[:-1]) + 128 for name, (_, _, video, _) in PROFILES.items()}
     return render_template("index.html", media_host=host, destinations=destinations, bitrates=bitrates,
                            camera_query=_camera_query(), cameras=get_cameras(),
-                           qualities=list(QUALITY_LABELS.items()))
+                           qualities=list(QUALITY_LABELS.items()), default_profile=settings_store.get("profile"))
 
 
 @app.route("/tally/<cam_id>")
@@ -306,6 +313,112 @@ def api_camera_report(cam_id):
         return jsonify(ok=False, error="Report too large"), 413
     answer = camera_control.record_report(cam_id, request.get_json(silent=True), tally=lambda: tally_state(cam_id))
     return jsonify(ok=True, **answer)
+
+
+# --- Settings tab -------------------------------------------------------------
+
+def _settings_view():
+    s = settings_store.get()
+    try:
+        free = recordings.free_bytes() / recordings.GB
+    except OSError:
+        free = None
+    return {
+        "settings": s,
+        "login": {"user": app.config["OPERATOR_USER"],
+                  "locked": "MCC_OPERATOR_PASSWORD" in os.environ or "MCC_OPERATOR_USER" in os.environ},
+        "camera_password_locked": "MCC_CAMERA_PASSWORD" in os.environ,
+        "recordings": {"dir": str(recordings.RECORDINGS_DIR), "default_dir": str(recordings.DEFAULT_DIR),
+                       "locked": "MCC_RECORDINGS_DIR" in os.environ,
+                       "free_gb": round(free, 1) if free is not None else None},
+        "profiles": list(settings_store.PROFILES),
+    }
+
+
+def _apply_match_defaults():
+    """Default team names and half length for a new match (before a saved one is restored)."""
+    with _scoreboard_lock:
+        _scoreboard["home_name"] = default_team_name("home_name")
+        _scoreboard["away_name"] = default_team_name("away_name")
+        _clock["half_length"] = settings_store.get("half_length")
+
+
+@app.route("/api/settings")
+@api_endpoint
+def api_settings():
+    return jsonify(ok=True, **_settings_view())
+
+
+@app.route("/api/settings", methods=["POST"])
+@api_endpoint
+def api_settings_update():
+    """Change settings: camera_password, home_name, away_name, half_length, profile,
+    recordings_dir, min_free_gb (any subset)."""
+    data = request.get_json()
+    changes = {k: v for k, v in data.items() if k in settings_store.DEFAULTS}
+    if not changes:
+        raise ValueError("Nothing to change")
+    if "camera_password" in changes and "MCC_CAMERA_PASSWORD" in os.environ:
+        raise ValueError("The camera password is set by the environment variable MCC_CAMERA_PASSWORD")
+    storage = {k: changes[k] for k in ("recordings_dir", "min_free_gb") if k in changes}
+    if storage:
+        if (get_recording_status() or {}).get("active"):
+            raise ValueError("Stop the recording before changing where recordings are stored")
+        for key, value in storage.items():
+            settings_store._check(key, value)  # validate before touching the disk
+        current = settings_store.get()
+        recordings.configure_storage(storage.get("recordings_dir", current["recordings_dir"]),
+                                     storage.get("min_free_gb", current["min_free_gb"]))
+    password_changed = "camera_password" in changes and changes["camera_password"] != settings_store.get("camera_password")
+    settings_store.update(changes)
+    if password_changed and get_mediamtx_running():
+        generate_mediamtx_config()  # MediaMTX reloads it: cameras must use the new links
+    log.info("Settings changed: %s", ", ".join(sorted(changes)))
+    return jsonify(ok=True, **_settings_view())
+
+
+@app.route("/api/settings/login", methods=["POST"])
+@api_endpoint
+def api_settings_login():
+    """Change the operator login: {"current_password", "user", "new_password"}."""
+    if "MCC_OPERATOR_PASSWORD" in os.environ or "MCC_OPERATOR_USER" in os.environ:
+        raise ValueError("The login is set by environment variables (MCC_OPERATOR_USER / MCC_OPERATOR_PASSWORD)")
+    data = request.get_json()
+    current = data.get("current_password")
+    if not isinstance(current, str) or not secrets.compare_digest(current.encode(), app.config["OPERATOR_PASSWORD"].encode()):
+        return jsonify(ok=False, error="The current password is wrong"), 403
+    user = data.get("user", app.config["OPERATOR_USER"])
+    new = data.get("new_password")
+    if not isinstance(user, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,32}", user):
+        raise ValueError("User name: 1-32 letters, digits, dot, - or _")
+    if not isinstance(new, str) or len(new) < 8 or len(new) > 128 or any(ord(c) < 32 for c in new):
+        raise ValueError("New password: at least 8 characters")
+    for name, value in (("operator-user", user), ("operator-password", new)):
+        path = RUNTIME_DIR / name
+        tmp = path.with_suffix(".tmp")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(value)
+        os.replace(tmp, path)
+    app.config["OPERATOR_USER"] = user
+    app.config["OPERATOR_PASSWORD"] = new
+    log.info("Operator login changed (user %s)", user)
+    return jsonify(ok=True, message="Login changed: sign in again with the new password")
+
+
+@app.route("/api/settings/new-match", methods=["POST"])
+@api_endpoint
+def api_settings_new_match():
+    """Start a new match now: default team names, 0:0, clock 00:00 in the 1st half."""
+    if get_stream_status().get("active") or (get_recording_status() or {}).get("active"):
+        raise ValueError("Stop the stream and the recording before starting a new match")
+    with _scoreboard_lock:
+        _scoreboard.update(home_score=0, away_score=0)
+        _clock.update(running=False, elapsed=0.0, start_ts=None, half=1, added=0)
+    _apply_match_defaults()
+    _write_scoreboard_file()
+    _save_match()
+    return jsonify(ok=True, message="New match: " + f"{_scoreboard['home_name']} 0:0 {_scoreboard['away_name']}")
 
 
 # --- AI Director ---------------------------------------------------------
@@ -1032,7 +1145,7 @@ def api_scoreboard_update():
     for field in ("home_name", "away_name"):
         if field in data:
             # Team names are shown exactly as typed; empty falls back to Home / Guest.
-            updates[field] = text_field(data, field, 40) or DEFAULT_TEAM_NAMES[field]
+            updates[field] = text_field(data, field, 40) or default_team_name(field)
     for field in ("home_score", "away_score"):
         if field in data:
             value = data[field]
@@ -1255,9 +1368,9 @@ def _restore_match():
             half_length = 45
         with _scoreboard_lock:
             if not fresh:
-                # Old match: keep only the setup (scoreboard source, overlay, visibility, half length).
+                # Old match: keep only the setup (scoreboard source, overlay, visibility); names
+                # and half length come from the Settings tab defaults (set in initialize()).
                 _scoreboard.update({key: state[key] for key in ("source", "overlay_url", "visible")})
-                _clock["half_length"] = half_length
                 log.info("Saved match is older than %d h: starting with %s 0:0 %s", MATCH_RESTORE_MAX // 3600,
                          _scoreboard["home_name"], _scoreboard["away_name"])
                 return
@@ -1416,6 +1529,13 @@ def initialize():
                 output.write(secrets.token_urlsafe(24))
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
+    settings_store.load()
+    _apply_match_defaults()
+    try:
+        recordings.configure_storage(settings_store.get("recordings_dir"), settings_store.get("min_free_gb"))
+    except ValueError as exc:  # e.g. a USB disk that is not plugged in: record into the default folder
+        log.warning("%s; recording into %s", exc, recordings.DEFAULT_DIR)
+        recordings.configure_storage("", settings_store.get("min_free_gb"))
     _restore_match()
     global _resume_pending
     _resume_pending = _load_resume()
