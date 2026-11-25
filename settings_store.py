@@ -24,6 +24,7 @@ DEFAULTS = {
     "recordings_dir": "",           # empty: <app>/recordings
     "min_free_gb": 3,               # refuse to start recording below this much free space
     "network_mode": "auto",         # camera network: auto (hotspot / laptop's Wi-Fi) or router
+    "router_iface": "",             # optional camera-network interface, including a USB Ethernet dock
     "router_ip": "",                # laptop address on the router that phones and the Pi were set up with
 }
 
@@ -86,6 +87,10 @@ def _check(key, value):
         if value not in ("auto", "router"):
             raise ValueError("Camera network: auto or router")
         return value
+    if key == "router_iface":
+        if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{0,15}", value):
+            raise ValueError("Invalid network interface")
+        return value
     if key == "router_ip":
         if not isinstance(value, str) or (value and not re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", value)):
             raise ValueError("Router address: an IPv4 address")
@@ -99,11 +104,15 @@ def update(changes):
         raise ValueError("Nothing to change")
     checked = {k: _check(k, v) for k, v in changes.items()}
     with _lock:
-        _values.update(checked)
+        updated = dict(_values, **checked)
         PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         tmp = PATH.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # holds the camera password
-        with os.fdopen(fd, "w") as f:
-            json.dump(_values, f, indent=1)
-        os.replace(tmp, PATH)
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(updated, f, indent=1)
+            os.replace(tmp, PATH)
+        finally:
+            tmp.unlink(missing_ok=True)
+        _values.update(checked)
         return dict(_values)

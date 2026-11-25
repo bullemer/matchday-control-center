@@ -46,6 +46,15 @@ class RouterDetectionTests(unittest.TestCase):
                 patch.object(n, "_is_usb_device", side_effect=lambda dev: dev.startswith("enx")):
             return n.get_network_status(check_internet=False, mode=mode)
 
+    def test_usb_dock_can_be_selected_as_router_even_with_other_links(self):
+        with patch.object(n, "run_cmd", side_effect=fake_nmcli()), patch.object(n, "_owned_uuid", return_value=None), \
+                patch.object(n, "_is_usb_device", side_effect=lambda dev: dev.startswith("enx")):
+            status = n.get_network_status(False, "router", router_iface="enx0a1b")
+            self.assertEqual(status["router"]["iface"], "enx0a1b")
+            self.assertIsNone(status["usb_iface"])
+            self.assertIn("enx0a1b", status["interfaces"])
+            self.assertFalse(n.get_network_status(False, "router", router_iface="missing")["router"]["connected"])
+
     def test_router_mode_uses_the_cable_not_the_venue_wifi(self):
         auto = self.status("auto")
         self.assertEqual((auto["camera_mode"], auto["camera_ip"]), ("lan", "192.168.188.129"))   # unchanged
@@ -150,7 +159,7 @@ class RouterApiTests(unittest.TestCase):
         settings_store.load()
         self.tmp.cleanup()
 
-    def fake_status(self, check_internet=True, mode="auto"):
+    def fake_status(self, check_internet=True, mode="auto", router_iface=""):
         router = {"connected": True, "iface": "eno1", "type": "ethernet", "name": "Wired", "ip": self.router_ip,
                   "mac": "3C:52:82:AA:BB:CC", "method": "auto", "internet": "router", "uuid": "2222-wired"}
         if mode == "router":

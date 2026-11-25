@@ -4,6 +4,10 @@ A Linux dashboard for USB internet tethering, an application-owned Wi-Fi hotspot
 four match cameras and two reporting cameras, a live scoreboard, and a supervised encoder that streams to YouTube,
 Facebook, Twitch and any other RTMP server at the same time, records and replays.
 
+## Control a Chameleon gimbal camera
+
+In **Cams**, select **Tracking (XbotGo, gimbal)** for the camera. On the phone, open Chameleon Stream 0.10.0 or later, select **Gimbal** and **SRT**, enter the laptop address and matching camera slot, and tap **Save SRT settings**. Enable **Follow dashboard settings**. The camera card now shows controls for the phone stream, the Bluetooth gimbal connection and tracking. Connect the gimbal before starting tracking. Keep the app open on the phone while waiting for a remote stream start.
+
 ## Requirements and first launch
 
 - Python **3.10+** on Linux, x86-64 or ARM64.
@@ -326,11 +330,9 @@ Replays show the angle that was on air; other angles would need per-camera recor
 
 For cuts and replays a new relay starts while the current one stays on air, and
 MediaMTX hands the program over the moment the new relay publishes. A cut that fails
-leaves the current picture on air. At the handover itself MediaMTX shows its offline
-picture for 1–2 frames (33–66 ms); the app replaces MediaMTX's "STREAM IS OFFLINE"
-picture with a plain dark "Back in a moment" card, which is also what viewers see while
-no camera at all is available. (A switcher inside the encoder that would avoid even
-those frames was tried; it was not reliable under load and is not used.)
+leaves the current picture on air. The fallback loop gives a new publisher 100 ms to take over
+before showing the first frame of the “Back in a moment” card. Viewers keep the
+previous picture across a brief handover and see the card during a sustained outage.
 
 Highlight marks, replays and the CAM REPLAY timeline use what has actually been
 written to the recording, not the wall clock, so they stay exact even if the stream

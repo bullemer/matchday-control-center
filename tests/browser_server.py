@@ -57,6 +57,7 @@ a.stop_recording=lambda: (recording.update(active=False) or True,'Recording stop
 a.switch_camera=lambda camera, source='manual': (False,'Camera unavailable')
 # Real camera settings, saved in a throwaway folder; MediaMTX is never touched.
 import media_engine as m
+m.meter_status=lambda: {'audio_on_air':['cam1'], 'active_camera':None, 'live':bool(streams['live'])}
 m.CAMERA_SETTING=Path(tempfile.mkdtemp())/'cameras.json'
 m.get_mediamtx_running=lambda: False
 # The app module imported these by name: patch its copies too, or a test could rewrite the
@@ -156,6 +157,7 @@ if True:
     # Recordings never touch the real library: one finished match, one being recorded.
     r=a.recordings
     r.RECORDINGS_DIR=Path(tmp)/'recordings'
+    r.storage_busy=lambda: recording['active']  # this fixture drives recording start and stop in memory
     r.free_bytes=lambda: 40*1024**3
     done=r.create_session('720p','Polonia vs HEBC')
     r.new_part(done); r.part_started(done,1000.0)

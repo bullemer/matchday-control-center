@@ -459,6 +459,9 @@ test('tally tells the camera a replay returns to that it is about to be live aga
   await expect(page.locator('#tally-box')).toHaveClass(/tally-replay/);
   Object.assign(tally, {replay: false, returning: false, on_air: true});
   await expect(page.locator('#tally-status')).toContainText('LIVE ON AIR');
+  await page.route('**/api/tally/cam1', route => route.abort());
+  await expect(page.locator('#tally-status')).toHaveText('OFFLINE');
+  await expect(page.locator('#live-text')).toHaveText('STATUS UNKNOWN');
   await context.close();
 });
 
@@ -1159,4 +1162,54 @@ test('own router: camera address on the cable, warnings, internet switch and add
   await expect.poll(() => confirmed).toBe(true);
   await expect(page.locator('#toast-container')).toContainText('Camera address 192.168.8.57 confirmed');
   expect(errors).toEqual([]);
+});
+
+test('an older status response cannot reverse a displayed cut', async ({page}) => {
+  await page.goto('/');
+  await expect(page.locator('#connection-status')).toHaveText('Connected');
+  const result = await page.evaluate(async () => {
+    const original = apiGet;
+    const base = await original('/api/status');
+    const snapshot = cam => ({...base, stream:{...base.stream, active_camera:cam, selected_camera:cam}});
+    let release;
+    apiGet = url => url !== '/api/status' ? original(url) : release
+      ? Promise.resolve(snapshot('cam2')) : new Promise(resolve => { release = resolve; });
+    try {
+      const earlier = pollStatus();
+      await pollStatus();
+      release(snapshot('cam1'));
+      await earlier;
+      return state.activeCam;
+    } finally { apiGet = original; }
+  });
+  expect(result).toBe('cam2');
+});
+
+test('Gimbal controls follow phone feedback and disappear on a fixed mount', async ({page}) => {
+  let mount = 'tracking';
+  let control = {stream: 'stopped', gimbal: 'disconnected', tracking: false, actions: ['start_stream', 'connect_gimbal']};
+  const commands = [];
+  await page.route('**/api/status', async route => {
+    const response = await route.fetch();
+    const data = await response.json();
+    data.camera_list.find(cam => cam.id === 'cam1').mount = mount;
+    data.camera_reports.cam1 = {...data.camera_reports.cam1, mode: 'gimbal', control};
+    await route.fulfill({json: data});
+  });
+  await page.route('**/api/cameras/cam1/action', async route => {
+    commands.push(route.request().postDataJSON().action);
+    await route.fulfill({status: 202, json: {ok: true}});
+  });
+  await page.goto('/');
+  await page.getByRole('tab', {name: /Cams/}).click();
+  const panel = page.locator('[data-gimbal-panel="cam1"]');
+  await expect(panel.getByRole('button', {name: 'Start tracking'})).toBeDisabled();
+  await panel.getByRole('button', {name: 'Connect gimbal'}).click();
+  await expect.poll(() => commands).toEqual(['connect_gimbal']);
+  control = {...control, gimbal: 'ready', actions: ['start_stream', 'disconnect_gimbal', 'start_tracking']};
+  await expect(panel.getByRole('button', {name: 'Start tracking'})).toBeEnabled();
+  control = undefined;
+  await expect(panel.getByRole('button', {name: 'Start stream'})).toBeDisabled();
+  mount = 'fixed';
+  await expect(panel).toBeHidden();
 });

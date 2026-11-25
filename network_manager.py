@@ -93,7 +93,7 @@ def _internet_available():
 NETWORK_MODES = ("auto", "router")
 
 
-def get_network_status(check_internet=True, mode="auto"):
+def get_network_status(check_internet=True, mode="auto", router_iface=""):
     """Report the internet uplink and the network camera phones should join.
 
     mode "auto": cameras use the app's hotspot when it is active, otherwise the Wi-Fi/LAN
@@ -107,7 +107,7 @@ def get_network_status(check_internet=True, mode="auto"):
                 hotspot_active=False, hotspot_ssid=None, hotspot_iface=None, internet_ok=False,
                 lan_iface=None, lan_type=None, lan_name=None, lan_ip=None,
                 camera_mode="none", camera_ip=None, uplink=None, uplink_iface=None,
-                network_mode=mode, router=None)
+                network_mode=mode, router=None, router_iface=router_iface, interfaces=[])
     ok, raw = run_cmd(["nmcli", "-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device"])
     candidates, lans = [], []
     if ok:
@@ -117,7 +117,12 @@ def get_network_status(check_internet=True, mode="auto"):
                 continue
             dev, kind, state, connection = parts
             # Identify USB-backed ethernet by sysfs, not by an enx name guess.
-            usb = kind == "ethernet" and _is_usb_device(dev)
+            if kind in ("wifi", "ethernet"):
+                info["interfaces"].append(dev)
+            driver = os.path.basename(os.path.realpath(f"/sys/class/net/{dev}/device/driver"))
+            usb = (kind == "ethernet" and _is_usb_device(dev)
+                   and driver not in ("r8152", "asix", "ax88179_178a", "lan78xx", "smsc75xx", "smsc95xx")
+                   and not (mode == "router" and dev == router_iface))
             if usb:
                 candidates.append((state == "connected", dev, state))
             elif kind in ("wifi", "ethernet") and state == "connected":
@@ -147,6 +152,8 @@ def get_network_status(check_internet=True, mode="auto"):
     if mode == "router":
         # The router link: a cable first (wired, not a USB tether), else the router's Wi-Fi.
         for _, dev, kind, connection in sorted(lans, key=lambda lan: lan[2] != "ethernet"):
+            if router_iface and dev != router_iface:
+                continue
             ip = _device_ip(dev) if dev != hotspot_dev else None
             if ip:
                 info["router"] = _router_details(dev, kind, connection)

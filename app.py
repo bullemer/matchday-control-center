@@ -304,8 +304,7 @@ def tally_page(cam_id):
 @app.route("/api/camera-report/<cam_id>", methods=["POST"])
 @api_endpoint
 def api_camera_report(cam_id):
-    """Status from the Chameleon Stream phone app (no operator login); answers with the zoom
-    the operator wants. With a camera password set, the phone must send it."""
+    """Camera-password-authenticated phone reports receive tally, settings, zoom and control commands."""
     if cam_id not in CAMERA_IDS:
         return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
     password = camera_password()
@@ -335,7 +334,7 @@ def _settings_view():
                   "locked": "MCC_OPERATOR_PASSWORD" in os.environ or "MCC_OPERATOR_USER" in os.environ},
         "camera_password_locked": "MCC_CAMERA_PASSWORD" in os.environ,
         "recordings": {"dir": str(recordings.RECORDINGS_DIR), "default_dir": str(recordings.DEFAULT_DIR),
-                       "locked": "MCC_RECORDINGS_DIR" in os.environ,
+                       "locked": "MCC_RECORDINGS_DIR" in os.environ, "busy": recordings.storage_busy(),
                        "free_gb": round(free, 1) if free is not None else None},
         "profiles": list(settings_store.PROFILES),
     }
@@ -358,6 +357,14 @@ def api_settings():
 @app.route("/api/settings", methods=["POST"])
 @api_endpoint
 def api_settings_update():
+    with _settings_write_lock:
+        return _update_settings()
+
+
+_settings_write_lock = threading.Lock()
+
+
+def _update_settings():
     """Change settings: camera_password, home_name, away_name, half_length, profile,
     recordings_dir, min_free_gb (any subset)."""
     data = request.get_json()
@@ -366,17 +373,18 @@ def api_settings_update():
         raise ValueError("Nothing to change")
     if "camera_password" in changes and "MCC_CAMERA_PASSWORD" in os.environ:
         raise ValueError("The camera password is set by the environment variable MCC_CAMERA_PASSWORD")
+    changes = {k: settings_store._check(k, v) for k, v in changes.items()}
+    password_changed = "camera_password" in changes and changes["camera_password"] != settings_store.get("camera_password")
     storage = {k: changes[k] for k in ("recordings_dir", "min_free_gb") if k in changes}
     if storage:
         if (get_recording_status() or {}).get("active"):
             raise ValueError("Stop the recording before changing where recordings are stored")
-        for key, value in storage.items():
-            settings_store._check(key, value)  # validate before touching the disk
         current = settings_store.get()
         recordings.configure_storage(storage.get("recordings_dir", current["recordings_dir"]),
-                                     storage.get("min_free_gb", current["min_free_gb"]))
-    password_changed = "camera_password" in changes and changes["camera_password"] != settings_store.get("camera_password")
-    settings_store.update(changes)
+                                     storage.get("min_free_gb", current["min_free_gb"]),
+                                     persist=lambda: settings_store.update(changes))
+    else:
+        settings_store.update(changes)
     if password_changed and get_mediamtx_running():
         generate_mediamtx_config()  # MediaMTX reloads it: cameras must use the new links
     log.info("Settings changed: %s", ", ".join(sorted(changes)))
@@ -508,6 +516,18 @@ def api_camera_zoom(cam_id):
     return jsonify(ok=True, zoom=target)
 
 
+@app.post("/api/cameras/<cam_id>/action")
+@api_endpoint
+def api_camera_action(cam_id):
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error="Unknown camera"), 404
+    if phone_config(cam_id)["mode"] != "gimbal":
+        raise ValueError("Select the Tracking (XbotGo, gimbal) mount first")
+    body = request.get_json(silent=True)
+    camera_control.request_action(cam_id, body.get("action") if isinstance(body, dict) else None)
+    return jsonify(ok=True), 202
+
+
 def _tally(cam_id):
     """Tally of one camera: what its operator needs to know (tally page and phone app)."""
     cameras = get_camera_status()
@@ -619,6 +639,7 @@ def api_status():
         "network": network,
         "cameras": cameras,
         "camera_list": get_cameras(),
+        "storage_busy": recordings.storage_busy(),
         "camera_inputs": get_camera_inputs(),
         "camera_reports": camera_control.get_reports(),
         "director_suggestion": ai_director.suggestion(),
@@ -638,7 +659,8 @@ def _network_status(check_internet=True):
     """Network status in the operator's camera-network mode; in router mode with advice.
     The first router address seen is remembered: it is what phones and the Pi were set up
     with, so a later change is reported until the operator confirms it."""
-    network = get_network_status(check_internet=check_internet, mode=settings_store.get("network_mode"))
+    network = get_network_status(check_internet=check_internet, mode=settings_store.get("network_mode"),
+                                 router_iface=settings_store.get("router_iface"))
     if network.get("camera_mode") == "router":
         ip = (network.get("router") or {}).get("ip")
         if ip and not settings_store.get("router_ip"):
@@ -654,7 +676,10 @@ def _network_status(check_internet=True):
 def api_network_mode():
     """{"mode": "auto"|"router"}: where camera phones connect."""
     mode = (request.get_json(force=True, silent=True) or {}).get("mode")
-    settings_store.update({"network_mode": mode})
+    changes = {"network_mode": mode}
+    if "interface" in request.json:
+        changes["router_iface"] = request.json["interface"]
+    settings_store.update(changes)
     log.info("Camera network mode: %s", mode)
     _refresh_network()
     return jsonify(ok=True, network=_diagnostics.get("network"))
@@ -840,10 +865,24 @@ def api_stream_keys_forget():
 @api_endpoint
 def api_stream_stop():
     """Stop streaming everywhere, or one destination with {"destination": name}."""
+    global _resume_pending
     data = request.get_json(force=True, silent=True) or {}
     name = text_field(data, "destination", 20) or None
     log.info("Stream stop requested (%s)", name or "all destinations")
-    success, msg = stop_stream(name)
+    with _resume_control_lock:
+        success, msg = stop_stream(name)
+        if _resume_pending is not None:
+            targets = _resume_pending.get("targets", {})
+            if name is None or name in targets:
+                if name is None:
+                    targets.clear()
+                else:
+                    targets.pop(name)
+                if not targets and not _resume_pending.get("record"):
+                    _resume_pending = None
+                success, msg = True, "Stopped streaming"
+        if success:
+            _save_live_state(include_pending=True)
     status_code = 200 if success else 409 if name else 502
     return jsonify({"ok": success, "message": msg}), status_code
 
@@ -892,6 +931,8 @@ def api_recording_start():
 def api_recording_stop():
     log.info("Recording stop requested")
     success, msg = stop_recording()
+    if success:
+        _save_live_state()
     return jsonify({"ok": success, "message": msg}), 200 if success else 409
 
 
@@ -954,14 +995,20 @@ def api_marker_update(sid, mid):
 @app.route("/api/recordings/<sid>/markers/<mid>/clip", methods=["POST"])
 @api_endpoint
 def api_marker_clip(sid, mid):
-    name = recordings.export_clip(sid, mid)
+    background = request.json.get("background") is True
+    name = recordings.start_export(sid, mid, background=background)
+    if background:
+        return jsonify(ok=True, message="Exporting clip…"), 202
     return jsonify({"ok": True, "message": "Clip ready", "clip": name})
 
 
 @app.route("/api/recordings/<sid>/reel", methods=["POST"])
 @api_endpoint
 def api_recording_reel(sid):
-    name = recordings.build_reel(sid)
+    background = request.json.get("background") is True
+    name = recordings.start_export(sid, background=background)
+    if background:
+        return jsonify(ok=True, message="Building highlight reel…"), 202
     return jsonify({"ok": True, "message": "Highlight reel ready", "file": name})
 
 
@@ -1160,10 +1207,7 @@ def api_audio_source():
 def api_audio_levels():
     """Peak/RMS levels in dBFS for each input (cameras, microphones) and the program
     output. Polled several times a second by the meters, so it only reads cached values."""
-    stream = get_stream_status()
-    return jsonify({"ok": True, "levels": get_audio_levels(), "mixer": get_mixer(),
-                    "audio_on_air": stream.get("audio_on_air", []),
-                    "active_camera": stream.get("active_camera"), "live": stream.get("active", False)})
+    return jsonify(ok=True, levels=get_audio_levels(), mixer=get_mixer(), **media_engine.meter_status())
 
 
 @app.route("/api/audio/mix", methods=["POST"])
@@ -1275,12 +1319,14 @@ def api_scoreboard_update():
             if type(value) is not int or not 0 <= value <= 999:
                 raise ValueError("Scores must be integers between 0 and 999")
             updates[field] = value
+    score_changed = False
     with _scoreboard_lock:
         if "delta" in data:
             if data.get("team") not in ("home", "away") or type(data["delta"]) is not int or data["delta"] not in (-1, 1):
                 raise ValueError("Score adjustment requires team and delta (+1 or -1)")
             key = data["team"] + "_score"
             updates[key] = max(0, min(999, _scoreboard[key] + data["delta"]))
+            score_changed = updates[key] != _scoreboard[key]
         candidate = dict(_scoreboard, **updates)
         if candidate["source"] == "score67" and not candidate["overlay_url"]:
             raise ValueError("Paste the Score67 OBS overlay link first")
@@ -1289,7 +1335,7 @@ def api_scoreboard_update():
 
     _write_scoreboard_file()
     _save_match()
-    if "delta" in data:
+    if score_changed:
         _auto_goal_marker(data["team"], data["delta"])
     log.info("Scoreboard updated (source=%s, visible=%s)", _scoreboard["source"], _scoreboard["visible"])
     return jsonify({"ok": True, "scoreboard": _get_scoreboard_state()})
@@ -1550,9 +1596,20 @@ def _live_state_path():
     return RUNTIME_DIR / "live-state.json"
 
 
-def _save_live_state():
+_checkpoint_lock = threading.Lock()
+_resume_control_lock = threading.Lock()
+
+
+def _save_live_state(include_pending=False):
+    with _checkpoint_lock:
+        _write_live_checkpoint(include_pending)
+
+
+def _write_live_checkpoint(include_pending):
     state = resume_state()
     path = _live_state_path()
+    if state is None and include_pending and _resume_pending is not None:
+        state = dict(_resume_pending)
     if state is None:
         if _resume_pending is None:  # not while a resume is still to come
             path.unlink(missing_ok=True)
@@ -1588,13 +1645,19 @@ def _resume_broadcast(state, wait=90):
     try:
         deadline = time.monotonic() + wait
         while not _workers_stop.is_set() and time.monotonic() < deadline:
+            if _resume_pending is not state:
+                return
             cameras = get_camera_status() if get_mediamtx_running() else {}
             if any(cameras.get(c) for c in CAMERA_IDS):
                 break
             _workers_stop.wait(1)
         if _workers_stop.is_set():
             return
-        ok, message = resume(state, title=_match_title())
+        with _resume_control_lock:
+            if _resume_pending is not state:
+                return
+            ok, message = resume(state, title=_match_title())
+            _resume_pending = None
         log.log(logging.INFO if ok else logging.WARNING, "Resuming the broadcast after a restart: %s", message)
         if not ok and state.get("session"):
             recordings.finalize(state["session"])

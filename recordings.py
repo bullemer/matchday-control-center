@@ -38,30 +38,41 @@ MIN_FREE_START = 3 * GB   # refuse to start recording below this
 MIN_FREE_KEEP = 1 * GB    # stop recording automatically below this
 
 
-def configure_storage(folder, min_free_gb):
-    """Recording folder and minimum free space from the Settings tab (MCC_RECORDINGS_DIR wins).
-    Creates the folder and checks it is writable. Not while recording: the caller checks."""
+def configure_storage(folder, min_free_gb, persist=None):
+    """Validate, persist and apply storage under the same lock as session creation."""
     global RECORDINGS_DIR, MIN_FREE_START
-    if "MCC_RECORDINGS_DIR" in os.environ:
-        target = Path(os.environ["MCC_RECORDINGS_DIR"])
-    else:
-        target = Path(folder) if folder else DEFAULT_DIR
+    with _lock:
+        if storage_busy():
+            raise ValueError("Wait for recording, saving and exports to finish before changing storage")
+        target = Path(os.environ.get("MCC_RECORDINGS_DIR") or folder or DEFAULT_DIR)
         try:
             target.mkdir(parents=True, exist_ok=True)
-            probe = target / ".write-test"
-            probe.write_text("ok")
-            probe.unlink()
+            with tempfile.NamedTemporaryFile(dir=target):
+                pass
         except OSError as exc:
             raise ValueError(f"Cannot record into {target}: {exc.strerror or exc}")
-    RECORDINGS_DIR = target
-    MIN_FREE_START = int(min_free_gb * GB)
-    return RECORDINGS_DIR
+        if persist:
+            persist()
+        RECORDINGS_DIR = target
+        MIN_FREE_START = int(min_free_gb * GB)
+        return target
+
+
+def storage_busy():
+    with _lock:
+        return (any(path.parent == RECORDINGS_DIR for path in _open_sessions)
+                or bool(_finalizing) or any(job["state"] == "running" for job in _exports.values()))
+
+
 JOIN_MARGIN = 200 * 1024 ** 2   # headroom when joining parts into the final file
 BYTES_PER_HOUR = {"720p": 2.1e9, "1080p": 2.8e9}   # what an hour of recording takes
 LABELS = ("Highlight", "Goal", "Chance", "Save", "Card", "Foul", "Other")
 CLIP_PRE, CLIP_POST = 20, 10
 _lock = threading.RLock()
+_exports_changed = threading.Condition(_lock)
 _finalizing = set()
+_open_sessions = set()  # from creation through finalization, including the stop-to-save handoff
+_exports = {}  # session folder -> latest export status
 
 
 def _now():
@@ -140,6 +151,7 @@ def create_session(profile, title):
                    "created": _now(), "state": "recording", "parts": [], "markers": [],
                    "file": None, "duration": None, "error": ""}
         _save(session)
+        _open_sessions.add(_dir(sid))
         return sid
 
 
@@ -652,6 +664,52 @@ def build_reel(sid):
     return "highlights.mp4"
 
 
+def start_export(sid, mid=None, background=True):
+    """One export per session; repeat dashboard requests can follow the same job."""
+    with _lock:
+        folder = _dir(sid)
+        session = _load(sid)
+        if mid is not None:
+            _marker(session, mid)
+        elif not session["markers"]:
+            raise ValueError("Mark some highlights first")
+        if sid in _finalizing or session["state"] == "finalizing":
+            raise ValueError("Wait for the recording to finish saving")
+        job = _exports.get(folder, {})
+        if job.get("state") == "running":
+            if background and job["marker"] == mid:
+                return None
+            raise ValueError("An export is already running for this recording")
+        _exports[folder] = {"marker": mid, "state": "running", "message": ""}
+
+    def run():
+        try:
+            name = export_clip(sid, mid) if mid is not None else build_reel(sid)
+        except Exception as exc:
+            with _lock:
+                _exports[folder].update(state="failed", message=str(exc))
+            if not background:
+                raise
+            logger.exception("Export failed for %s", sid)
+        else:
+            with _lock:
+                _exports[folder].update(state="done", message="")
+            return name
+        finally:
+            with _exports_changed:
+                _exports_changed.notify_all()
+
+    if not background:
+        return run()
+    try:
+        threading.Thread(target=run, daemon=True, name=f"export-{sid}").start()
+    except RuntimeError:
+        with _lock:
+            _exports.pop(folder, None)
+            _exports_changed.notify_all()
+        raise
+
+
 def _timestamp(seconds):
     seconds = int(seconds)
     h, rest = divmod(seconds, 3600)
@@ -685,19 +743,52 @@ def reopen(sid):
                 part["duration"] = round(_probe_duration(path) or 0.0, 3) if path.exists() else 0.0
         session.update(state="recording", error="")
         _save(session)
+        _open_sessions.add(_dir(sid))
         logger.info("Recording %s continues after a restart", sid)
         return True
 
 
-def finalize(sid, timeout=3600):
-    """Join the parts into one MP4 (copy only) and remove the parts when that worked."""
+def finalize(sid, timeout=3600, *, background=False):
+    """Reserve the session before queuing work so a second request cannot start another join."""
     with _lock:
+        folder = _dir(sid)
         if sid in _finalizing:
             return False, "Already finalizing"
+        _load(sid)
+        _finalizing.add(sid)
+
+    def finish():
+        try:
+            with _exports_changed:
+                if not _exports_changed.wait_for(
+                        lambda: _exports.get(folder, {}).get("state") != "running", timeout=timeout):
+                    session = _load(sid)
+                    session.update(state="unfinished", error="Export still running. Finish saving after it completes.")
+                    _save(session)
+                    return False, session["error"]
+            return _join_parts(sid, timeout)
+        finally:
+            with _lock:
+                _open_sessions.discard(folder)
+                _finalizing.discard(sid)
+
+    if not background:
+        return finish()
+    try:
+        threading.Thread(target=finish, daemon=True, name=f"finalize-{sid}").start()
+    except RuntimeError:
+        with _lock:
+            _finalizing.discard(sid)
+            _open_sessions.discard(folder)
+        raise
+    return True, "Saving the recording…"
+
+
+def _join_parts(sid, timeout):
+    with _lock:
         session = _load(sid)
         parts = [p for p in session["parts"] if (_dir(sid) / p["file"]).exists()]
         if parts:
-            _finalizing.add(sid)
             session["state"], session["error"] = "finalizing", ""
         else:
             session["state"] = "empty" if not session.get("file") else "done"
@@ -746,8 +837,6 @@ def finalize(sid, timeout=3600):
         return False, str(exc)
     finally:
         listing.unlink(missing_ok=True)
-        with _lock:
-            _finalizing.discard(sid)
 
 
 def _finish_live_windows(sid):
@@ -774,7 +863,7 @@ def _finish_live_windows(sid):
 
 
 def finalize_async(sid):
-    threading.Thread(target=finalize, args=(sid,), daemon=True, name=f"finalize-{sid}").start()
+    return finalize(sid, background=True)
 
 
 def recover():
@@ -802,7 +891,11 @@ def delete_session(sid):
         session = _load(sid)
         if session["state"] in ("recording", "finalizing"):
             raise ValueError("Stop the recording first")
-        shutil.rmtree(_dir(sid))
+        folder = _dir(sid)
+        if sid in _finalizing or folder in _open_sessions or _exports.get(folder, {}).get("state") == "running":
+            raise ValueError("Wait for saving and exports to finish")
+        shutil.rmtree(folder)
+        _exports.pop(folder, None)
 
 
 def _size(folder):
@@ -826,7 +919,7 @@ def describe(session, live_wall=None):
     return {"id": session["id"], "title": session["title"], "created": session["created"],
             "state": session["state"], "profile": session["profile"], "error": session.get("error", ""),
             "file": session.get("file"), "duration": round(duration or 0.0, 1),
-            "bytes": _size(folder), "markers": markers,
+            "bytes": _size(folder), "markers": markers, "export": dict(_exports.get(folder, {})),
             "reel": "highlights.mp4" if (folder / "highlights.mp4").exists() else None,
             "cuts": len(session.get("cuts", [])),
             "live": [{"id": w["id"], "camera": w["camera"], "time": _timestamp(w["offset"]),

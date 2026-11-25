@@ -1,17 +1,14 @@
-"""Phone camera status and remote zoom (Chameleon Stream app).
+"""Phone camera status, remote commands and zoom (Chameleon Stream app).
 
-While it streams over SRT the app POSTs a status report to /api/camera-report/<cam>:
-battery, charging, temperature, Android thermal status and its zoom (current, min, max).
-Long poll: the request is held for up to HOLD_S seconds and answered at once when the
-operator asks for a zoom or the camera's tally changes (on air, PiP, ...), so a phone sends
-about one request every 30 s, yet zoom and tally react immediately. The answer carries the requested zoom with a sequence number (the phone
-applies each request once; a pinch on the phone is not undone). Nothing is pushed to the
-phone: it needs no server and works behind any router.
+A streaming phone reports zoom, health and tally through the SRT camera slot's HTTP
+endpoint. A Gimbal-mode phone can also report from its idle preview. Its control
+session receives short-lived operator commands and reports the hardware state back.
 """
 import json
 import math
 import threading
 import time
+import uuid
 
 HOLD_S = 28.0             # long poll: answer after this at the latest
 REPORT_STALE = 45.0       # seconds: older reports are not shown (phone gone / app stopped)
@@ -26,6 +23,49 @@ _zoom_requests = {}       # cam -> {"zoom": float, "seq": int, "at": float}
 # Request numbers keep growing across restarts of this app: a phone that applied request n
 # before a restart must not ignore the first new one (it would also be n otherwise).
 _SEQ_BASE = int(time.time()) - 1_700_000_000
+
+
+# Each phone link has a fresh session. Commands expire even if the phone loses Wi-Fi.
+CONTROL_POLL_S = 4
+CONTROL_TTL = 12
+_commands = {}
+ACTIONS = ("start_stream", "stop_stream", "connect_gimbal", "disconnect_gimbal", "start_tracking", "stop_tracking")
+
+
+def _phone_control(data):
+    session = data.get("control_session")
+    if not isinstance(session, str) or not 1 <= len(session) <= 64 or data.get("mode") != "gimbal":
+        return None
+    stream, gimbal, tracking = data.get("stream"), data.get("gimbal"), data.get("tracking")
+    if stream not in ("stopped", "connecting", "live") or gimbal not in ("disconnected", "connecting", "ready") or type(tracking) is not bool:
+        raise ValueError("Invalid phone control state")
+    error = data.get("gimbal_error")
+    return {"session": session, "stream": stream, "gimbal": gimbal, "tracking": tracking,
+            "gimbal_error": error[:120] if gimbal == "disconnected" and isinstance(error, str) else None}
+
+
+def _actions(control):
+    actions = ["start_stream" if control["stream"] == "stopped" else "stop_stream",
+               "connect_gimbal" if control["gimbal"] == "disconnected" else "disconnect_gimbal"]
+    if control["gimbal"] == "ready":
+        actions.append("stop_tracking" if control["tracking"] else "start_tracking")
+    return actions
+
+
+def request_action(cam, action):
+    with _changed:
+        report = _reports.get(cam, {})
+        control = report.get("control")
+        if not control or time.time() - report["at"] > CONTROL_TTL:
+            raise ValueError("Open Chameleon Stream in Gimbal mode and enable dashboard control")
+        if action not in ACTIONS or action not in _actions(control):
+            raise ValueError("This action is unavailable in the phone’s current state")
+        pending = _commands.get(cam)
+        if pending and pending["expires"] > time.monotonic() and "error" not in pending:
+            raise ValueError("The phone is still handling the previous command")
+        _commands[cam] = {"id": uuid.uuid4().hex, "action": action, "session": control["session"],
+                          "expires": time.monotonic() + CONTROL_TTL}
+        _changed.notify_all()
 
 
 def _number(data, key, low, high):
@@ -51,6 +91,7 @@ def clean_report(data):
     charging = data.get("charging")
     if charging is not None and type(charging) is not bool:
         raise ValueError("charging must be true or false")
+    report["control"] = _phone_control(data)
     report["charging"] = charging
     report["remote_zoom"] = data.get("remote_zoom") is True
     thermal = data.get("thermal")
@@ -101,10 +142,25 @@ def record_report(cam, data, hold=None, tally=None, config=None):
     wait = HOLD_S if hold is None else hold
     if data.get("wait") is not True or type(known) is not int:
         wait = 0
+    control = report["control"]
+    if control:
+        wait = min(wait, CONTROL_POLL_S)
     deadline = time.monotonic() + wait
     with _changed:
         report["at"] = time.time()
         _reports[cam] = report
+        pending = _commands.get(cam)
+        if pending and (not control or control["session"] != pending["session"]):
+            _commands.pop(cam)
+        elif pending and data.get("action_ack") == pending["id"]:
+            error = data.get("action_error")
+            if isinstance(error, str) and error:
+                pending["error"] = error[:120]
+            elif pending["action"] in ("start_tracking", "stop_tracking") and control["gimbal"] != "ready":
+                pending["error"] = "Gimbal disconnected before confirming tracking"
+            elif pending["action"] not in _actions(control):
+                # For tracking, wait for the gimbal's own state packet.
+                _commands.pop(cam)
         while True:
             request = _zoom_requests.get(cam)
             seq = request["seq"] if request else _SEQ_BASE
@@ -113,8 +169,22 @@ def record_report(cam, data, hold=None, tally=None, config=None):
             tally_changed = known_tally is not None and now_tally is not None and now_tally != known_tally
             now_config = _safe_tally(config)
             config_changed = now_config is not None and _config_key(now_config) != known_config
-            if seq != known or tally_changed or config_changed or left <= 0:
+            pending = _commands.get(cam)
+            if pending and now_config is not None and now_config.get("mode") != "gimbal":
+                _commands.pop(cam)
+                pending = None
+            current = _reports.get(cam) is report
+            send = (current and pending and control and pending["session"] == control["session"]
+                    and pending["expires"] > time.monotonic() and "error" not in pending
+                    and data.get("action_ack") != pending["id"]
+                    and (config is None or now_config is not None))
+            if send or seq != known or tally_changed or config_changed or left <= 0:
                 answer = {"zoom": request["zoom"] if request else None, "zoom_seq": seq}
+                if control:
+                    answer["supports_actions"] = True
+                if send:
+                    answer["action"] = {"id": pending["id"], "name": pending["action"],
+                                        "valid_ms": int(1000 * (pending["expires"] - time.monotonic()))}
                 if now_tally is not None:
                     answer["tally"] = now_tally
                 if now_config is not None:
@@ -143,6 +213,16 @@ def get_reports():
             if age > REPORT_STALE:
                 continue
             item = {k: v for k, v in report.items() if k != "at"}
+            control = item.pop("control", None)
+            if control and age <= CONTROL_TTL:
+                command = _commands.get(cam)
+                item["control"] = {k: control[k] for k in ("stream", "gimbal", "tracking", "gimbal_error")}
+                item["control"]["actions"] = _actions(control)
+                if command:
+                    if "error" in command or command["expires"] <= time.monotonic():
+                        item["control"]["error"] = command.get("error", "Phone did not confirm the command")
+                    else:
+                        item["control"]["pending"] = command["action"]
             item["age_s"] = round(age, 1)
             item["warning"] = "; ".join(warnings(report))
             pending = _zoom_requests.get(cam)
@@ -187,3 +267,4 @@ def reset():
     with _lock:
         _reports.clear()
         _zoom_requests.clear()
+        _commands.clear()

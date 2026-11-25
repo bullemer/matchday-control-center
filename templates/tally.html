@@ -173,11 +173,16 @@
     // Poll tally state
     async function pollTally() {
       try {
-        const res = await fetch('/api/tally/' + camId, {cache: 'no-store'});
+        const res = await fetch('/api/tally/' + camId, {cache: 'no-store', signal: AbortSignal.timeout(3500)});
         if (!res.ok) throw new Error('Status error');
         const data = await res.json();
         updateTallyDisplay(data);
       } catch {
+        document.getElementById('live-dot').className = 'w-3 h-3 rounded-full bg-slate-500';
+        const live = document.getElementById('live-text');
+        live.className = 'font-bold text-slate-400';
+        live.textContent = 'STATUS UNKNOWN';
+        lastOnAir = false;
         renderState('offline', 'OFFLINE', 'Connecting to laptop server…');
       } finally {
         setTimeout(pollTally, 500);

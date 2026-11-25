@@ -2,6 +2,7 @@ import base64
 import copy
 import os
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -122,6 +123,81 @@ class SettingsApiTests(unittest.TestCase):
         self.assertEqual(st.get('recordings_dir'), str(target))   # a failed change saves nothing
         with patch.object(a, 'get_recording_status', return_value={'active': True}):
             self.assertEqual(self.post('/api/settings', {'min_free_gb': 5}).status_code, 400)
+
+    def test_rejected_settings_leave_storage_and_existing_files_intact(self):
+        target = Path(self.tmp.name) / 'selected'
+        target.mkdir()
+        sentinel = target / '.write-test'
+        sentinel.write_text('operator file')
+        old = recordings.RECORDINGS_DIR
+        self.assertEqual(self.post('/api/settings', {'recordings_dir': str(target), 'half_length': 2}).status_code, 400)
+        self.assertEqual(recordings.RECORDINGS_DIR, old)
+        with patch.object(st.os, 'replace', side_effect=OSError('disk full')):
+            self.assertEqual(self.post('/api/settings', {'recordings_dir': str(target)}).status_code, 500)
+        self.assertEqual((recordings.RECORDINGS_DIR, st.get('recordings_dir')), (old, ''))
+        self.assertEqual(self.post('/api/settings', {'recordings_dir': str(target)}).status_code, 200)
+        self.assertEqual(sentinel.read_text(), 'operator file')
+
+    def test_storage_stays_locked_through_final_save(self):
+        sid = recordings.create_session('720p', 'Final')
+        target = str(Path(self.tmp.name) / 'next')
+        def join(session, timeout):
+            self.assertTrue(self.client.get('/api/settings', headers=self.auth()).json['recordings']['busy'])
+            self.assertEqual(self.post('/api/settings', {'recordings_dir': target}).status_code, 400)
+            return True, 'saved'
+        with patch.object(recordings, '_join_parts', side_effect=join):
+            self.assertEqual(recordings.finalize(sid), (True, 'saved'))
+        self.assertEqual(self.post('/api/settings', {'recordings_dir': target}).status_code, 200)
+
+    def test_repeated_export_uses_one_job_and_reports_completion(self):
+        sid = recordings.create_session('720p', 'Final')
+        recordings.add_marker(sid, wall=10)
+        entered, release = threading.Event(), threading.Event()
+        def build(session):
+            entered.set()
+            self.assertTrue(release.wait(5))
+            return 'highlights.mp4'
+        with patch.object(recordings, 'build_reel', side_effect=build) as exporter:
+            url = f'/api/recordings/{sid}/reel'
+            self.assertEqual(self.post(url, {'background': True}).status_code, 202)
+            try:
+                self.assertTrue(entered.wait(2))
+                self.assertEqual(self.post(url, {'background': True}).status_code, 202)
+                self.assertEqual(recordings.get(sid)['export']['state'], 'running')
+            finally:
+                release.set()
+            with recordings._exports_changed:
+                self.assertTrue(recordings._exports_changed.wait_for(
+                    lambda: recordings.get(sid)['export']['state'] == 'done', timeout=2))
+            exporter.assert_called_once_with(sid)
+
+    def test_stop_persists_destination_removal_before_reply(self):
+        a._live_state_path().write_text('{"targets":{"youtube":{}}}')
+        with patch.object(a, 'stop_stream', return_value=(True, 'Stopped')), patch.object(a, 'resume_state', return_value=None):
+            self.assertTrue(self.post('/api/stream/stop', {}).json['ok'])
+        self.assertFalse(a._live_state_path().exists())
+
+    def test_stop_during_recovery_preserves_recording_and_other_destinations(self):
+        pending = {'targets': {'youtube': {}, 'custom': {}}, 'record': True, 'session': 'match'}
+        with patch.object(a, '_resume_pending', pending), patch.object(a, 'resume_state', return_value=None), \
+                patch.object(a, 'stop_stream', return_value=(False, 'Not live yet')):
+            self.assertTrue(self.post('/api/stream/stop', {'destination': 'youtube'}).json['ok'])
+            self.assertEqual(a._load_resume()['targets'], {'custom': {}})
+            self.assertTrue(self.post('/api/stream/stop', {}).json['ok'])
+            self.assertEqual(a._load_resume()['targets'], {})
+            self.assertEqual(a._load_resume()['session'], 'match')
+
+    def test_meter_poll_skips_recording_lookup(self):
+        with patch.object(m, '_recording', 'active'), patch.object(recordings, 'get') as lookup:
+            self.assertTrue(self.client.get('/api/audio/levels', headers=self.auth()).json['ok'])
+            lookup.assert_not_called()
+
+    def test_score_at_limit_has_no_highlight_side_effect(self):
+        with patch.object(a, '_auto_goal_marker') as marker:
+            for score, delta in [(0, -1), (999, 1)]:
+                self.post('/api/scoreboard/update', {'home_score': score})
+                self.assertTrue(self.post('/api/scoreboard/update', {'team': 'home', 'delta': delta}).json['ok'])
+            marker.assert_not_called()
 
     def test_login_change(self):
         self.assertEqual(self.post('/api/settings/login', {'current_password': 'wrong', 'new_password': 'longenough'}).status_code, 403)

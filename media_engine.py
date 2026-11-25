@@ -101,7 +101,7 @@ _relay_slot = 0
 # instead of its "STREAM IS OFFLINE" segment.
 # v2: without B-frames. WebRTC cannot play B-frames, so the browser preview of the program
 # spun forever until the first cut. A new name makes existing installs create the new card.
-OFFLINE_CARD = str(BASE / "data/offline-v2.mp4")
+OFFLINE_CARD = str(BASE / "data/offline-v3.mp4")
 CAMERA_USER = "camera"
 GAIN_MIN, GAIN_MAX = -60.0, 12.0
 _relay_failures = 0
@@ -434,12 +434,31 @@ def _ensure_offline_card():
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=0x101418:s=1280x720:r=30:d=0.5",
                         "-f", "lavfi", "-i", "anullsrc=r=48000:cl=stereo", "-vf",
                         "drawtext=text='Back in a moment':fontcolor=white:fontsize=48:x=(w-tw)/2:y=(h-th)/2",
-                        "-t", "0.5", "-c:v", "libx264", "-preset", "veryfast", "-bf", "0", "-pix_fmt", "yuv420p", "-g", "15",
+                        "-force_key_frames", "0,0.1", "-t", "0.5", "-c:v", "libx264", "-preset", "veryfast", "-bf", "0", "-pix_fmt", "yuv420p", "-g", "15",
                         "-c:a", "aac", "-ar", "48000", "-ac", "2", "-shortest", OFFLINE_CARD + ".tmp.mp4"],
                        check=True, capture_output=True, timeout=30)
-        os.replace(OFFLINE_CARD + ".tmp.mp4", OFFLINE_CARD)
+        # MediaMTX briefly switches to this file while replacing a publisher.
+        # Give the incoming publisher three frame periods to arrive. Delimiter-only
+        # samples advance the offline loop clock without emitting a picture. The
+        # forced IDR at 0.1 s starts the real card independently on a longer loss.
+        temporary = OFFLINE_CARD + ".tmp.mp4"
+        probe = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                                "-show_packets", "-show_entries", "packet=pos,size,flags",
+                                "-of", "json", temporary], check=True, capture_output=True, timeout=5)
+        packets = json.loads(probe.stdout)["packets"]
+        if len(packets) < 4 or "K" not in packets[3]["flags"]:
+            raise ValueError("Offline card is missing its recovery keyframe")
+        with open(temporary, "r+b") as card:
+            for packet in packets[:3]:
+                size = int(packet["size"])
+                if size < 6:
+                    raise ValueError("Invalid offline video sample")
+                card.seek(int(packet["pos"]))
+                # Length-prefixed H.264 access unit delimiter and trailing zero bytes.
+                card.write((size - 4).to_bytes(4, "big") + bytes([9, 0xf0]) + bytes(size - 6))
+        os.replace(temporary, OFFLINE_CARD)
         return True
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         logger.warning("Cannot create the offline card; MediaMTX's default is used")
         return False
 
@@ -1188,21 +1207,28 @@ def _error_text():
     return "; ".join(_errors[part] for part in ERROR_PARTS if _errors.get(part))
 
 
+def meter_status():
+    camera = get_active_camera()
+    return {"active_camera": camera, "live": get_youtube_running(),
+            "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if camera else []}
+
+
 def get_stream_status():
     # Status must remain responsive while a control operation awaits readiness.
-    active = get_youtube_running()
+    meter = meter_status()
+    camera, active = meter["active_camera"], meter["live"]
     state = "reconnecting" if _want_stream and _state == "live" and not active else _state
     return {"active": active, "state": state,
-            "active_camera": get_active_camera(), "selected_camera": _active_camera,
+            "active_camera": camera, "selected_camera": _active_camera,
             "pending_camera": _pending_camera,
             "layout": dict(_layout), "cut_source": _cut_source,
-            "secondary_camera": _relay_secondary if get_active_camera() else None,
+            "secondary_camera": _relay_secondary if camera else None,
             "layout_warning": _layout_warning if _relay_proc else "",
             "audio_source": get_audio_source(), "muted": _muted,
-            "audio_on_air": [c for c in _relay_channels if c not in _relay_muted] if get_active_camera() else [],
+            "audio_on_air": meter["audio_on_air"],
             "audio_warning": _audio_warning if _relay_proc else "",
             "started_at": _started_at, "destinations": get_destinations(), "program_path": program_path(),
-            "error": _error_text(), "encoder": get_encoder_status(), "profile": _profile, "fallback": get_active_camera() is None and not _replay,
+            "error": _error_text(), "encoder": get_encoder_status(), "profile": _profile, "fallback": camera is None and not _replay,
             "recording": get_recording_status(), "replay": get_replay_status()}
 
 

@@ -77,6 +77,72 @@ class CameraControlTests(unittest.TestCase):
         self.assertEqual(cc.record_report('cam3', dict(REPORT, wait=True, zoom_seq=b + 1), hold=0.1)['zoom_seq'], b + 1)
 
 
+class PhoneActionTests(unittest.TestCase):
+    def setUp(self):
+        cc.reset()
+        self.phone = dict(REPORT, mode='gimbal', control_session='phone-A', stream='stopped',
+                          gimbal='disconnected', tracking=False)
+        cc.record_report('cam1', self.phone)
+
+    def test_all_actions_require_confirmation_and_use_reported_state(self):
+        for action, update in [
+            ('connect_gimbal', {'gimbal': 'ready'}), ('start_tracking', {'tracking': True}),
+            ('start_stream', {'stream': 'live'}), ('stop_stream', {'stream': 'stopped'}),
+            ('stop_tracking', {'tracking': False}), ('disconnect_gimbal', {'gimbal': 'disconnected'})
+        ]:
+            cc.request_action('cam1', action)
+            with self.assertRaises(ValueError):
+                cc.request_action('cam1', action)
+            sent = cc.record_report('cam1', self.phone)['action']
+            self.assertEqual(sent['name'], action)
+            self.assertEqual(cc.record_report('cam1', self.phone)['action']['id'], sent['id'])
+            self.phone['action_ack'] = sent['id']
+            self.assertNotIn('action', cc.record_report('cam1', self.phone))
+            self.assertEqual(cc.get_reports()['cam1']['control']['pending'], action)
+            self.phone.update(update)
+            cc.record_report('cam1', self.phone)
+            self.assertNotIn('pending', cc.get_reports()['cam1']['control'])
+
+    def test_mode_session_expiry_and_failure(self):
+        cc.record_report('cam1', dict(self.phone, gimbal_error='disconnected (status 133)'))
+        self.assertEqual(cc.get_reports()['cam1']['control']['gimbal_error'], 'disconnected (status 133)')
+        with self.assertRaises(ValueError):
+            cc.request_action('cam1', 'start_tracking')
+        cc.request_action('cam1', 'start_stream')
+        self.assertNotIn('action', cc.record_report('cam1', self.phone, config=lambda: {'mode':'fixed'}))
+        self.phone['control_session'] = 'new-link'
+        self.assertNotIn('action', cc.record_report('cam1', self.phone))
+        cc.request_action('cam1', 'connect_gimbal')
+        with patch.object(cc.time, 'monotonic', return_value=time.monotonic() + cc.CONTROL_TTL + 1):
+            self.assertNotIn('action', cc.record_report('cam1', self.phone))
+            self.assertIn('error', cc.get_reports()['cam1']['control'])
+        cc.record_report('cam1', dict(self.phone, control_session='replacement'))
+        cc.record_report('cam1', self.phone)
+        cc.request_action('cam1', 'connect_gimbal')
+        sent = cc.record_report('cam1', self.phone)['action']
+        cc.record_report('cam1', dict(self.phone, action_ack=sent['id'], action_error='Bluetooth is off'))
+        self.assertEqual(cc.get_reports()['cam1']['control']['error'], 'Bluetooth is off')
+        with patch.object(cc.time, 'time', return_value=time.time() + cc.CONTROL_TTL + 1):
+            with self.assertRaises(ValueError):
+                cc.request_action('cam1', 'start_stream')
+        for phone in (dict(REPORT), dict(self.phone, mode='fixed'), dict(self.phone, control_session=None)):
+            cc.record_report('cam1', phone)
+            with self.assertRaises(ValueError):
+                cc.request_action('cam1', 'start_stream')
+
+    def test_action_route_requires_operator_and_tracking_mount(self):
+        import app as a
+        client = a.app.test_client()
+        with patch.dict(a.app.config, OPERATOR_USER='operator', OPERATOR_PASSWORD='test'):
+            url = '/api/cameras/cam1/action'
+            body = {'action': 'start_stream'}
+            self.assertEqual(client.post(url, json=body).status_code, 401)
+            with patch.object(a, 'phone_config', return_value={'mode':'fixed'}):
+                self.assertEqual(client.post(url, json=body, auth=('operator','test')).status_code, 400)
+            with patch.object(a, 'phone_config', return_value={'mode':'gimbal'}):
+                self.assertEqual(client.post(url, json=body, auth=('operator','test')).status_code, 202)
+
+
 class TallyLongPollTests(unittest.TestCase):
     def setUp(self):
         cc.reset()
@@ -208,3 +274,4 @@ class CameraReportApiTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+

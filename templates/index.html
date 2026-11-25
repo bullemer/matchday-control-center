@@ -559,6 +559,9 @@
           <span class="text-sm font-semibold text-white">📶 Field router</span>
           <span id="router-link" class="text-xs px-2 py-0.5 rounded bg-slate-700 text-slate-300">—</span>
         </div>
+        <label class="block mb-3 text-sm">Camera network interface
+          <select id="router-interface" onchange="setNetworkMode('router', this.value)" class="bg-slate-700 rounded px-2 py-1"></select>
+        </label>
         <dl class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs mb-3">
           <div><dt class="text-slate-400">Camera address (laptop)</dt><dd id="router-ip" class="text-white font-mono text-sm">—</dd></div>
           <div><dt class="text-slate-400">Router</dt><dd id="router-gateway" class="text-white font-mono text-sm">—</dd></div>
@@ -711,6 +714,16 @@
               <span data-phone-zoom-value class="w-12 text-center text-slate-200 font-mono"></span>
               <button type="button" onclick="cameraZoom('{{ cam.id }}', {step: 1})" aria-label="{{ cam.label }} zoom in" class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-200 font-bold">+</button>
             </span>
+          </div>
+          <div data-gimbal-panel="{{ cam.id }}" class="hidden mb-3">
+            <p data-gimbal-status aria-live="polite" class="text-xs text-slate-300 mb-1"></p>
+            <div class="flex flex-wrap gap-1">
+              {% for kind in ['stream', 'gimbal', 'tracking'] %}
+              <button type="button" data-gimbal-button="{{ kind }}" disabled
+                      onclick="sendPhoneAction('{{ cam.id }}', this.dataset.action)"
+                      class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs text-white disabled:opacity-50"></button>
+              {% endfor %}
+            </div>
           </div>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('{{ cam.id }}'))"
@@ -1239,6 +1252,7 @@
         <h3 class="font-semibold text-white mb-1">💾 Recording storage</h3>
         <p class="text-xs text-slate-400 mb-3">Folder for recordings (e.g. an external disk) and the free space a recording needs to start.
           Recordings already made stay in the old folder. Not while recording.</p>
+        <p id="storage-busy" hidden class="text-xs text-brand-amber mb-2">Recording, saving or exporting. Storage settings unlock when finished.</p>
         <p data-settings-locked="storage" class="hidden text-xs text-brand-amber mb-2">The folder is set by the environment variable MCC_RECORDINGS_DIR.</p>
         <div class="grid sm:grid-cols-[1fr_10rem] gap-3">
           <label class="text-xs text-slate-300">Folder <input id="set-recdir" spellcheck="false" class="dest-input text-sm font-mono w-full"></label>
@@ -1869,6 +1883,13 @@
       } catch (err) { showToast('Settings could not be loaded', 'error'); }
     }
 
+    let storageLocked = false;
+    function setStorageBusy(busy) {
+      document.getElementById('storage-busy').hidden = !busy;
+      document.querySelectorAll('#settings-storage input, #settings-storage button')
+        .forEach(el => el.disabled = storageLocked || !!busy);
+    }
+
     function renderSettings(d) {
       const s = d.settings;
       document.getElementById('set-user').value = d.login.user;
@@ -1890,6 +1911,8 @@
         const form = {login: 'settings-login', camera: 'settings-camera', storage: 'settings-storage'}[key];
         document.querySelectorAll(`#${form} input, #${form} button`).forEach(el => el.disabled = locked);
       }
+      storageLocked = d.recordings.locked;
+      setStorageBusy(d.recordings.busy);
     }
 
     function generatePassword() {
@@ -2724,7 +2747,7 @@
       const clip = mk.clip
         ? `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, mk.clip))}')" aria-label="Play clip">▶</button>
            <a class="rec-action" href="${esc(recordingUrl(rec.id, mk.clip, true))}" aria-label="Download clip">⬇</a>`
-        : `<button class="rec-action" onclick="clipMarker(this, '${esc(rec.id)}', '${esc(mk.id)}')">🎬 Clip</button>`;
+        : `<button class="rec-action" ${rec.export?.state === 'running' || rec.state === 'finalizing' ? 'disabled' : ''} onclick="clipMarker(this, '${esc(rec.id)}', '${esc(mk.id)}')">🎬 Clip</button>`;
       return `<li class="marker-row" data-marker="${esc(mk.id)}">
         <span class="font-mono text-sm text-white">${esc(mk.time)}</span>
         <select onchange="relabelMarker('${esc(rec.id)}', '${esc(mk.id)}', this.value)" aria-label="Highlight type">${labels}</select>
@@ -2815,6 +2838,7 @@
       renderMatchZoom();
       for (const cam of CAMERA_IDS) {
         const r = reports[cam];
+        renderGimbal(cam, r?.control);
         document.querySelectorAll(`[data-phone-box="${cam}"]`).forEach(box => {
           box.classList.toggle('shown', !!r);
           if (!r) return;
@@ -2891,6 +2915,51 @@
       if (v) document.getElementById('match-zoom-value').textContent = v.textContent;
     }
 
+    const phoneActions = {
+      start_stream: 'Start stream', stop_stream: 'Stop stream',
+      connect_gimbal: 'Connect gimbal', disconnect_gimbal: 'Disconnect gimbal',
+      start_tracking: 'Start tracking', stop_tracking: 'Stop tracking'
+    };
+    const submittingAction = new Set();
+
+    function renderGimbal(cam, control) {
+      const panel = document.querySelector(`[data-gimbal-panel="${cam}"]`);
+      if (!panel) return;
+      const visible = camInfo(cam).mount === 'tracking';
+      panel.classList.toggle('hidden', !visible);
+      if (!visible) return;
+      const status = panel.querySelector('[data-gimbal-status]');
+      if (!control) {
+        status.textContent = 'Open Chameleon Stream 0.10.0 or later in Gimbal mode, save the SRT target and enable Follow dashboard.';
+      } else {
+        const tracking = control.gimbal === 'ready' ? (control.tracking ? 'on' : 'off') : 'unavailable';
+        status.textContent = `Stream ${control.stream} · Gimbal ${control.gimbal} · Tracking ${tracking}`
+          + (control.pending ? ` · Waiting for phone (${phoneActions[control.pending]})` : '')
+          + (control.error || control.gimbal_error ? ` · ${control.error || control.gimbal_error}` : '');
+      }
+      for (const button of panel.querySelectorAll('[data-gimbal-button]')) {
+        const kind = button.dataset.gimbalButton;
+        const action = control?.actions.find(a => a.endsWith('_' + kind));
+        button.dataset.action = action || '';
+        button.textContent = phoneActions[action || (kind === 'gimbal' ? 'connect_gimbal' : 'start_' + kind)];
+        button.disabled = !action || !!control.pending || submittingAction.has(cam);
+      }
+    }
+
+    async function sendPhoneAction(cam, action) {
+      if (!action || submittingAction.has(cam)) return;
+      submittingAction.add(cam);
+      renderGimbal(cam, lastReports[cam]?.control);
+      try {
+        const {ok, data} = await apiRequest(`/api/cameras/${cam}/action`, {action});
+        if (!ok) showToast(data.error || 'Phone command failed', 'error');
+        else if (lastReports[cam]?.control) lastReports[cam].control.pending = action;
+      } finally {
+        submittingAction.delete(cam);
+        renderGimbal(cam, lastReports[cam]?.control);
+      }
+    }
+
     async function cameraZoom(cam, body) {
       const {ok, data} = await apiRequest(`/api/cameras/${cam}/zoom`, body);
       if (!ok) return showToast('❌ ' + (data.error || 'Zoom failed'), 'error');
@@ -2919,12 +2988,13 @@
 
     function recordingCard(rec) {
       const [chipText, chipClass] = recordingChips[rec.state] || [rec.state, 'chip chip-slate'];
-      const busy = ['recording', 'finalizing'].includes(rec.state);
+      const exporting = rec.export?.state === 'running';
+      const busy = exporting || ['recording', 'finalizing'].includes(rec.state);
       const actions = [
         rec.file && `<a class="rec-action" href="${esc(recordingUrl(rec.id, rec.file, true))}">⬇ Download MP4</a>`,
         rec.file && `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, rec.file))}')">▶ Watch</button>`,
         rec.state === 'unfinished' && `<button class="rec-action" onclick="recordingAction(this, '${esc(rec.id)}', 'finalize')">🔧 Finish saving</button>`,
-        rec.markers.length && `<button class="rec-action" onclick="recordingAction(this, '${esc(rec.id)}', 'reel')">🎞 ${rec.reel ? 'Rebuild' : 'Build'} highlight reel</button>`,
+        rec.markers.length && `<button class="rec-action" ${exporting || rec.state === 'finalizing' ? 'disabled' : ''} onclick="recordingAction(this, '${esc(rec.id)}', 'reel')">🎞 ${rec.reel ? 'Rebuild' : 'Build'} highlight reel</button>`,
         rec.reel && `<a class="rec-action" href="${esc(recordingUrl(rec.id, rec.reel, true))}">⬇ Highlight reel</a>`,
         rec.reel && `<button class="rec-action" onclick="toggleVideo(this, '${esc(recordingUrl(rec.id, rec.reel))}')">▶ Watch reel</button>`,
         !busy && `<button class="rec-action rec-danger" onclick="deleteRecording('${esc(rec.id)}')">🗑 Delete</button>`,
@@ -2943,6 +3013,7 @@
           <span class="${chipClass}">${esc(chipText)}</span>
         </div>
         <p data-rec-meta class="text-xs text-slate-400"></p>
+        ${rec.export?.state ? `<p role="status" class="text-sm">${esc(rec.export.marker ? 'Clip' : 'Highlight reel')} · ${esc(({running:'Exporting…',done:'Ready',failed:'Failed'})[rec.export.state])} ${esc(rec.export.message)}</p>` : ''}
         ${rec.error ? `<p class="text-xs font-semibold text-brand-amber">⚠ ${esc(rec.error)}</p>` : ''}
         ${actions ? `<div class="flex flex-wrap gap-2">${actions}</div>` : ''}
         <div data-player></div>
@@ -3011,7 +3082,7 @@
       finally { if (button) button.disabled = false; await loadRecordings(true); }
     }
     function clipMarker(button, id, marker) {
-      return recordingRequest(button, `/api/recordings/${id}/markers/${marker}/clip`);
+      return recordingRequest(button, `/api/recordings/${id}/markers/${marker}/clip`, {background:true});
     }
     function relabelMarker(id, marker, label) {
       document.activeElement.blur();
@@ -3021,8 +3092,7 @@
       if (confirm('Remove this highlight?')) return recordingRequest(null, `/api/recordings/${id}/markers/${marker}`, {delete: true});
     }
     function recordingAction(button, id, action) {
-      if (action === 'reel') showToast('Building the highlight reel…', 'info');
-      return recordingRequest(button, `/api/recordings/${id}/${action}`);
+      return recordingRequest(button, `/api/recordings/${id}/${action}`, {background: action === 'reel'});
     }
     function deleteRecording(id) {
       if (confirm('Delete this recording with all its clips? This cannot be undone.')) return recordingRequest(null, `/api/recordings/${id}/delete`);
@@ -3907,8 +3977,8 @@
     }
 
     // ──────────────────────── Own field router ────────────────────────
-    async function setNetworkMode(mode) {
-      const {ok, data} = await apiRequest('/api/network/mode', {mode});
+    async function setNetworkMode(mode, iface) {
+      const {ok, data} = await apiRequest('/api/network/mode', {mode, interface: iface});
       if (!ok) return showToast('❌ ' + (data.error || 'Could not change the camera network'), 'error');
       showToast(mode === 'router' ? '📶 Own router: cameras connect through the field router' : 'Camera network: automatic', 'success');
       if (data.network) { state.network = data.network; renderCameraNetwork(data.network); renderRouter(data.network); }
@@ -3934,6 +4004,14 @@
       const card = document.getElementById('router-card');
       card.classList.toggle('hidden', mode !== 'router');
       if (mode !== 'router') return;
+      const picker = document.getElementById('router-interface');
+      const selected = network.router_iface || '';
+      const choices = [...new Set(['', ...(network.interfaces || []), selected])];
+      if (picker.dataset.options !== JSON.stringify(choices)) {
+        picker.replaceChildren(...choices.map(dev => new Option(dev || 'Automatic', dev)));
+        picker.dataset.options = JSON.stringify(choices);
+      }
+      picker.value = selected;
       const r = network.router || {};
       const link = document.getElementById('router-link');
       link.textContent = !r.connected ? '⚠ not connected' : r.type === 'ethernet' ? `🔌 cable · ${r.iface}` : `📶 Wi-Fi “${r.name}”`;
@@ -3974,7 +4052,15 @@
       let tone = 'border-green-800 bg-green-950/40';
       hotspotNote.classList.add('hidden');
       if (network.network_mode === 'router') {
-        const r = network.router || {};
+        const picker = document.getElementById('router-interface');
+      const selected = network.router_iface || '';
+      const choices = [...new Set(['', ...(network.interfaces || []), selected])];
+      if (picker.dataset.options !== JSON.stringify(choices)) {
+        picker.replaceChildren(...choices.map(dev => new Option(dev || 'Automatic', dev)));
+        picker.dataset.options = JSON.stringify(choices);
+      }
+      picker.value = selected;
+      const r = network.router || {};
         if (network.camera_mode === 'router') {
           title.textContent = `📶 Cameras join the field router's Wi-Fi — server ${network.camera_ip}`;
           hint.textContent = r.type === 'ethernet' ? `The laptop is on the router by cable (${r.iface}).`
@@ -4019,9 +4105,12 @@
     }
 
     // ──────────────────────── Poll /api/status ────────────────────────
-    let statusFailures = 0;
+    let statusFailures = 0, statusSequence = 0, appliedStatus = 0;
     async function pollStatus() {
+      const sequence = ++statusSequence;
       const data = await apiGet('/api/status');
+      if (sequence < appliedStatus) return;
+      appliedStatus = sequence;
       if (data && data.ok) statusFailures = 0;
       else if (++statusFailures < 2) {
         // One missed poll is not an outage: keep the previews and tallies as they are.
@@ -4035,6 +4124,7 @@
         state.activeCam = state.selectedCam = state.serverPendingCam = null;
         state.cameras = {};
         state.connectionLost = true;
+        renderCameraReports({});
         syncPreviews();
         updateTallyButtons();
         return;
@@ -4042,6 +4132,7 @@
       const network = data.network || {};
       state.network = network;
       const stream = data.stream || {};
+      setStorageBusy(data.storage_busy);
       renderEncoder(stream.encoder);
       if (data.initialization_error || stream.error) setBanner(data.initialization_error || stream.error, 'error');
       else if (stream.layout_warning) setBanner(stream.layout_warning, 'warning');

@@ -125,7 +125,7 @@ def run():
                 data = watcher.communicate(timeout=60)[0]
                 return [data[i:i+3] for i in range(0, len(data) - 2, 3)]
             def dark_runs(frames):
-                """Lengths of dark spells: a handover may show 1-2 frames of the offline card."""
+                """Lengths of dark spells: a normal handover must keep the offline card off air."""
                 runs, run = [], 0
                 for c in frames + [b'\xff\xff\xff']:
                     if max(c) < 60:
@@ -140,7 +140,7 @@ def run():
             cut_time = time.monotonic() - started
             frames = colours(watcher)
             runs = dark_runs(frames)
-            assert len(frames) > 250 and max(runs, default=0) <= 2, (len(frames), runs)
+            assert len(frames) > 250 and not runs, (len(frames), runs)
             print(f'PASS: cut red→blue in {cut_time:.1f} s with the old picture on air until the switch ({len(frames)} frames; handover blips: {runs or "none"})', flush=True)
             px = program_pixels()  # the live relay draws the scoreboard box (bottom left) itself
             assert px(80, 45)[2] > 200 and px(4, 85)[2] < 160, (px(80, 45), px(4, 85))
@@ -177,8 +177,7 @@ def run():
             time.sleep(9)  # blue footage in the recording
             assert m.switch_camera('cam1')[0]  # live is red again
             recorder_pid = m._recorder_proc.proc.pid
-            # Let this cut's 1-2 handover frames pass the encoder first: the window below is about
-            # the replay. (The old encoder delayed everything by ~6 s, which hid this cut.)
+            # Begin the replay measurement once the preceding cut has reached the output.
             time.sleep(2)
             watcher = watch_program(30)
             time.sleep(2)
@@ -198,7 +197,7 @@ def run():
             assert m.get_youtube_running()
             frames = colours(watcher)
             runs = dark_runs(frames)
-            assert max(runs, default=0) <= 2, ('dark spell around the replay', runs, len(frames))
+            assert not runs, ('dark spell around the replay', runs, len(frames))
             print(f'PASS: replay on air after {replay_start:.1f} s, shows recorded footage with a REPLAY label, '
                   f'returns to live; {len(frames)} frames, handover blips: {runs or "none"}', flush=True)
             assert m.play_replay(4, 0.5)[0]
@@ -314,6 +313,7 @@ def run():
             wait(lambda: m.get_active_camera() is None)
             time.sleep(3)
             assert m._encoder_proc.proc.pid == encoder_pid and m.get_youtube_running(), m.get_stream_status()
+            assert max(program_pixels()(10, 10)) < 60, 'Offline card missing on sustained source loss'
             print('PASS: source loss keeps output alive on fallback', flush=True)
             # Across the camera loss: no audio flood (that wrote hundreds of seconds per second),
             # and marks/replays follow what is really in the file, whatever the wall clock says.
