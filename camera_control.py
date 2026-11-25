@@ -337,8 +337,41 @@ def request_zoom(cam, zoom=None, step=None, wide=False):
         return target
 
 
+# Touchline sends a small still of its wide analysis picture every few seconds, with the
+# direction the gimbal pointed at and the angle the picture covers: the operator drags the
+# pitch lines on it and the dashboard turns their position into gimbal angles.
+STILL_MAX = 400_000
+_stills = {}              # cam -> {"jpeg", "at", "heading", "fov"}
+
+
+def _angle(value, low, high):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) and low <= number <= high else None
+
+
+def store_still(cam, jpeg, heading=None, fov=None):
+    if not isinstance(jpeg, bytes) or not jpeg.startswith(b"\xff\xd8") or len(jpeg) > STILL_MAX:
+        raise ValueError("A JPEG picture of at most 400 kB is required")
+    with _lock:
+        _stills[cam] = {"jpeg": jpeg, "at": time.time(), "heading": _angle(heading, -360, 360),
+                        "fov": _angle(fov, 10, 170)}
+
+
+def get_still(cam):
+    """The newest still of a camera with its age, or None when it is older than a report may be."""
+    with _lock:
+        still = _stills.get(cam)
+        if not still or time.time() - still["at"] > REPORT_STALE:
+            return None
+        return dict(still, age_s=round(time.time() - still["at"], 1))
+
+
 def reset():
     with _lock:
+        _stills.clear()
         _reports.clear()
         _zoom_requests.clear()
         _commands.clear()

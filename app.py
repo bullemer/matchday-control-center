@@ -22,7 +22,7 @@ import threading
 import time
 from functools import wraps
 
-from flask import Flask, jsonify, render_template, request, send_file
+from flask import Flask, Response, jsonify, render_template, request, send_file
 import recordings
 import camera_control
 import media_engine
@@ -318,6 +318,38 @@ def api_camera_report(cam_id):
     answer = camera_control.record_report(cam_id, data, tally=lambda: tally_state(cam_id),
                                           config=lambda: phone_config(cam_id))
     return jsonify(ok=True, **answer)
+
+
+@app.route("/api/camera-report/<cam_id>/still", methods=["POST"])
+@api_endpoint
+def api_camera_still_upload(cam_id):
+    """A Touchline phone's wide analysis picture (JPEG body) for drawing the pitch lines on."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    password = camera_password()
+    if password and not secrets.compare_digest(request.headers.get("X-Camera-Password", "").encode(), password.encode()):
+        return jsonify(ok=False, error="Camera password required"), 401
+    if request.content_length is None or request.content_length > camera_control.STILL_MAX:
+        return jsonify(ok=False, error="Picture too large"), 413
+    camera_control.store_still(cam_id, request.get_data(), heading=request.headers.get("X-Heading-Deg"),
+                               fov=request.headers.get("X-Fov-Deg"))
+    return jsonify(ok=True)
+
+
+@app.route("/api/cameras/<cam_id>/still")
+@api_endpoint
+def api_camera_still(cam_id):
+    """The newest wide picture of a Touchline phone; heading and picture angle in the headers."""
+    still = camera_control.get_still(cam_id) if cam_id in CAMERA_IDS else None
+    if not still:
+        return jsonify(ok=False, error="This camera has not sent a picture"), 404
+    response = Response(still["jpeg"], mimetype="image/jpeg")
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Age-S"] = str(still["age_s"])
+    for name, key in (("X-Heading-Deg", "heading"), ("X-Fov-Deg", "fov")):
+        if still[key] is not None:
+            response.headers[name] = f"{still[key]:.2f}"
+    return response
 
 
 # --- Settings tab -------------------------------------------------------------

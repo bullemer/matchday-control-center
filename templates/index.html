@@ -22,6 +22,9 @@
     #fence-editor { width: min(64rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); margin: auto; padding: 1rem;
       border: 1px solid #475569; border-radius: 1rem; background: #1e293b; color: #fff; }
     #fence-editor::backdrop { background: rgb(0 0 0 / .65); }
+    #lines-editor { width: min(64rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); margin: auto; padding: 1rem;
+                    border-radius: .75rem; background: #0f172a; color: #e2e8f0; border: 1px solid #334155; }
+    #lines-editor::backdrop { background: rgb(0 0 0 / .65); }
     #fence-box { cursor: crosshair; }
     #pitch-editor { width: min(84rem, calc(100vw - 2rem)); max-height: calc(100dvh - 2rem); margin: auto; padding: 1rem;
       background: #1e293b; color: #e2e8f0; border: 1px solid #334155; border-radius: .75rem; }
@@ -723,7 +726,10 @@
                       onclick="sendPhoneAction('{{ cam.id }}', this.dataset.action)"
                       class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs text-white disabled:opacity-50"></button>
               {% endfor %}
+              <button type="button" data-lines-button hidden onclick="openLinesEditor('{{ cam.id }}')"
+                      class="px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-xs text-white">📐 Pitch lines</button>
             </div>
+            <p data-lines-status class="text-xs text-slate-400 mt-1"></p>
           </div>
           <div class="grid grid-cols-2 gap-2">
             <button onclick="copyRtmp(cameraUrl('{{ cam.id }}'))"
@@ -1383,6 +1389,32 @@
         <button id="layout-apply" class="flex-1 bg-brand-blue rounded-lg py-3 font-semibold">Apply layout</button>
       </div>
     </form>
+  </dialog>
+
+  <dialog id="lines-editor" aria-labelledby="lines-editor-title">
+    <div class="flex items-center justify-between gap-2 mb-2">
+      <h3 id="lines-editor-title" class="text-base font-semibold">📐 Pitch lines</h3>
+      <span id="lines-editor-info" class="text-xs text-slate-400"></span>
+    </div>
+    <p class="text-xs text-slate-300 mb-2">Drag each line to an end of the pitch. While following, the gimbal stops at the lines and rests in the middle
+      between them. If an end is out of view, turn the gimbal at the phone and drag that line then: a line keeps its place on the pitch.</p>
+    <div id="lines-box" class="relative aspect-video bg-black rounded overflow-hidden mb-3" style="user-select:none; touch-action:none;">
+      <img id="lines-img" alt="Wide picture of the Touchline camera" class="w-full h-full object-contain" draggable="false">
+      {% for side in ['left', 'right'] %}
+      <div data-lines-line="{{ side }}" style="position:absolute; top:0; bottom:0; width:2.5rem; margin-left:-1.25rem; cursor:ew-resize; display:flex; justify-content:center; touch-action:none;">
+        <div data-lines-stroke style="width:3px; height:100%; background:#fde047;"></div>
+        <span data-lines-label style="position:absolute; top:50%; padding:1px 5px; border-radius:4px; background:rgb(0 0 0 / .8); font-size:11px; font-weight:600; white-space:nowrap;"></span>
+      </div>
+      {% endfor %}
+      <div id="lines-loading" class="absolute inset-0 grid place-content-center text-sm text-slate-400">Waiting for a picture from the phone…</div>
+    </div>
+    <div class="flex flex-wrap justify-between gap-2">
+      <button type="button" onclick="clearGimbalLines()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Remove lines</button>
+      <div class="flex gap-2">
+        <button type="button" onclick="closeLinesEditor()" class="px-3 py-2 rounded-lg bg-slate-700 hover:bg-slate-600 text-sm">Cancel</button>
+        <button type="button" onclick="saveGimbalLines()" class="px-4 py-2 rounded-lg bg-brand-green hover:bg-green-600 text-white font-semibold text-sm">Save</button>
+      </div>
+    </div>
   </dialog>
 
   <dialog id="fence-editor" aria-labelledby="fence-editor-title">
@@ -2839,6 +2871,7 @@
       for (const cam of CAMERA_IDS) {
         const r = reports[cam];
         renderGimbal(cam, r?.control);
+        renderLinesButton(cam);
         document.querySelectorAll(`[data-phone-box="${cam}"]`).forEach(box => {
           box.classList.toggle('shown', !!r);
           if (!r) return;
@@ -2930,7 +2963,8 @@
       if (!visible) return;
       const status = panel.querySelector('[data-gimbal-status]');
       if (!control) {
-        status.textContent = 'Open Chameleon Stream 0.10.0 or later in Gimbal mode, save the SRT target and enable Follow dashboard.';
+        status.textContent = 'Open Chameleon Stream 0.10.0 or later in Gimbal mode, save the SRT target and enable Follow dashboard. '
+          + 'Touchline: put this dashboard\'s address into its config.json.';
       } else {
         const tracking = control.gimbal === 'ready' ? (control.tracking ? 'on' : 'off') : 'unavailable';
         status.textContent = `Stream ${control.stream} · Gimbal ${control.gimbal} · Tracking ${tracking}`
@@ -2944,6 +2978,116 @@
         button.textContent = phoneActions[action || (kind === 'gimbal' ? 'connect_gimbal' : 'start_' + kind)];
         button.disabled = !action || !!control.pending || submittingAction.has(cam);
       }
+    }
+
+    // Touchline pitch lines: the phone sends a still of its wide picture with the direction the
+    // gimbal pointed at. A line is kept as a gimbal angle (degrees, right positive), so it stays
+    // on its spot of the pitch when the gimbal turns, and goes to the phone as a tuning number.
+    const gimbalLines = {cam: null, heading: null, fov: 100, left: null, right: null, timer: null, drag: null};
+    function linesTurn(from, to) {
+      let gap = (to - from) % 360;
+      if (gap > 180) gap -= 360;
+      if (gap < -180) gap += 360;
+      return gap;
+    }
+    function linesHalf() { return Math.tan(gimbalLines.fov / 2 * Math.PI / 180); }
+    function renderLinesButton(cam) {
+      const panel = document.querySelector(`[data-gimbal-panel="${cam}"]`);
+      if (!panel) return;
+      const report = lastReports[cam];
+      const touchline = !!report && (report.app || '').startsWith('touchline');
+      panel.querySelector('[data-lines-button]').hidden = !touchline;
+      const q = (touchline && report.quality) || {};
+      const text = [];
+      if (q.pitch_left_deg != null && q.pitch_right_deg != null) text.push(`Pitch ${q.pitch_left_deg.toFixed(0)}° to ${q.pitch_right_deg.toFixed(0)}°`);
+      else if (touchline) text.push('No pitch lines: the gimbal follows without limits');
+      if (q.heading_deg != null) text.push(`aim ${q.heading_deg.toFixed(0)}°`);
+      if (q.people != null) text.push(`${q.people} people in view`);
+      panel.querySelector('[data-lines-status]').textContent = text.join(' · ');
+    }
+    async function loadLinesStill() {
+      if (!gimbalLines.cam || gimbalLines.drag) return;
+      try {
+        const res = await fetch(`/api/cameras/${gimbalLines.cam}/still`, {signal: AbortSignal.timeout(5000)});
+        if (!res.ok) throw new Error('none');
+        const heading = parseFloat(res.headers.get('X-Heading-Deg'));
+        const fov = parseFloat(res.headers.get('X-Fov-Deg'));
+        const blob = await res.blob();
+        if (gimbalLines.drag) return;
+        const img = document.getElementById('lines-img');
+        const old = img.src;
+        img.src = URL.createObjectURL(blob);
+        if (old.startsWith('blob:')) URL.revokeObjectURL(old);
+        gimbalLines.heading = Number.isFinite(heading) ? heading : null;
+        if (Number.isFinite(fov)) gimbalLines.fov = fov;
+        document.getElementById('lines-loading').style.display = 'none';
+        document.getElementById('lines-editor-info').textContent = gimbalLines.heading == null
+          ? 'The gimbal has not reported its direction: dock the phone first'
+          : `aim ${gimbalLines.heading.toFixed(0)}° · picture ${res.headers.get('X-Age-S')} s old`;
+      } catch (err) {
+        document.getElementById('lines-editor-info').textContent = 'No picture from the phone';
+      }
+      renderGimbalLines();
+    }
+    function renderGimbalLines() {
+      for (const el of document.querySelectorAll('[data-lines-line]')) {
+        const side = el.dataset.linesLine;
+        const angle = gimbalLines[side];
+        let x = side === 'left' ? 0.04 : 0.96;
+        if (angle != null && gimbalLines.heading != null) {
+          const gap = linesTurn(gimbalLines.heading, angle);
+          x = Math.abs(gap) < 85 ? 0.5 + Math.tan(gap * Math.PI / 180) / (2 * linesHalf()) : (gap > 0 ? 0.96 : 0.04);
+          x = Math.min(Math.max(x, 0.04), 0.96);
+        }
+        el.style.left = (x * 100) + '%';
+        el.querySelector('[data-lines-stroke]').style.background = angle != null ? '#4ade80' : '#fde047';
+        el.querySelector('[data-lines-label]').textContent = (side === 'left' ? 'Left end' : 'Right end') + (angle != null ? ` ${angle.toFixed(0)}°` : '');
+      }
+    }
+    function linesDrag(event) {
+      if (!gimbalLines.drag || gimbalLines.heading == null) return;
+      const r = document.getElementById('lines-box').getBoundingClientRect();
+      const x = Math.min(Math.max((event.clientX - r.left) / r.width, 0.02), 0.98);
+      const offset = Math.atan((x - 0.5) * 2 * linesHalf()) * 180 / Math.PI;
+      gimbalLines[gimbalLines.drag] = Math.round(linesTurn(0, gimbalLines.heading + offset) * 10) / 10;
+      renderGimbalLines();
+    }
+    for (const el of document.querySelectorAll('[data-lines-line]')) {
+      el.addEventListener('pointerdown', event => {
+        if (gimbalLines.heading == null) return showToast('The gimbal has not reported its direction yet', 'info');
+        gimbalLines.drag = el.dataset.linesLine;
+        el.setPointerCapture(event.pointerId);
+        linesDrag(event);
+      });
+      el.addEventListener('pointermove', linesDrag);
+      for (const name of ['pointerup', 'pointercancel']) el.addEventListener(name, () => { gimbalLines.drag = null; });
+    }
+    function openLinesEditor(cam) {
+      const q = (lastReports[cam] || {}).quality || {};
+      Object.assign(gimbalLines, {cam, heading: null, drag: null,
+                                left: q.pitch_left_deg ?? null, right: q.pitch_right_deg ?? null});
+      document.getElementById('lines-editor-title').textContent = `📐 Pitch lines · ${camLabel(cam)}`;
+      document.getElementById('lines-loading').style.display = '';
+      document.getElementById('lines-img').removeAttribute('src');
+      document.getElementById('lines-editor').showModal();
+      clearInterval(gimbalLines.timer);
+      gimbalLines.timer = setInterval(loadLinesStill, 2000);
+      loadLinesStill();
+    }
+    function closeLinesEditor() { document.getElementById('lines-editor').close(); }
+    document.getElementById('lines-editor').addEventListener('close', () => {
+      clearInterval(gimbalLines.timer);
+      gimbalLines.cam = null;
+    });
+    function clearGimbalLines() { gimbalLines.left = gimbalLines.right = null; renderGimbalLines(); }
+    async function saveGimbalLines() {
+      let {cam, left, right} = gimbalLines;
+      if ((left == null) !== (right == null)) return showToast('Set both lines, or remove both', 'info');
+      if (left != null && linesTurn(left, right) < 0) [left, right] = [right, left];
+      const {ok, data} = await apiRequest(`/api/cameras/${cam}/tuning`, {pitch_left_deg: left, pitch_right_deg: right});
+      if (!ok) return showToast('❌ ' + (data.error || 'Saving the pitch lines failed'), 'error');
+      showToast(left != null ? `📐 Pitch lines sent to ${camLabel(cam)}` : `Pitch lines removed for ${camLabel(cam)}`, 'success');
+      closeLinesEditor();
     }
 
     async function sendPhoneAction(cam, action) {

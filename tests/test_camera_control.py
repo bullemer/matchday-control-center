@@ -217,6 +217,30 @@ class CameraReportApiTests(unittest.TestCase):
         a.app.config['OPERATOR_PASSWORD'] = 'pw'
         self.client = a.app.test_client()
 
+    def test_touchline_still_round_trip(self):
+        patcher = patch.object(self.a, 'camera_password', return_value='secret')
+        patcher.start(); self.addCleanup(patcher.stop)
+        self.a.app.config['OPERATOR_USER'] = 'operator'
+        auth = {'Authorization': 'Basic ' + __import__('base64').b64encode(b'operator:pw').decode()}
+        jpeg = b'\xff\xd8' + b'x' * 100
+        send = lambda **kw: self.client.post('/api/camera-report/cam3/still', data=kw.pop('data', jpeg),
+                                             content_type='image/jpeg', **kw)
+        self.assertEqual(send().status_code, 401)
+        phone = {'X-Camera-Password': 'secret', 'X-Heading-Deg': '-12.5', 'X-Fov-Deg': '106.2'}
+        self.assertEqual(send(data=b'not a picture', headers=phone).status_code, 400)
+        self.assertEqual(send(data=b'\xff\xd8' + b'x' * cc.STILL_MAX, headers=phone).status_code, 413)
+        self.assertEqual(self.client.get('/api/cameras/cam3/still', headers=auth).status_code, 404)
+        self.assertEqual(send(headers=phone).status_code, 200)
+        self.assertEqual(self.client.get('/api/cameras/cam3/still').status_code, 401)
+        r = self.client.get('/api/cameras/cam3/still', headers=auth)
+        self.assertEqual((r.status_code, r.data, r.mimetype), (200, jpeg, 'image/jpeg'))
+        self.assertEqual((r.headers['X-Heading-Deg'], r.headers['X-Fov-Deg']), ('-12.50', '106.20'))
+        # A direction that is no number is dropped; the picture is still kept.
+        self.assertEqual(send(headers=dict(phone, **{'X-Heading-Deg': 'nan'})).status_code, 200)
+        self.assertNotIn('X-Heading-Deg', self.client.get('/api/cameras/cam3/still', headers=auth).headers)
+        cc._stills['cam3']['at'] -= cc.REPORT_STALE + 1
+        self.assertEqual(self.client.get('/api/cameras/cam3/still', headers=auth).status_code, 404)
+
     def test_report_needs_no_login_but_zoom_does(self):
         patcher = patch.object(self.a, 'camera_password', return_value='')
         patcher.start(); self.addCleanup(patcher.stop)
