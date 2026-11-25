@@ -516,6 +516,17 @@ def api_camera_zoom(cam_id):
     return jsonify(ok=True, zoom=target)
 
 
+@app.route("/api/cameras/<cam_id>/tuning", methods=["GET", "POST"])
+@api_endpoint
+def api_camera_tuning(cam_id):
+    """Tuning numbers for a Touchline phone: POST {"name": number | null, ...} merges."""
+    if cam_id not in CAMERA_IDS:
+        return jsonify(ok=False, error=f"Unknown camera '{cam_id}'"), 404
+    if request.method == "POST":
+        return jsonify(ok=True, tuning=camera_control.set_tuning(cam_id, request.get_json()))
+    return jsonify(ok=True, tuning=camera_control.get_tuning(cam_id))
+
+
 @app.post("/api/cameras/<cam_id>/action")
 @api_endpoint
 def api_camera_action(cam_id):
@@ -1716,6 +1727,7 @@ def initialize():
         app.config["OPERATOR_PASSWORD"] = password_file.read_text().strip()
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     settings_store.load()
+    camera_control.load_tuning(RUNTIME_DIR / "camera-tuning.json")
     _apply_match_defaults()
     try:
         recordings.configure_storage(settings_store.get("recordings_dir"), settings_store.get("min_free_gb"))

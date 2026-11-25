@@ -275,3 +275,80 @@ class CameraReportApiTests(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
+
+class TouchlineTuningTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        cc.reset()
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.file = Path(folder.name) / 'camera-tuning.json'
+        patcher = patch.object(cc, 'TUNING_FILE', self.file)
+        patcher.start(); self.addCleanup(patcher.stop)
+
+    def test_other_phones_never_see_tuning(self):
+        cc.set_tuning('cam3', {'analysis_hz': 4})
+        self.assertNotIn('tuning', cc.record_report('cam3', dict(REPORT)))
+
+    def test_phone_gets_tuning_at_once_and_waits_when_current(self):
+        cc.set_tuning('cam3', {'analysis_hz': 4, 'pan_dead_zone_deg': 2.5})
+        report = dict(REPORT, wait=True, zoom_seq=cc._SEQ_BASE, tuning_key='')
+        t0 = time.monotonic()
+        answer = cc.record_report('cam3', report, hold=5)
+        self.assertLess(time.monotonic() - t0, 0.5)
+        self.assertEqual(answer['tuning'], {'analysis_hz': 4, 'pan_dead_zone_deg': 2.5})
+        t0 = time.monotonic()
+        again = cc.record_report('cam3', dict(report, tuning_key=answer['tuning_key']), hold=0.4)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.35)
+        self.assertEqual(again['tuning_key'], answer['tuning_key'])
+
+    def test_change_wakes_the_waiting_phone(self):
+        first = cc.record_report('cam3', dict(REPORT, tuning_key=''))
+        result = {}
+        waiting = threading.Thread(target=lambda: result.update(cc.record_report(
+            'cam3', dict(REPORT, wait=True, zoom_seq=cc._SEQ_BASE, tuning_key=first['tuning_key']), hold=5)))
+        t0 = time.monotonic()
+        waiting.start()
+        time.sleep(0.2)
+        cc.set_tuning('cam3', {'analysis_hz': 1})
+        waiting.join(3)
+        self.assertLess(time.monotonic() - t0, 1.5)
+        self.assertEqual(result['tuning'], {'analysis_hz': 1})
+
+    def test_merge_remove_validate_and_survive_restart(self):
+        cc.set_tuning('cam3', {'analysis_hz': 4, 'step_degrees': 3})
+        self.assertEqual(cc.set_tuning('cam3', {'step_degrees': None}), {'analysis_hz': 4})
+        for bad in ({'Analysis': 1}, {'analysis_hz': 'fast'}, {'analysis_hz': float('nan')}, {'x': True}, [1],
+                    {f'n{i}': i for i in range(cc.TUNING_MAX + 1)}):
+            with self.assertRaises(ValueError):
+                cc.set_tuning('cam3', bad)
+        self.assertEqual(cc.get_tuning('cam3'), {'analysis_hz': 4})
+        cc.reset()
+        self.assertEqual(cc.get_tuning('cam3'), {})
+        cc.load_tuning(self.file)
+        self.assertEqual(cc.get_tuning('cam3'), {'analysis_hz': 4})
+        self.file.write_text('not json')
+        cc.load_tuning(self.file)
+        self.assertEqual(cc.get_tuning('cam3'), {})
+
+    def test_phone_reports_applied_values_and_quality(self):
+        cc.record_report('cam3', dict(REPORT, tuning_key='', tuning_active={'analysis_hz': 4},
+                                      quality={'play_in_frame': 0.82, 'reversals_per_min': 3}))
+        shown = cc.get_reports()['cam3']
+        self.assertEqual(shown['tuning_active'], {'analysis_hz': 4})
+        self.assertEqual(shown['quality']['play_in_frame'], 0.82)
+        with self.assertRaises(ValueError):
+            cc.clean_report(dict(REPORT, quality={'play_in_frame': 'good'}))
+
+    def test_operator_api(self):
+        import app as a
+        a.app.config['OPERATOR_PASSWORD'] = 'pw'
+        a.app.config['OPERATOR_USER'] = 'operator'
+        client = a.app.test_client()
+        self.assertEqual(client.post('/api/cameras/cam3/tuning', json={'analysis_hz': 4}).status_code, 401)
+        auth = {'Authorization': 'Basic ' + __import__('base64').b64encode(b'operator:pw').decode()}
+        r = client.post('/api/cameras/cam3/tuning', json={'analysis_hz': 4}, headers=auth)
+        self.assertEqual((r.status_code, r.get_json()['tuning']), (200, {'analysis_hz': 4}))
+        self.assertEqual(client.get('/api/cameras/cam3/tuning', headers=auth).get_json()['tuning'], {'analysis_hz': 4})
+        self.assertEqual(client.post('/api/cameras/cam3/tuning', json={'analysis_hz': 'x'}, headers=auth).status_code, 400)
+        self.assertEqual(client.post('/api/cameras/cam9/tuning', json={'a': 1}, headers=auth).status_code, 404)
