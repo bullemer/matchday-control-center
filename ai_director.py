@@ -16,7 +16,9 @@ import threading
 import time
 from pathlib import Path
 
+import camera_control
 import director_scoring
+import follow_rating
 import media_engine
 import pitch_map
 
@@ -401,9 +403,23 @@ def _supervise():
             pass
         try:
             _update_suggestion()
+            _rate_followers()
         except Exception:  # a status hiccup must never stop the supervisor
             log.exception("AI Director suggestion failed")
         _stop.wait(1.0)
+
+
+def _rate_followers(now=None):
+    """Once a second: the rating of each Touchline camera's picture feeds its follow rating."""
+    if _state_age() >= STALE_S:
+        return
+    cams = _read_state().get("cams", {})
+    for cam, report in camera_control.get_reports().items():
+        if cam not in cams or not (report.get("app") or "").startswith("touchline"):
+            continue
+        following = (report.get("control") or {}).get("tracking") is True
+        follow_rating.add(cam, cams[cam], following, now)
+        follow_rating.log_row(cam, report.get("tuning_active"), now)
 
 
 # --- Suggest mode ----------------------------------------------------------------------

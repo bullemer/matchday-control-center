@@ -2899,6 +2899,7 @@
     // first reporting phone; tapping the camera name goes to the next one.
     let matchZoomChoice = null;
     let lastReports = {};
+    let followRatings = {};   // Touchline cameras: how well the picture kept play in the last minute
     // Every reporting phone (battery / temperature); zoom buttons only where remote zoom is allowed.
     function reportingPhones() {
       return CAMERA_IDS.filter(c => lastReports[c]);
@@ -3003,6 +3004,10 @@
       else if (touchline) text.push('No pitch lines: the gimbal follows without limits');
       if (q.heading_deg != null) text.push(`aim ${q.heading_deg.toFixed(0)}°`);
       if (q.people != null) text.push(`${q.people} people in view`);
+      if (q.stream_mbps != null) text.push(`sends ${q.stream_mbps.toFixed(1)} Mbit/s at ${Math.round(q.stream_fps || 0)} fps`);
+      const rating = touchline && followRatings[cam];
+      if (rating) text.push(`Follow rating ${Math.round(rating.score)} of 100 (ball in picture ${rating.ball_pct} % · play ${rating.play_pct} % · last ${rating.seconds} s)`);
+      else if (touchline && report.control && report.control.stream === 'live') text.push('Follow rating: switch on the AI Director');
       panel.querySelector('[data-lines-status]').textContent = text.join(' · ');
     }
     async function loadLinesStill() {
@@ -4334,6 +4339,7 @@
       syncPreviews();
       if (data.camera_list) renderCameraNames(data.camera_list);
       renderCameraInputs(data.camera_inputs || {});
+      followRatings = data.follow_ratings || {};
       renderCameraReports(data.camera_reports || {});
       state.suggestion = data.director_suggestion || null;
       renderSuggestion();

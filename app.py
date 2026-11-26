@@ -25,6 +25,7 @@ from functools import wraps
 from flask import Flask, Response, jsonify, render_template, request, send_file
 import recordings
 import camera_control
+import follow_rating
 import media_engine
 import settings_store
 import ai_director
@@ -317,6 +318,9 @@ def api_camera_report(cam_id):
         apply_phone_settings(cam_id, data["settings"])
     answer = camera_control.record_report(cam_id, data, tally=lambda: tally_state(cam_id),
                                           config=lambda: phone_config(cam_id))
+    rating = follow_rating.summary(cam_id)
+    if rating:
+        answer["rating"] = rating   # Touchline: how well its picture kept play, last minute
     return jsonify(ok=True, **answer)
 
 
@@ -685,6 +689,7 @@ def api_status():
         "storage_busy": recordings.storage_busy(),
         "camera_inputs": get_camera_inputs(),
         "camera_reports": camera_control.get_reports(),
+        "follow_ratings": follow_rating.summaries(),
         "director_suggestion": ai_director.suggestion(),
         "mediamtx": mediamtx,
         "stream": stream,
@@ -1760,6 +1765,7 @@ def initialize():
         log.info("Login as %s; password is in %s", app.config["OPERATOR_USER"], password_file)
     settings_store.load()
     camera_control.load_tuning(RUNTIME_DIR / "camera-tuning.json")
+    follow_rating.LOG_FILE = RUNTIME_DIR / "follow-rating.csv"
     _apply_match_defaults()
     try:
         recordings.configure_storage(settings_store.get("recordings_dir"), settings_store.get("min_free_gb"))
