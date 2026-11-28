@@ -208,6 +208,27 @@ class IsoRecordingTests(EngineStateCase):
 
 
 class IsoStoreTests(EngineStateCase):
+    def test_session_remembers_what_was_in_each_camera_slot(self):
+        sid = r.create_session('720p', 'A vs B')
+        xbot = {'label': 'XbotGo left', 'mount': 'tracking', 'app': 'chameleon-stream 0.10.0'}
+        r.note_camera(sid, 'cam1', xbot)
+        path = r.new_iso_part(sid, 'cam2', {'label': 'Touchline', 'app': 'touchline 0.3'})
+        session = json.loads((Path(self.tmp) / sid / 'session.json').read_text())
+        self.assertEqual(session['cameras']['cam1'], xbot)
+        self.assertEqual(session['cameras']['cam2']['app'], 'touchline 0.3')
+        self.assertEqual(session['iso'][0]['source']['label'], 'Touchline')
+        self.assertTrue(path.endswith('iso/cam2-01.ts'))
+
+    def test_camera_description_joins_settings_phone_report_and_arriving_stream(self):
+        m.load_camera_setting()
+        with patch.dict(m._inputs, {'cam1': {'protocol': 'srt', 'codec': 'H264', 'width': 1920, 'height': 1080, 'audio': True}}), \
+                patch.object(m.camera_control, 'get_reports', return_value={'cam1': {'app': 'touchline 0.3', 'mode': 'gimbal'}}):
+            info = m._camera_source_info('cam1')
+        self.assertEqual((info['app'], info['app_mode'], info['codec'], info['width'], info['audio']),
+                         ('touchline 0.3', 'gimbal', 'H264', 1920, True))
+        self.assertIn('label', info)
+        self.assertIn('mount', info)
+
     def test_finalize_saves_reporting_camera_parts_on_the_timeline(self):
         sid = r.create_session('720p', 'A vs B')
         r.new_part(sid); r.part_started(sid, 1000.0)
@@ -456,10 +477,18 @@ class NvidiaEncoderTests(unittest.TestCase):
     def test_failed_nvidia_relay_retries_in_software(self):
         with patch.object(m, '_test_nvenc', return_value=True):
             m.set_hardware_encoding('nvidia')
-        self.assertTrue(m._relay_nvenc_failed('Relay did not produce frames'))
-        self.assertEqual(m._relay_video_codec()[1], 'libx264')
-        self.assertIn('relays use the software encoder', m.get_encoder_status()['warning'])
-        self.assertFalse(m._relay_nvenc_failed('Relay did not produce frames'))  # only once
+        with patch.object(m, '_test_nvenc', return_value=False):
+            self.assertTrue(m._relay_nvenc_failed('Relay did not produce frames'))
+            self.assertEqual(m._relay_video_codec()[1], 'libx264')
+            self.assertIn('relays use the software encoder', m.get_encoder_status()['warning'])
+            self.assertFalse(m._relay_nvenc_failed('Relay did not produce frames'))  # only once
+
+    def test_relay_failure_with_a_working_nvidia_encoder_stays_on_the_gpu(self):
+        # A camera that drops during a cut must not push every later relay onto the CPU.
+        with patch.object(m, '_test_nvenc', return_value=True):
+            m.set_hardware_encoding('nvidia')
+            self.assertFalse(m._relay_nvenc_failed('Relay did not produce frames'))
+            self.assertEqual(m._relay_video_codec()[1], 'h264_nvenc')
 
     def test_relay_failure_falls_back_within_the_same_cut(self):
         with patch.object(m, '_test_nvenc', return_value=True):
@@ -470,6 +499,7 @@ class NvidiaEncoderTests(unittest.TestCase):
             codecs.append(cmd[cmd.index('-c:v') + 1])
             return (None, 'nvenc: no capable devices') if len(codecs) == 1 else (MagicMock(), None)
         with patch.object(m, '_probe', return_value={'video', 'audio'}), patch.object(m, '_take_over', side_effect=take_over), \
+                patch.object(m, '_test_nvenc', return_value=False), \
                 patch.object(m, '_await_retired'), patch.object(m, '_retire'), patch.object(m, '_log_cut'), \
                 patch.object(m, '_generation', 5), patch.object(m, '_relay_proc', None), patch.object(m, '_active_camera', None), \
                 patch.object(m, '_layout', {'mode': 'single', 'main': 'cam1', 'secondary': 'cam5', 'position': 'top-right'}):

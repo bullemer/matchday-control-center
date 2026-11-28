@@ -393,14 +393,14 @@ def _supervise():
                     break
                 try:
                     _start_worker()
-                except OSError as exc:
+                except Exception as exc:  # never let the supervisor thread die
                     _last_error = str(exc)
         elif _state_age() < STALE_S:
             delay = 2.0  # running fine: next crash restarts quickly again
         try:
             sync_fences()  # a camera switched to/from "fixed" mount
-        except OSError:
-            pass
+        except Exception:
+            log.exception("Cannot sync the field fences")
         try:
             _update_suggestion()
             _rate_followers()

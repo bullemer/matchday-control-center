@@ -268,16 +268,30 @@ def new_live_window(sid, camera):
         return str(_dir(sid) / name)
 
 
-def new_iso_part(sid, camera):
-    """Register a new part of a reporting camera's own recording; returns its path."""
+def note_camera(sid, camera, info):
+    """Remember what was in a camera slot during this recording (label, mount, the phone
+    app that reported, what arrived): later users of the files need to know the model."""
     with _lock:
         session = _load(sid)
+        cameras = session.setdefault("cameras", {})
+        if cameras.get(camera) != info:
+            cameras[camera] = info
+            _save(session)
+
+
+def new_iso_part(sid, camera, source=None):
+    """Register a new part of a reporting camera's own recording; returns its path.
+    source: what was in the slot when this part began (see note_camera)."""
+    with _lock:
+        session = _load(sid)
+        if source:
+            session.setdefault("cameras", {})[camera] = source
         parts = session.setdefault("iso", [])
         number = sum(1 for p in parts if p["camera"] == camera) + 1
         name = f"iso/{camera}-{number:02d}.ts"
         (_dir(sid) / "iso").mkdir(exist_ok=True)
         parts.append({"id": f"i{len(parts) + 1}", "file": name, "camera": camera, "start": _now(),
-                      "offset": None, "duration": None, "mp4": None})
+                      "offset": None, "duration": None, "mp4": None, "source": source})
         _save(session)
         return str(_dir(sid) / name)
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from browser_overlay import FRAME_PATH, OverlayFeeder, ensure_frame
+import camera_control
 import recordings
 import settings_store
 
@@ -1530,6 +1531,10 @@ def _relay_nvenc_failed(problem):
     global _relay_hw_failed
     if problem == SUPERSEDED or not _relay_uses_nvenc():
         return False
+    if _test_nvenc():
+        # The encoder itself works: the relay failed for another reason (a camera dropped
+        # during the cut). Staying on the GPU matters: software relays cost several cores.
+        return False
     _relay_hw_failed = True
     logger.warning("NVIDIA encoder failed in a relay (%s); using the software encoder", problem)
     return True
@@ -2041,6 +2046,44 @@ def _log_cut(source=None):
         logger.warning("Cannot log the cut: %s", exc)
 
 
+_camera_noted = {}        # camera -> (session, description) last written to the session file
+
+
+def _camera_source_info(cam):
+    """What is in a camera slot right now: its settings, the phone app that reports for it
+    and the stream that arrives. Written into the recording, so the files can be told apart
+    by camera model later (tests and training material)."""
+    if not _camera_info:
+        load_camera_setting()
+    info, arriving = _camera_info[cam], _inputs.get(cam) or {}
+    try:
+        report = camera_control.get_reports().get(cam) or {}
+    except Exception:  # never let a status detail stop a recording
+        report = {}
+    return {"label": info["label"], "position": info["position"], "mount": info["mount"],
+            "quality": info["quality"], "app": report.get("app"), "app_mode": report.get("mode"),
+            "protocol": arriving.get("protocol") or info["protocol"], "codec": arriving.get("codec") or None,
+            "width": arriving.get("width"), "height": arriving.get("height"),
+            "audio": bool(arriving.get("audio"))}
+
+
+def _note_cameras(session):
+    """Keep the session's description of every publishing camera up to date."""
+    if not session:
+        _camera_noted.clear()
+        return
+    for cam in CAMERA_IDS:
+        if not _camera_status.get(cam):
+            continue
+        info = _camera_source_info(cam)
+        if _camera_noted.get(cam) != (session, info):
+            try:
+                recordings.note_camera(session, cam, info)
+                _camera_noted[cam] = (session, info)
+            except (OSError, ValueError) as exc:
+                logger.warning("Cannot note camera %s in the recording: %s", cam, exc)
+
+
 def _supervise_iso(now):
     """Record every publishing reporting camera (and, when chosen, every match camera) on its
     own while a recording runs (copy only, on air or not). A camera that drops out ends its
@@ -2050,12 +2093,15 @@ def _supervise_iso(now):
     with _iso_lock:
         with _lock:
             session = _recording if _want_record else None
+        _note_cameras(session)
         wanted_cams = _iso_cameras()
         for cam in [c for c in _iso if c not in wanted_cams]:
             _kill_process(_iso.pop(cam)["proc"])
         for cam in wanted_cams:
             entry = _iso.get(cam)
-            wanted = bool(session and _camera_status.get(cam))
+            # While MediaMTX does not answer, the status says "offline" for every camera:
+            # a running recorder then knows better (it exits by itself when its camera goes).
+            wanted = bool(session and (_camera_status.get(cam) or (entry and _status_failures)))
             if entry:
                 proc = entry["proc"]
                 died = proc.poll() is not None
@@ -2071,7 +2117,7 @@ def _supervise_iso(now):
                     entry["noted"] = True
             if wanted and not entry and now >= _iso_retry.get(cam, 0.0):
                 try:
-                    path = recordings.new_iso_part(session, cam)
+                    path = recordings.new_iso_part(session, cam, _camera_source_info(cam))
                     _iso[cam] = {"proc": Process(_iso_command(cam, path), copy=True),
                                  "session": session, "path": path, "noted": False}
                 except (OSError, ValueError) as exc:

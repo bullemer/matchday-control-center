@@ -1354,6 +1354,103 @@
       <div id="checklist" class="space-y-2">
         <!-- Items rendered by JS -->
       </div>
+      <h2 class="text-lg font-semibold text-white mt-8 mb-4 flex items-center gap-2">
+        📖 Cameras: types, setup, help
+      </h2>
+      <div id="camera-guide" class="space-y-2">
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">📋 Camera types at a glance</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <p>Every camera can use every slot: Cam 1–4 film the game, Reporter 1–2 are for interviews. A slot never needs to know the model. The phone app tells the dashboard what it is.</p>
+            <ul class="list-disc pl-5 space-y-1">
+              <li><b>XbotGo gimbal + Android phone</b> (Chameleon Stream app): sends video over SRT, reports to the dashboard. Gimbal panel: connect, tracking, zoom.</li>
+              <li><b>Touchline</b> (iPhone on a DockKit gimbal, e.g. Osmo Mobile 8P): reports to the dashboard. Gimbal panel plus pitch lines and follow rating. Video only arrives with a build that has the Start stream button.</li>
+              <li><b>FoloCam</b> (original iPhone app on a DockKit gimbal): records on the iPhone only. No slot, no picture in the dashboard. Copy the file from the phone after the match.</li>
+              <li><b>Osmo Pocket</b> (own gimbal, planned): any slot as a plain camera if it sends RTMP or SRT to the laptop. Picture, cuts and recording work; no remote control from the dashboard.</li>
+              <li><b>Any other phone or camera</b> (Larix, Raspberry Pi …): any slot, plain camera.</li>
+            </ul>
+            <p>Rules: one camera per slot. Mount = <b>Tracking</b> for everything on a gimbal, <b>Fixed</b> for a tripod (only fixed cameras get a pitch map in the AI Director), <b>Handheld</b> for reporters.</p>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">🔧 How to: set up a camera slot</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <ol class="list-decimal pl-5 space-y-1">
+              <li>Open the <b>Cams</b> tab and pick a free slot.</li>
+              <li>Type the model into the label, e.g. “XbotGo left” or “Touchline right”. The label and the app name are saved with every recording, so the files can be told apart later.</li>
+              <li>Choose the mount (Tracking / Fixed / Handheld) and the quality. Use 1080p: 2160p makes the laptop hot and recordings large.</li>
+              <li>Scan the QR code or copy the link into the camera app. The link holds the laptop address and the slot.</li>
+              <li>Start the stream on the phone. The slot tile turns live within a few seconds.</li>
+            </ol>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">🤖 How to: XbotGo gimbal (Chameleon Stream)</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <ol class="list-decimal pl-5 space-y-1">
+              <li>Phone and laptop on the same network (field router or the dashboard hotspot).</li>
+              <li>Open Chameleon Stream, choose Gimbal mode and save the SRT target from the slot’s QR code.</li>
+              <li>Switch on “Follow dashboard”: resolution, bitrate and delay then come from the slot settings.</li>
+              <li>Tap <b>Start stream</b>, then <b>Connect gimbal</b>, then <b>Start tracking</b> (or use the gimbal panel in the dashboard).</li>
+              <li>The screen may be switched off; the stream continues. A red frame on the phone means this camera is on air.</li>
+            </ol>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">📱 How to: Touchline (iPhone + DockKit gimbal)</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <ol class="list-decimal pl-5 space-y-1">
+              <li>Pair the gimbal: close DJI Mimo, unlock the iPhone on the home screen, hold it to the gimbal’s NFC area and wait until the gimbal nods. On the Osmo Mobile 8P take off the small detachable monitor first.</li>
+              <li>In the Files app open Touchline’s <code>config.json</code>: set <code>dashboard_url</code> to this dashboard’s address (e.g. http://192.168.8.10:5000) and <code>camera</code> to the slot (cam1 … cam4). It must be a slot no other phone uses.</li>
+              <li>Set that slot’s mount to Tracking. The gimbal panel appears as soon as the phone reports.</li>
+              <li>Press <b>📐 Pitch lines</b> in the gimbal panel and drag the left and right end of the pitch on the wide picture. Without lines the gimbal follows without limits.</li>
+              <li>Tap <b>Follow play</b> on the phone (or Start tracking in the dashboard).</li>
+              <li>If the build has it: <b>Start stream</b> sends the main lens to the slot. The follow rating needs this stream and the AI Director switched on.</li>
+            </ol>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">🎥 How to: FoloCam and Osmo Pocket</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <p><b>FoloCam:</b> set it up and record in the FoloCam app as usual. Start its recording close to the dashboard recording and say the time or clap once in front of all cameras: that makes lining the files up easy later. After the match copy the video from the iPhone into the recording’s folder (the storage folder is shown in Settings).</p>
+            <p><b>Osmo Pocket:</b> start a live stream to a custom RTMP address from the DJI app and enter the slot’s RTMP link (switch the slot’s protocol to RTMP first). Set the mount to Tracking so the AI Director does not expect a pitch map.</p>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">⏺ How to: record for tests and training</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <ol class="list-decimal pl-5 space-y-1">
+              <li>Main tab, next to the Record button: switch on <b>📹 Also record each match camera separately</b>. Each camera then gets its own untouched file in <code>iso/</code>, on air or not. The program file alone only holds what was on air.</li>
+              <li>Check the free space: about 2.7 GB per hour for each 1080p camera, plus the program.</li>
+              <li>Press Record before kick-off, also without YouTube. Make a 20-second test recording first and play it back.</li>
+              <li>A camera that drops out continues in a new file (cam1-02, cam1-03 …) when it is back. That is normal.</li>
+              <li>Press Stop after the match and wait for “saved”. The folder then holds the program MP4, <code>iso/</code> with one MP4 per camera connection and <code>session.json</code> with cuts, highlights and, per camera, label, mount, app name and picture size.</li>
+              <li>Copy the whole folder to the training storage. Do not rename files inside it: <code>session.json</code> refers to them.</li>
+            </ol>
+          </div>
+        </details>
+        <details class="bg-slate-900 rounded-lg px-4 py-3 border border-slate-700">
+          <summary class="text-sm font-semibold text-white cursor-pointer">🛠 Troubleshooting</summary>
+          <div class="text-sm text-slate-300 mt-3 space-y-2">
+            <ul class="list-disc pl-5 space-y-1">
+              <li><b>Camera does not appear:</b> phone on the same network as the laptop? Laptop address in the link still right (it changes between home Wi-Fi, router and hotspot)? Slot protocol (SRT/RTMP) the same as in the app? Camera password set in Settings but not in the app?</li>
+              <li><b>Chameleon Stream hangs on “connecting”:</b> tap Stop, wait two seconds, tap Start stream again.</li>
+              <li><b>Two phones fight over one slot</b> (picture jumps, commands get lost): give each phone its own slot. Touchline’s config.json says cam1 unless changed.</li>
+              <li><b>No gimbal panel:</b> slot mount must be Tracking, and the phone must report: Chameleon Stream with “Follow dashboard” on, Touchline with the right <code>dashboard_url</code>.</li>
+              <li><b>Touchline says “Waiting for a paired gimbal”:</b> iOS sees no docked gimbal. Close DJI Mimo, pair again via NFC, wait for the nod; on the 8P remove the detachable monitor.</li>
+              <li><b>Touchline gimbal turns away from play:</b> set <code>yaw_direction</code> (or <code>pitch_direction</code>) in config.json to the opposite sign (1 / -1).</li>
+              <li><b>Pitch lines editor shows “Waiting for a picture”:</b> the phone is not reaching the dashboard: check <code>dashboard_url</code> and the network.</li>
+              <li><b>No follow rating:</b> needs the AI Director on and the Touchline video stream live.</li>
+              <li><b>Warning “relays use the software encoder”:</b> the graphics chip failed once; the laptop now works much harder. Stop and start the broadcast or recording at a quiet moment to go back to the graphics chip.</li>
+              <li><b>Laptop very hot or picture stutters:</b> set the phones to 1080p, close other programs, keep the laptop in the shade with free air below.</li>
+              <li><b>Picture breaks up, “packets lost” on a slot:</b> weak Wi-Fi. Move the router closer or higher, use 5 GHz, lower the quality of that slot, raise its delay to 500–800 ms.</li>
+              <li><b>“Low room” warning while recording:</b> the recording stops by itself before the disk is full so the file can still be saved. Free space or choose another folder in Settings before the match.</li>
+              <li><b>App or laptop crashed:</b> start the app again within 10 minutes: broadcast and recording continue with the same camera, the recording gets a new part.</li>
+              <li><b>A camera has no sound:</b> camera sound is off by default; choose the audio source on the Main tab. Touchline sends video only.</li>
+            </ul>
+          </div>
+        </details>
+      </div>
     </section>
 
   </main>
@@ -3890,12 +3987,18 @@
     const checklistItems = [
       { id: 'chk-internet',     label: 'Internet: laptop on Wi-Fi, or phone USB-tethered and connected in dashboard' },
       { id: 'chk-camera-net',   label: 'Camera network: same Wi-Fi as the laptop, or hotspot started' },
-      { id: 'chk-cam-connect',  label: 'Camera phones joined the camera network' },
-      { id: 'chk-cam1-stream',  label: 'Camera 1 streaming' },
-      { id: 'chk-stream-key',   label: 'Stream key entered' },
-      { id: 'chk-scoreboard',   label: 'Scoreboard set up' },
-      { id: 'chk-yt-live',      label: 'YouTube stream started' },
-      { id: 'chk-test-cut',     label: 'Test cut between cameras' },
+      { id: 'chk-power',        label: 'Power: laptop on mains or power bank, phones and gimbals charged' },
+      { id: 'chk-slots',        label: 'Each camera has its own slot; label names the model (XbotGo, Touchline …); mount set (Tracking for gimbals)' },
+      { id: 'chk-cam-connect',  label: 'Camera phones joined the camera network; links point to the laptop address of today' },
+      { id: 'chk-cam1-stream',  label: 'Every camera streaming at 1080p, no “packets lost” hint' },
+      { id: 'chk-gimbals',      label: 'Gimbals paired and tracking; Touchline pitch lines drawn' },
+      { id: 'chk-rec-iso',      label: 'Main tab: “Also record each match camera separately” on; enough free space' },
+      { id: 'chk-test-rec',     label: 'Test recording of 20 seconds made and played back' },
+      { id: 'chk-test-cut',     label: 'Test cut to every camera, no encoder warning' },
+      { id: 'chk-scoreboard',   label: 'Scoreboard set up (team names, half length)' },
+      { id: 'chk-stream-key',   label: 'Stream key entered (only when streaming)' },
+      { id: 'chk-yt-live',      label: 'Recording started; YouTube stream started (only when streaming)' },
+      { id: 'chk-after',        label: 'After the match: Stop, wait for “saved”, copy the recording folder and FoloCam files' },
     ];
 
     function renderChecklist() {

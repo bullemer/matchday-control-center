@@ -335,6 +335,7 @@ def api_camera_still_upload(cam_id):
         return jsonify(ok=False, error="Camera password required"), 401
     if request.content_length is None or request.content_length > camera_control.STILL_MAX:
         return jsonify(ok=False, error="Picture too large"), 413
+    request.max_content_length = camera_control.STILL_MAX  # the app-wide limit is for small JSON
     camera_control.store_still(cam_id, request.get_data(), heading=request.headers.get("X-Heading-Deg"),
                                fov=request.headers.get("X-Fov-Deg"))
     return jsonify(ok=True)
@@ -1628,7 +1629,7 @@ def _overlay_worker():
                 saved = time.monotonic()
                 _save_match()
                 _save_live_state()
-        except OSError:
+        except Exception:  # this thread also keeps the clock and the crash checkpoint alive
             log.exception("Cannot update scoreboard")
 
 
